@@ -73,7 +73,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -84,7 +84,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -103,7 +103,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -143,7 +143,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -154,7 +154,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -185,7 +185,7 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
                             {true}, 5,
                             spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
-                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, true,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                             4, {always}).get();
 
     ASSERT_EQ(1, results["found"].get<size_t>());
@@ -218,6 +218,17 @@ TEST_F(CollectionSchemaChangeTest, AddNewFieldsToCollection) {
 
     alter_op = coll1->alter(schema_changes);
     ASSERT_TRUE(alter_op.ok());
+
+    // try to add `id` field
+    schema_changes = R"({
+        "fields": [
+            {"name": "id", "type": "int32"}
+        ]
+    })"_json;
+
+    alter_op = coll1->alter(schema_changes);
+    ASSERT_FALSE(alter_op.ok());
+    ASSERT_EQ("Field `id` cannot be altered.", alter_op.error());
 
     ASSERT_EQ(9, coll1->get_schema().size());
     ASSERT_EQ(12, coll1->get_fields().size());
@@ -309,6 +320,17 @@ TEST_F(CollectionSchemaChangeTest, DropFieldsFromCollection) {
     ASSERT_EQ(1, coll1->_get_index()->num_seq_ids());
     ASSERT_EQ("", coll1->get_fallback_field_type());
     ASSERT_EQ("", coll1->get_default_sorting_field());
+
+    // try to drop `id` field
+    schema_changes = R"({
+        "fields": [
+            {"name": "id", "drop": true}
+        ]
+    })"_json;
+
+    alter_op = coll1->alter(schema_changes);
+    ASSERT_FALSE(alter_op.ok());
+    ASSERT_EQ("Field `id` cannot be altered.", alter_op.error());
 
     // try restoring collection from disk: all fields should be deleted
     collectionManager.dispose();
@@ -475,6 +497,18 @@ TEST_F(CollectionSchemaChangeTest, AlterValidations) {
     alter_op = coll1->alter(schema_changes);
     ASSERT_FALSE(alter_op.ok());
     ASSERT_EQ("Field `title` has an invalid data type `foobar`, see docs for supported data types.",alter_op.error());
+
+    // add + drop `id` field
+    schema_changes = R"({
+        "fields": [
+            {"name": "id", "drop": true},
+            {"name": "id", "type": "string"}
+        ]
+    })"_json;
+
+    alter_op = coll1->alter(schema_changes);
+    ASSERT_FALSE(alter_op.ok());
+    ASSERT_EQ("Field `id` cannot be altered.", alter_op.error());
 
     collectionManager.drop_collection("coll1");
 }

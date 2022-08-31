@@ -108,6 +108,8 @@ struct override_t {
     bool remove_matched_tokens = false;
     bool filter_curated_hits = false;
 
+    std::string sort_by;
+
     override_t() = default;
 
     static Option<bool> parse(const nlohmann::json& override_json, const std::string& id, override_t& override) {
@@ -124,9 +126,10 @@ struct override_t {
         }
 
         if(override_json.count("includes") == 0 && override_json.count("excludes") == 0 &&
-           override_json.count("filter_by") == 0 && override_json.count("remove_matched_tokens") == 0) {
+           override_json.count("filter_by") == 0 && override_json.count("sort_by") == 0 &&
+           override_json.count("remove_matched_tokens") == 0) {
             return Option<bool>(400, "Must contain one of: `includes`, `excludes`, "
-                                     "`filter_by`, `remove_matched_tokens`.");
+                                     "`filter_by`, `sort_by`, `remove_matched_tokens`.");
         }
 
         if(override_json.count("includes") != 0) {
@@ -228,6 +231,10 @@ struct override_t {
             override.filter_by = override_json["filter_by"].get<std::string>();
         }
 
+        if (override_json.count("sort_by") != 0) {
+            override.sort_by = override_json["sort_by"].get<std::string>();
+        }
+
         if(override_json.count("remove_matched_tokens") != 0) {
             override.remove_matched_tokens = override_json["remove_matched_tokens"].get<bool>();
         } else {
@@ -286,6 +293,10 @@ struct override_t {
             override["filter_by"] = filter_by;
         }
 
+        if(!sort_by.empty()) {
+            override["sort_by"] = sort_by;
+        }
+
         override["remove_matched_tokens"] = remove_matched_tokens;
         override["filter_curated_hits"] = filter_curated_hits;
 
@@ -293,7 +304,7 @@ struct override_t {
     }
 };
 
-enum infix_t {
+enum enable_t {
     always,
     fallback,
     off
@@ -320,20 +331,20 @@ struct search_args {
     size_t group_limit;
     std::string default_sorting_field;
     bool prioritize_exact_match;
+    bool prioritize_token_position;
     size_t all_result_ids_len;
     bool exhaustive_search;
     size_t concurrency;
-    const std::vector<const override_t*>& filter_overrides;
     size_t search_cutoff_ms;
     size_t min_len_1typo;
     size_t min_len_2typo;
     size_t max_candidates;
-    std::vector<infix_t> infixes;
+    std::vector<enable_t> infixes;
     const size_t max_extra_prefix;
     const size_t max_extra_suffix;
     const size_t facet_query_num_typos;
     const bool filter_curated_hits;
-    const bool split_join_tokens;
+    const enable_t split_join_tokens;
     tsl::htrie_map<char, token_leaf> qtoken_set;
 
     spp::sparse_hash_set<uint64_t> groups_processed;
@@ -350,11 +361,12 @@ struct search_args {
                 size_t max_facet_values, size_t max_hits, size_t per_page, size_t page, token_ordering token_order,
                 const std::vector<bool>& prefixes, size_t drop_tokens_threshold, size_t typo_tokens_threshold,
                 const std::vector<std::string>& group_by_fields, size_t group_limit,
-                const string& default_sorting_field, bool prioritize_exact_match, bool exhaustive_search,
-                size_t concurrency, const std::vector<const override_t*>& dynamic_overrides, size_t search_cutoff_ms,
-                size_t min_len_1typo, size_t min_len_2typo, size_t max_candidates, const std::vector<infix_t>& infixes,
+                const string& default_sorting_field, bool prioritize_exact_match,
+                const bool prioritize_token_position, bool exhaustive_search,
+                size_t concurrency, size_t search_cutoff_ms,
+                size_t min_len_1typo, size_t min_len_2typo, size_t max_candidates, const std::vector<enable_t>& infixes,
                 const size_t max_extra_prefix, const size_t max_extra_suffix, const size_t facet_query_num_typos,
-                const bool filter_curated_hits, const bool split_join_tokens) :
+                const bool filter_curated_hits, const enable_t split_join_tokens) :
             field_query_tokens(field_query_tokens),
             search_fields(search_fields), filters(filters), facets(facets),
             included_ids(included_ids), excluded_ids(excluded_ids), sort_fields_std(sort_fields_std),
@@ -362,9 +374,9 @@ struct search_args {
             page(page), token_order(token_order), prefixes(prefixes),
             drop_tokens_threshold(drop_tokens_threshold), typo_tokens_threshold(typo_tokens_threshold),
             group_by_fields(group_by_fields), group_limit(group_limit), default_sorting_field(default_sorting_field),
-            prioritize_exact_match(prioritize_exact_match), all_result_ids_len(0),
-            exhaustive_search(exhaustive_search), concurrency(concurrency),
-            filter_overrides(dynamic_overrides), search_cutoff_ms(search_cutoff_ms),
+            prioritize_exact_match(prioritize_exact_match), prioritize_token_position(prioritize_token_position),
+            all_result_ids_len(0), exhaustive_search(exhaustive_search), concurrency(concurrency),
+            search_cutoff_ms(search_cutoff_ms),
             min_len_1typo(min_len_1typo), min_len_2typo(min_len_2typo), max_candidates(max_candidates),
             infixes(infixes), max_extra_prefix(max_extra_prefix), max_extra_suffix(max_extra_suffix),
             facet_query_num_typos(facet_query_num_typos), filter_curated_hits(filter_curated_hits),
@@ -580,6 +592,7 @@ private:
                                const std::vector<uint32_t>& num_typos,
                                const std::vector<bool>& prefixes,
                                bool prioritize_exact_match,
+                               const bool prioritize_token_position,
                                const bool exhaustive_search,
                                const size_t max_candidates,
                                int syn_orig_num_tokens,
@@ -705,6 +718,7 @@ public:
                            const uint32_t seq_id, const int sort_order[3],
                            const bool prioritize_exact_match,
                            const bool single_exact_query_token,
+                           const bool prioritize_token_position,
                            size_t num_query_tokens,
                            int syn_orig_num_tokens,
                            const std::vector<posting_list_t::iterator_t>& posting_lists) const;
@@ -769,12 +783,13 @@ public:
                 tsl::htrie_map<char, token_leaf>& qtoken_set,
                 std::vector<std::vector<KV*>>& raw_result_kvs, std::vector<std::vector<KV*>>& override_result_kvs,
                 const size_t typo_tokens_threshold, const size_t group_limit,
-                const std::vector<std::string>& group_by_fields, const std::vector<const override_t*>& filter_overrides,
-                const string& default_sorting_field, bool prioritize_exact_match, bool exhaustive_search,
+                const std::vector<std::string>& group_by_fields,
+                const string& default_sorting_field, bool prioritize_exact_match,
+                const bool prioritize_token_position, bool exhaustive_search,
                 size_t concurrency, size_t search_cutoff_ms, size_t min_len_1typo, size_t min_len_2typo,
-                size_t max_candidates, const std::vector<infix_t>& infixes, const size_t max_extra_prefix,
+                size_t max_candidates, const std::vector<enable_t>& infixes, const size_t max_extra_prefix,
                 const size_t max_extra_suffix, const size_t facet_query_num_typos,
-                const bool filter_curated_hits, bool split_join_tokens) const;
+                const bool filter_curated_hits, enable_t split_join_tokens) const;
 
     void remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name);
 
@@ -857,6 +872,7 @@ public:
                              const size_t facet_query_num_typos,
                              const uint32_t* all_result_ids, const size_t& all_result_ids_len,
                              const std::vector<std::string>& group_by_fields,
+                             size_t max_candidates,
                              std::vector<facet_info_t>& facet_infos) const;
 
     void resolve_space_as_typos(std::vector<std::string>& qtokens, const std::string& field_name,
@@ -869,7 +885,7 @@ public:
                           size_t& exclude_token_ids_size) const;
 
     void do_infix_search(const size_t num_search_fields, const std::vector<search_field_t>& the_fields,
-                         const std::vector<infix_t>& infixes,
+                         const std::vector<enable_t>& infixes,
                          const std::vector<sort_by>& sort_fields,
                          std::vector<std::vector<art_leaf*>>& searched_queries, const size_t group_limit,
                          const std::vector<std::string>& group_by_fields, const size_t max_extra_prefix,
@@ -889,7 +905,10 @@ public:
                            const token_ordering& token_order,
                            const size_t typo_tokens_threshold, const size_t group_limit,
                            const std::vector<std::string>& group_by_fields, bool prioritize_exact_match,
-                           const bool exhaustive_search, const size_t concurrency, size_t min_len_1typo,
+                           const bool prioritize_token_position,
+                           const bool exhaustive_search, const size_t concurrency,
+                           const std::vector<bool>& prefixes,
+                           size_t min_len_1typo,
                            size_t min_len_2typo, const size_t max_candidates, const std::set<uint32_t>& curated_ids,
                            const std::vector<uint32_t>& curated_ids_sorted, const uint32_t* exclude_token_ids,
                            size_t exclude_token_ids_size,
@@ -924,6 +943,7 @@ public:
                              uint32_t*& all_result_ids, size_t& all_result_ids_len,
                              const size_t group_limit, const std::vector<std::string>& group_by_fields,
                              bool prioritize_exact_match,
+                             const bool prioritize_token_position,
                              std::set<uint64>& query_hashes,
                              const token_ordering token_order,
                              const std::vector<bool>& prefixes,
@@ -959,7 +979,9 @@ public:
                               std::vector<std::vector<art_leaf*>>& searched_queries,
                               tsl::htrie_map<char, token_leaf>& qtoken_set,
                               const size_t group_limit,
-                              const std::vector<std::string>& group_by_fields, bool prioritize_exact_match,
+                              const std::vector<std::string>& group_by_fields,
+                              bool prioritize_exact_match,
+                              const bool search_all_candidates,
                               const uint32_t* filter_ids, uint32_t filter_ids_length,
                               const uint32_t total_cost,
                               const int syn_orig_num_tokens,
@@ -984,7 +1006,7 @@ public:
                   const size_t typo_tokens_threshold, const size_t group_limit,
                   const std::vector<std::string>& group_by_fields, bool prioritize_exact_match,
                   const bool exhaustive_search, const size_t concurrency, size_t min_len_1typo, size_t min_len_2typo,
-                  const size_t max_candidates, const std::vector<infix_t>& infixes, const size_t max_extra_prefix,
+                  const size_t max_candidates, const std::vector<enable_t>& infixes, const size_t max_extra_prefix,
                   const size_t max_extra_suffix, uint32_t* filter_ids, uint32_t filter_ids_length,
                   const std::set<uint32_t>& curated_ids, const std::vector<uint32_t>& curated_ids_sorted,
                   const size_t num_search_fields, const uint32_t* exclude_token_ids, size_t exclude_token_ids_size,

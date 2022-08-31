@@ -28,7 +28,7 @@ void ReplicationClosure::Run() {
 // State machine implementation
 
 int ReplicationState::start(const butil::EndPoint & peering_endpoint, const int api_port,
-                            int election_timeout_ms, int snapshot_interval_s,
+                            int election_timeout_ms, int snapshot_max_byte_count_per_rpc,
                             const std::string & raft_dir, const std::string & nodes,
                             const std::atomic<bool>& quit_abruptly) {
 
@@ -78,13 +78,15 @@ int ReplicationState::start(const butil::EndPoint & peering_endpoint, const int 
     braft::FLAGS_raft_max_append_entries_cache_size = 8;
 
     // flag controls snapshot download size of each RPC
-    braft::FLAGS_raft_max_byte_count_per_rpc = 4 * 1024 * 1024; // 4 MB
+    braft::FLAGS_raft_max_byte_count_per_rpc = snapshot_max_byte_count_per_rpc;
+
+    // automatic snapshot is disabled since it caused issues during slow follower catch-ups
+    node_options.snapshot_interval_s = -1;
 
     node_options.catchup_margin = config->get_healthy_read_lag();
     node_options.election_timeout_ms = election_timeout_ms;
     node_options.fsm = this;
     node_options.node_owns_fsm = false;
-    node_options.snapshot_interval_s = snapshot_interval_s;
     node_options.filter_before_copy_remote = true;
     std::string prefix = "local://" + raft_dir;
     node_options.log_uri = prefix + "/" + log_dir_name;
@@ -126,6 +128,7 @@ int ReplicationState::start(const butil::EndPoint & peering_endpoint, const int 
 
     LOG(INFO) << "Node last_index: " << node_status.last_index;
 
+    std::unique_lock lock(node_mutex);
     this->node = node;
     return 0;
 }
@@ -262,7 +265,7 @@ void ReplicationState::write_to_leader(const std::shared_ptr<http_req>& request,
     auto raw_req = request->_req;
     const std::string& path = std::string(raw_req->path.base, raw_req->path.len);
     const std::string& scheme = std::string(raw_req->scheme->name.base, raw_req->scheme->name.len);
-    const std::string url = get_leader_url_path(leader_addr, path, scheme);
+    const std::string url = get_node_url_path(leader_addr, path, scheme);
 
     thread_pool->enqueue([request, response, server, path, url, this]() {
         pending_writes++;
@@ -318,10 +321,10 @@ void ReplicationState::write_to_leader(const std::shared_ptr<http_req>& request,
     });
 }
 
-std::string ReplicationState::get_leader_url_path(const std::string& leader_addr, const std::string& path,
-                                                  const std::string& protocol) const {
+std::string ReplicationState::get_node_url_path(const std::string& node_addr, const std::string& path,
+                                                const std::string& protocol) const {
     std::vector<std::string> addr_parts;
-    StringUtils::split(leader_addr, addr_parts, ":");
+    StringUtils::split(node_addr, addr_parts, ":");
     std::string leader_host_port = addr_parts[0] + ":" + addr_parts[2];
     std::string url = protocol + "://" + leader_host_port + path;
     return url;
@@ -570,7 +573,8 @@ void ReplicationState::refresh_catchup_status(bool log_msg) {
         return ;
     }
 
-    bool leader_or_follower = (node->is_leader() || !node->leader_id().is_empty());
+    bool is_leader = node->is_leader();
+    bool leader_or_follower = (is_leader || !node->leader_id().is_empty());
     if(!leader_or_follower) {
         read_caught_up = write_caught_up = false;
         return ;
@@ -623,6 +627,52 @@ void ReplicationState::refresh_catchup_status(bool log_msg) {
             this->write_caught_up = true;
         }
     }
+
+    if(is_leader || !this->read_caught_up) {
+        // no need to re-check status with leader
+        return ;
+    }
+
+    lock.lock();
+
+    if(node->leader_id().is_empty()) {
+        LOG(ERROR) << "Could not get leader status, as node does not have a leader!";
+        return ;
+    }
+
+    const std::string & leader_addr = node->leader_id().to_string();
+    lock.unlock();
+
+    const std::string protocol = api_uses_ssl ? "https" : "http";
+    std::string url = get_node_url_path(leader_addr, "/status", protocol);
+
+    std::string api_res;
+    std::map<std::string, std::string> res_headers;
+    long status_code = HttpClient::get_response(url, api_res, res_headers);
+    if(status_code == 404) {
+        // earlier versions don't have this end-point, so we just ignore
+        return ;
+    }
+
+    if(status_code != 200) {
+        this->read_caught_up = false;
+        return ;
+    }
+
+    // compare leader's applied log with local applied to see if we are lagging
+    nlohmann::json leader_status = nlohmann::json::parse(api_res);
+    if(leader_status.contains("committed_index")) {
+        int64_t leader_committed_index = leader_status["committed_index"].get<int64_t>();
+        if(leader_committed_index <= n_status.committed_index) {
+            // this can happen due to network latency in making the /status call
+            // we will refrain from changing current status
+            return ;
+        }
+        this->read_caught_up = ((leader_committed_index - n_status.committed_index) < healthy_read_lag);
+    } else {
+        // we will refrain from changing current status
+        LOG(ERROR) << "Error, `committed_index` key not found in /status response from leader.";
+    }
 }
 
 ReplicationState::ReplicationState(HttpServer* server, BatchedIndexer* batched_indexer,
@@ -636,7 +686,8 @@ ReplicationState::ReplicationState(HttpServer* server, BatchedIndexer* batched_i
         config(config),
         num_collections_parallel_load(num_collections_parallel_load),
         num_documents_parallel_load(num_documents_parallel_load),
-        ready(false), shutting_down(false), pending_writes(0) {
+        ready(false), shutting_down(false), pending_writes(0),
+        last_snapshot_ts(std::time(nullptr)), snapshot_interval_s(config->get_snapshot_interval_seconds()) {
 
 }
 
@@ -690,7 +741,7 @@ void ReplicationState::do_dummy_write() {
     lock.unlock();
 
     const std::string protocol = api_uses_ssl ? "https" : "http";
-    std::string url = get_leader_url_path(leader_addr, "/health", protocol);
+    std::string url = get_node_url_path(leader_addr, "/health", protocol);
 
     std::string api_res;
     std::map<std::string, std::string> res_headers;
@@ -769,6 +820,102 @@ bool ReplicationState::is_leader() {
     }
 
     return node->is_leader();
+}
+
+nlohmann::json ReplicationState::get_status() {
+    nlohmann::json status;
+
+    std::shared_lock lock(node_mutex);
+    if(!node) {
+        // `node` is not yet initialized (probably loading snapshot)
+        status["state"] = "NOT_READY";
+        status["committed_index"] = 0;
+        status["queued_writes"] = 0;
+        return status;
+    }
+
+    braft::NodeStatus node_status;
+    node->get_status(&node_status);
+    lock.unlock();
+
+    status["state"] = braft::state2str(node_status.state);
+    status["committed_index"] = node_status.committed_index;
+    status["queued_writes"] = batched_indexer->get_queued_writes();
+
+    return status;
+}
+
+void ReplicationState::do_snapshot(const std::string& nodes) {
+    auto current_ts = std::time(nullptr);
+    if(current_ts - last_snapshot_ts < snapshot_interval_s) {
+        //LOG(INFO) << "Skipping snapshot: not enough time has elapsed.";
+        return;
+    }
+
+    LOG(INFO) << "Snapshot timer is active, current_ts: " << current_ts << ", last_snapshot_ts: " << last_snapshot_ts;
+
+    if(is_leader()) {
+        // run the snapshot only if there are no other recovering followers
+        std::vector<braft::PeerId> peers;
+        braft::Configuration peer_config;
+        peer_config.parse_from(nodes);
+        peer_config.list_peers(&peers);
+
+        std::shared_lock lock(node_mutex);
+        std::string my_addr = node->node_id().peer_id.to_string();
+        lock.unlock();
+
+        //LOG(INFO) << "my_addr: " << my_addr;
+        bool all_peers_healthy = true;
+
+        // iterate peers and check health status
+        for(const auto& peer: peers) {
+            const std::string& peer_addr = peer.to_string();
+            //LOG(INFO) << "do_snapshot, peer_addr: " << peer_addr;
+
+            if(my_addr == peer_addr) {
+                // skip self
+                //LOG(INFO) << "do_snapshot: skipping self, peer_addr: " << peer_addr;
+                continue;
+            }
+
+            const std::string protocol = api_uses_ssl ? "https" : "http";
+            std::string url = get_node_url_path(peer_addr, "/health", protocol);
+            std::string api_res;
+            std::map<std::string, std::string> res_headers;
+            long status_code = HttpClient::get_response(url, api_res, res_headers);
+            bool peer_healthy = (status_code == 200);
+
+            //LOG(INFO) << "do_snapshot, status_code: " << status_code;
+
+            if(!peer_healthy) {
+                LOG(WARNING) << "Peer " << peer_addr << " reported unhealthy during snapshot pre-check.";
+            }
+
+            all_peers_healthy = all_peers_healthy && peer_healthy;
+        }
+
+        if(!all_peers_healthy) {
+            LOG(WARNING) << "Unable to trigger snapshot as one or more of the peers reported unhealthy.";
+            return ;
+        }
+    }
+
+    TimedSnapshotClosure* snapshot_closure = new TimedSnapshotClosure(this);
+    std::shared_lock lock(node_mutex);
+    node->snapshot(snapshot_closure);
+    last_snapshot_ts = current_ts;
+}
+
+void TimedSnapshotClosure::Run() {
+    // Auto delete this after Done()
+    std::unique_ptr<TimedSnapshotClosure> self_guard(this);
+
+    if(status().ok()) {
+        LOG(INFO) << "Timed snapshot succeeded!";
+    } else {
+        LOG(ERROR) << "Timed snapshot failed, error: " << status().error_str() << ", code: " << status().error_code();
+    }
 }
 
 void OnDemandSnapshotClosure::Run() {

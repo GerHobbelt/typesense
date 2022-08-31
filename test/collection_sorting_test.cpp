@@ -240,7 +240,7 @@ TEST_F(CollectionSortingTest, FrequencyOrderedTokensWithoutDefaultSortingField) 
                             0, spp::sparse_hash_set<std::string>(), spp::sparse_hash_set<std::string>(),
                             10, "", 30, 4, "title", 20, {}, {}, {}, 0,
                             "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7,
-                            false, 2).get();
+                            off, 2).get();
 
     // [11 + 10] + 9 + 8 + 7 + 6 + 5 + 4 + 3 + 2
     ASSERT_EQ(21, results["found"].get<size_t>());
@@ -1729,10 +1729,10 @@ TEST_F(CollectionSortingTest, RepeatingTokenRanking) {
     ASSERT_EQ("2", results["hits"][2]["document"]["id"].get<std::string>());
     ASSERT_EQ("1", results["hits"][3]["document"]["id"].get<std::string>());
 
-    ASSERT_EQ(4284743939, results["hits"][0]["text_match"].get<uint32_t>());
-    ASSERT_EQ(4284743683, results["hits"][1]["text_match"].get<uint32_t>());
-    ASSERT_EQ(4284743683, results["hits"][2]["text_match"].get<uint32_t>());
-    ASSERT_EQ(4284743683, results["hits"][3]["text_match"].get<uint32_t>());
+    ASSERT_EQ(144681433946980355, results["hits"][0]["text_match"].get<size_t>());
+    ASSERT_EQ(144681433946914819, results["hits"][1]["text_match"].get<size_t>());
+    ASSERT_EQ(144681433946914819, results["hits"][2]["text_match"].get<size_t>());
+    ASSERT_EQ(144681433946914819, results["hits"][3]["text_match"].get<size_t>());
 
     collectionManager.drop_collection("coll1");
 }

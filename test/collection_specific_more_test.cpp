@@ -50,7 +50,7 @@ TEST_F(CollectionSpecificMoreTest, MaxCandidatesShouldBeRespected) {
                                  spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 20, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7,
-                                 false, 1000).get();
+                                 fallback, 1000).get();
 
     ASSERT_EQ(200, results["found"].get<size_t>());
     collectionManager.drop_collection("coll1");
@@ -87,7 +87,6 @@ TEST_F(CollectionSpecificMoreTest, PrefixExpansionWhenExactMatchExists) {
 }
 
 TEST_F(CollectionSpecificMoreTest, PrefixExpansionOnSingleField) {
-    // when no default sorting field is provided, tokens must be ordered on frequency
     Collection *coll1;
     std::vector<field> fields = {field("title", field_types::STRING, false),
                                  field("points", field_types::INT32, false)};
@@ -429,4 +428,298 @@ TEST_F(CollectionSpecificMoreTest, SortByStringEmptyValuesConfigThirdField) {
     results = coll1->search("*", {}, "", {}, sort_fields, {0}, 10, 1, MAX_SCORE, {true}).get();
     ASSERT_EQ(4, results["hits"].size());
     ASSERT_EQ("2", results["hits"][3]["document"]["id"].get<std::string>());
+}
+
+TEST_F(CollectionSpecificMoreTest, WrongTypoCorrection) {
+    std::vector<field> fields = {field("title", field_types::STRING, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["title"] = "Gold plated arvin";
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    auto results = coll1->search("earrings", {"title"},
+                                 "", {}, {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 1, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 5, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true).get();
+
+    ASSERT_EQ(0, results["hits"].size());
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionSpecificMoreTest, PositionalTokenRanking) {
+    Collection *coll1;
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll1 = collectionManager.get_collection("coll1").get();
+    if(coll1 == nullptr) {
+        coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
+    }
+
+    std::vector<std::string> tokens = {
+        "Alpha Beta Gamma", "Omega Alpha Theta", "Omega Theta Alpha", "Indigo Omega Theta Alpha"
+    };
+
+    for(size_t i = 0; i < tokens.size(); i++) {
+        std::string title = tokens[i];
+        nlohmann::json doc;
+        doc["title"] = title;
+        doc["points"] = i;
+        coll1->add(doc.dump());
+    }
+
+    auto results = coll1->search("alpha", {"title"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                                 Index::DROP_TOKENS_THRESHOLD,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                                 "", 10, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                                 4, {off}, 32767, 32767, 2,
+                                 false, true).get();
+
+    ASSERT_EQ(4, results["hits"].size());
+    ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("2", results["hits"][2]["document"]["id"].get<std::string>());
+    ASSERT_EQ("3", results["hits"][3]["document"]["id"].get<std::string>());
+
+    results = coll1->search("alpha", {"title"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                            Index::DROP_TOKENS_THRESHOLD,
+                            spp::sparse_hash_set<std::string>(),
+                            spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                            "", 10, {}, {}, {}, 0,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                            4, {off}, 32767, 32767, 2,
+                            false, false).get();
+
+    ASSERT_EQ(4, results["hits"].size());
+    ASSERT_EQ("3", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("2", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][2]["document"]["id"].get<std::string>());
+    ASSERT_EQ("0", results["hits"][3]["document"]["id"].get<std::string>());
+
+    results = coll1->search("theta alpha", {"title"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                            Index::DROP_TOKENS_THRESHOLD,
+                            spp::sparse_hash_set<std::string>(),
+                            spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                            "", 10, {}, {}, {}, 0,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                            4, {off}, 32767, 32767, 2,
+                            false, false).get();
+
+    ASSERT_EQ(3, results["hits"].size());
+    ASSERT_EQ("3", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("2", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][2]["document"]["id"].get<std::string>());
+
+    results = coll1->search("theta alpha", {"title"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                            Index::DROP_TOKENS_THRESHOLD,
+                            spp::sparse_hash_set<std::string>(),
+                            spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                            "", 10, {}, {}, {}, 0,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                            4, {off}, 32767, 32767, 2,
+                            false, true).get();
+    ASSERT_EQ(3, results["hits"].size());
+    ASSERT_EQ("2", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("3", results["hits"][2]["document"]["id"].get<std::string>());
+}
+
+TEST_F(CollectionSpecificMoreTest, PositionalTokenRankingWithArray) {
+    Collection *coll1;
+    std::vector<field> fields = {field("tags", field_types::STRING_ARRAY, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll1 = collectionManager.get_collection("coll1").get();
+    if(coll1 == nullptr) {
+        coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
+    }
+
+    nlohmann::json doc1;
+    doc1["tags"] = {"alpha foo", "gamma", "beta alpha"};
+    doc1["points"] = 100;
+
+    nlohmann::json doc2;
+    doc2["tags"] = {"omega", "omega beta alpha"};
+    doc2["points"] = 200;
+
+    coll1->add(doc1.dump());
+    coll1->add(doc2.dump());
+
+    auto results = coll1->search("alpha", {"tags"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                                 Index::DROP_TOKENS_THRESHOLD,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                                 "", 10, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                                 4, {off}, 32767, 32767, 2,
+                                 false, false).get();
+
+    ASSERT_EQ(2, results["hits"].size());
+    ASSERT_EQ("1", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("0", results["hits"][1]["document"]["id"].get<std::string>());
+
+    results = coll1->search("alpha", {"tags"}, "", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                            Index::DROP_TOKENS_THRESHOLD,
+                            spp::sparse_hash_set<std::string>(),
+                            spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                            "", 10, {}, {}, {}, 0,
+                            "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                            4, {off}, 32767, 32767, 2,
+                            false, true).get();
+
+    ASSERT_EQ(2, results["hits"].size());
+    ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+}
+
+TEST_F(CollectionSpecificMoreTest, ExactFilteringOnArray) {
+    Collection *coll1;
+    std::vector<field> fields = {field("tags", field_types::STRING_ARRAY, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll1 = collectionManager.get_collection("coll1").get();
+    if(coll1 == nullptr) {
+        coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
+    }
+
+    nlohmann::json doc1;
+    doc1["tags"] = {"§ 23",
+                    "§ 34d EStG",
+                    "§ 23 Satz EStG"};
+    doc1["points"] = 100;
+
+    coll1->add(doc1.dump());
+
+    auto results = coll1->search("*", {"tags"}, "tags:=§ 23 EStG", {}, {}, {0}, 100, 1, MAX_SCORE, {true},
+                                 Index::DROP_TOKENS_THRESHOLD,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
+                                 "", 10, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
+                                 4, {off}, 32767, 32767, 2,
+                                 false, false).get();
+
+    ASSERT_EQ(0, results["hits"].size());
+}
+
+TEST_F(CollectionSpecificMoreTest, SplitTokensCrossFieldMatching) {
+    std::vector<field> fields = {field("name", field_types::STRING, false),
+                                 field("brand", field_types::STRING, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["name"] = "Vitamin C1";
+    doc1["brand"] = "Paulas Choice";
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    auto results = coll1->search("paulaschoice c1", {"name", "brand"},
+                                 "", {}, {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 0).get();
+
+    ASSERT_EQ(1, results["hits"].size());
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionSpecificMoreTest, PrefixSearchOnSpecificFields) {
+    std::vector<field> fields = {field("name", field_types::STRING, false),
+                                 field("brand", field_types::STRING, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    // atleast 4 tokens that begin with "girl" to trigger this regression
+    std::vector<std::string> names = {
+        "Jungle Girl", "Jungle Girlz", "Jam Foo1", "Jam Foo2", "Jam Foo3", "Jam Foo4", "Jam Foo"
+    };
+
+    std::vector<std::string> brands = {
+        "Foobar", "Foobar2", "Girlx", "Girly", "Girlz", "Girlz", "Girlzz"
+    };
+
+    for(size_t i = 0; i < names.size(); i++) {
+        nlohmann::json doc1;
+        doc1["name"] = names[i];
+        doc1["brand"] = brands[i];
+        ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+    }
+
+    auto results = coll1->search("jungle girl", {"name", "brand"},
+                                 "", {}, {}, {0}, 10,
+                                 1, FREQUENCY, {false, true},
+                                 0).get();
+
+    ASSERT_EQ(1, results["hits"].size());
+
+    results = coll1->search("jam foo", {"name"},
+                            "", {}, {}, {0}, 10,
+                            1, FREQUENCY, {true},
+                            0).get();
+
+    ASSERT_EQ(4, results["hits"].size());
+    ASSERT_EQ("6", results["hits"][0]["document"]["id"].get<std::string>());
+
+    results = coll1->search("jam foo", {"name"},
+                            "", {}, {}, {0}, 10,
+                            1, FREQUENCY, {false},
+                            0).get();
+
+    ASSERT_EQ(1, results["hits"].size());
+
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionSpecificMoreTest, OrderWithThreeSortFields) {
+    std::vector<field> fields = {field("name", field_types::STRING, false),
+                                 field("type", field_types::INT32, false),
+                                 field("valid_from", field_types::INT64, false),
+                                 field("created_at", field_types::INT64, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    nlohmann::json doc1;
+    doc1["name"] = "should be 1st";
+    doc1["type"] = 2;
+    doc1["valid_from"] = 1655741107972;
+    doc1["created_at"] = 1655741107724;
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    doc1["name"] = "should be 2nd";
+    doc1["type"] = 1;
+    doc1["valid_from"] = 1656309617303;
+    doc1["created_at"] = 1656309617194;
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    doc1["name"] = "should be 3rd";
+    doc1["type"] = 0;
+    doc1["valid_from"] = 0;
+    doc1["created_at"] = 1656309677131;
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    sort_fields = {sort_by("type", "desc"), sort_by("valid_from", "desc"), sort_by("created_at", "desc")};
+
+    auto results = coll1->search("s", {"name"},
+                                 "", {}, sort_fields, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 0).get();
+
+    ASSERT_EQ(3, results["hits"].size());
+    ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("2", results["hits"][2]["document"]["id"].get<std::string>());
+
+    collectionManager.drop_collection("coll1");
 }

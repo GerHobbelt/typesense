@@ -184,7 +184,7 @@ Option<nlohmann::json> Collection::add(const std::string & json_str,
                                        const DIRTY_VALUES& dirty_values) {
     nlohmann::json document;
     std::vector<std::string> json_lines = {json_str};
-    const nlohmann::json& res = add_many(json_lines, document, operation, id, dirty_values);
+    const nlohmann::json& res = add_many(json_lines, document, operation, id, dirty_values, false, false);
 
     if(!res["success"].get<bool>()) {
         nlohmann::json res_doc;
@@ -204,7 +204,7 @@ Option<nlohmann::json> Collection::add(const std::string & json_str,
 
 nlohmann::json Collection::add_many(std::vector<std::string>& json_lines, nlohmann::json& document,
                                     const index_operation_t& operation, const std::string& id,
-                                    const DIRTY_VALUES& dirty_values) {
+                                    const DIRTY_VALUES& dirty_values, const bool& write_docs, const bool& write_id) {
     //LOG(INFO) << "Memory ratio. Max = " << max_memory_ratio << ", Used = " << SystemMetrics::used_memory_ratio();
     std::vector<index_record> index_records;
 
@@ -281,7 +281,7 @@ nlohmann::json Collection::add_many(std::vector<std::string>& json_lines, nlohma
         do_batched_index:
 
         if((i+1) % index_batch_size == 0 || i == json_lines.size()-1 || repeated_doc) {
-            batch_index(index_records, json_lines, num_indexed);
+            batch_index(index_records, json_lines, num_indexed, write_docs, write_id);
 
             // to return the document for the single doc add cases
             if(index_records.size() == 1) {
@@ -305,7 +305,7 @@ bool Collection::is_exceeding_memory_threshold() const {
 }
 
 void Collection::batch_index(std::vector<index_record>& index_records, std::vector<std::string>& json_out,
-                             size_t &num_indexed) {
+                             size_t &num_indexed, const bool& write_docs, const bool& write_id) {
 
     batch_index_in_memory(index_records);
 
@@ -349,8 +349,14 @@ void Collection::batch_index(std::vector<index_record>& index_records, std::vect
                     index_record.index_success();
                 }
             }
-
             res["success"] = index_record.indexed.ok();
+
+            if (write_docs & index_record.indexed.ok()) {
+                res["document"] = index_record.is_update ? index_record.new_doc : index_record.doc;
+            }
+            if (write_id & index_record.indexed.ok()) {
+                res["id"] = index_record.is_update ? index_record.new_doc["id"] : index_record.doc["id"];
+            }
             if(!index_record.indexed.ok()) {
                 res["document"] = json_out[index_record.position];
                 res["error"] = index_record.indexed.error();
@@ -419,7 +425,8 @@ void Collection::curate_results(string& actual_query, bool enable_overrides, boo
                                 std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
                                 std::vector<uint32_t>& excluded_ids,
                                 std::vector<const override_t*>& filter_overrides,
-                                bool& filter_curated_hits) const {
+                                bool& filter_curated_hits,
+                                std::string& curated_sort_by) const {
 
     std::set<uint32_t> excluded_set;
 
@@ -486,6 +493,7 @@ void Collection::curate_results(string& actual_query, bool enable_overrides, boo
                 }
 
                 filter_curated_hits = override.filter_curated_hits;
+                curated_sort_by = override.sort_by;
             }
         }
     }
@@ -743,13 +751,14 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
                                   const size_t search_stop_millis,
                                   const size_t min_len_1typo,
                                   const size_t min_len_2typo,
-                                  bool split_join_tokens,
+                                  enable_t split_join_tokens,
                                   const size_t max_candidates,
-                                  const std::vector<infix_t>& infixes,
+                                  const std::vector<enable_t>& infixes,
                                   const size_t max_extra_prefix,
                                   const size_t max_extra_suffix,
                                   const size_t facet_query_num_typos,
-                                  const size_t filter_curated_hits_option) const {
+                                  const size_t filter_curated_hits_option,
+                                  const bool prioritize_token_position) const {
 
     std::shared_lock lock(mutex);
 
@@ -915,29 +924,6 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
         }
     }
 
-    // validate sort fields and standardize
-
-    std::vector<sort_by> sort_fields_std;
-    auto sort_validation_op = validate_and_standardize_sort_fields(sort_fields, sort_fields_std);
-    if(!sort_validation_op.ok()) {
-        return Option<nlohmann::json>(sort_validation_op.code(), sort_validation_op.error());
-    }
-
-    // apply bucketing on text match score
-    int match_score_index = -1;
-    for(size_t i = 0; i < sort_fields_std.size(); i++) {
-        if(sort_fields_std[i].name == sort_field_const::text_match && sort_fields_std[i].text_match_buckets != 0) {
-            match_score_index = i;
-
-            if(sort_fields_std[i].text_match_buckets > 1) {
-                // we will disable prioritize exact match because it's incompatible with bucketing
-                prioritize_exact_match = false;
-            }
-
-            break;
-        }
-    }
-
     // check for valid pagination
     if(page < 1) {
         std::string message = "Page must be an integer of value greater than 0.";
@@ -994,8 +980,9 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
     std::vector<const override_t*> filter_overrides;
     std::string query = raw_query;
     bool filter_curated_hits = false;
+    std::string curated_sort_by;
     curate_results(query, enable_overrides, pre_segmented_query, pinned_hits, hidden_hits,
-                   included_ids, excluded_ids, filter_overrides, filter_curated_hits);
+                   included_ids, excluded_ids, filter_overrides, filter_curated_hits, curated_sort_by);
 
     if(filter_curated_hits_option == 0 || filter_curated_hits_option == 1) {
         // When query param has explicit value set, override level configuration takes lower precedence.
@@ -1024,6 +1011,43 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
         LOG(INFO) << "----";
     }
     */
+
+    // validate sort fields and standardize
+
+    std::vector<sort_by> sort_fields_std;
+
+    if(curated_sort_by.empty()) {
+        auto sort_validation_op = validate_and_standardize_sort_fields(sort_fields, sort_fields_std);
+        if(!sort_validation_op.ok()) {
+            return Option<nlohmann::json>(sort_validation_op.code(), sort_validation_op.error());
+        }
+    } else {
+        std::vector<sort_by> curated_sort_fields;
+        bool parsed_sort_by = CollectionManager::parse_sort_by_str(curated_sort_by, curated_sort_fields);
+        if(!parsed_sort_by) {
+            return Option<nlohmann::json>(400, "Parameter `sort_by` is malformed.");
+        }
+
+        auto sort_validation_op = validate_and_standardize_sort_fields(curated_sort_fields, sort_fields_std);
+        if(!sort_validation_op.ok()) {
+            return Option<nlohmann::json>(sort_validation_op.code(), sort_validation_op.error());
+        }
+    }
+
+    // apply bucketing on text match score
+    int match_score_index = -1;
+    for(size_t i = 0; i < sort_fields_std.size(); i++) {
+        if(sort_fields_std[i].name == sort_field_const::text_match && sort_fields_std[i].text_match_buckets != 0) {
+            match_score_index = i;
+
+            if(sort_fields_std[i].text_match_buckets > 1) {
+                // we will disable prioritize exact match because it's incompatible with bucketing
+                prioritize_exact_match = false;
+            }
+
+            break;
+        }
+    }
 
     //LOG(INFO) << "Num indices used for querying: " << indices.size();
     std::vector<query_tokens_t> field_query_tokens;
@@ -1080,8 +1104,8 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
                                                  per_page, page, token_order, prefixes,
                                                  drop_tokens_threshold, typo_tokens_threshold,
                                                  group_by_fields, group_limit, default_sorting_field,
-                                                 prioritize_exact_match,
-                                                 exhaustive_search, 4, filter_overrides,
+                                                 prioritize_exact_match, prioritize_token_position,
+                                                 exhaustive_search, 4,
                                                  search_stop_millis,
                                                  min_len_1typo, min_len_2typo, max_candidates, infixes,
                                                  max_extra_prefix, max_extra_suffix, facet_query_num_typos,
@@ -1261,7 +1285,8 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
             std::vector<highlight_t> highlights;
             StringUtils string_utils;
 
-            for(auto& highlight_item: highlight_items) {
+            for(size_t i = 0; i < highlight_items.size(); i++) {
+                auto& highlight_item = highlight_items[i];
                 const std::string& field_name = highlight_item.name;
                 if(search_schema.count(field_name) == 0) {
                     continue;
@@ -1273,7 +1298,7 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query, const s
                                     search_field.type == field_types::STRING_ARRAY)) {
 
                     highlight_t highlight;
-                    highlight_result(raw_query, search_field, highlight_item.qtoken_leaves, q_tokens, field_order_kv,
+                    highlight_result(raw_query, search_field, i, highlight_item.qtoken_leaves, q_tokens, field_order_kv,
                                      document,string_utils, snippet_threshold, highlight_affix_num_tokens,
                                      highlight_item.fully_highlighted, highlight_item.infix,
                                      highlight_start_tag, highlight_end_tag, index_symbols, highlight);
@@ -1528,7 +1553,7 @@ void Collection::process_highlight_fields(const std::vector<std::string>& search
                                           const spp::sparse_hash_set<std::string>& exclude_fields,
                                           const string& highlight_fields,
                                           const std::string& highlight_full_fields,
-                                          const std::vector<infix_t>& infixes,
+                                          const std::vector<enable_t>& infixes,
                                           std::vector<std::string>& q_tokens,
                                           const tsl::htrie_map<char, token_leaf>& qtoken_set,
                                           std::vector<highlight_field_t>& highlight_items) const {
@@ -1547,7 +1572,7 @@ void Collection::process_highlight_fields(const std::vector<std::string>& search
     for(size_t i = 0; i < search_fields.size(); i++) {
         const auto& field_name = search_fields[i];
 
-        infix_t field_infix = (i < infixes.size()) ? infixes[i] : infixes[0];
+        enable_t field_infix = (i < infixes.size()) ? infixes[i] : infixes[0];
         if(field_infix != off) {
             fields_infixed_set.insert(field_name);
         }
@@ -1828,6 +1853,7 @@ bool Collection::facet_value_to_string(const facet &a_facet, const facet_count_t
 }
 
 void Collection::highlight_result(const std::string& raw_query, const field &search_field,
+                                  const size_t search_field_index,
                                   const tsl::htrie_map<char, token_leaf>& qtoken_leaves,
                                   const std::vector<std::string>& q_tokens,
                                   const KV* field_order_kv, const nlohmann::json & document,
@@ -1872,11 +1898,13 @@ void Collection::highlight_result(const std::string& raw_query, const field &sea
                 array_len = document[search_field.name].size();
             }
 
+            const std::vector<token_positions_t> empty_offsets;
+
             for(size_t i = 0; i < array_len; i++) {
                 std::string text = field_is_array ? document[search_field.name][i] : document[search_field.name];
                 StringUtils::tolowercase(text);
                 if(text.size() < 100 && text.find(raw_query_tokens.front()) != std::string::npos) {
-                    const Match & this_match = Match(field_order_kv->key, {}, false, false);
+                    const Match & this_match = Match(field_order_kv->key, empty_offsets, false, false);
                     uint64_t this_match_score = this_match.get_match_score(0, 1);
                     match_indices.emplace_back(this_match, this_match_score, i);
                 }
@@ -1896,7 +1924,7 @@ void Collection::highlight_result(const std::string& raw_query, const field &sea
             posting_lists.push_back(token_leaf.leaf->values);
         }
 
-        std::unordered_map<size_t, std::vector<token_positions_t>> array_token_positions;
+        std::map<size_t, std::vector<token_positions_t>> array_token_positions;
         posting_t::get_array_token_positions(field_order_kv->key, posting_lists, array_token_positions);
 
         for(const auto& kv: array_token_positions) {
@@ -1911,9 +1939,10 @@ void Collection::highlight_result(const std::string& raw_query, const field &sea
             uint64_t this_match_score = this_match.get_match_score(1, token_positions.size());
             match_indices.emplace_back(this_match, this_match_score, array_index);
 
-            /*LOG(INFO) << "doc_id: " << document["id"]   << ", words_present: " << size_t(this_match.words_present)
-                                                   << ", match_score: " << this_match_score
-                                                   << ", match.distance: " << size_t(this_match.distance);*/
+            /*LOG(INFO) << "doc_id: " << document["id"] << ", search_field: " << search_field.name
+                      << ", words_present: " << size_t(this_match.words_present)
+                      << ", match_score: " << this_match_score
+                      << ", match.distance: " << size_t(this_match.distance);*/
         }
     }
 
@@ -2129,6 +2158,7 @@ void Collection::highlight_result(const std::string& raw_query, const field &sea
     }
 
     highlight.field = search_field.name;
+    highlight.field_index = search_field_index;
 
     if(!match_indices.empty()) {
         highlight.match_score = match_indices[0].match_score;
@@ -2779,6 +2809,10 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
         }
 
         const std::string& field_name = kv.value()["name"].get<std::string>();
+
+        if(field_name == "id") {
+            return Option<bool>(400, "Field `" + field_name + "` cannot be altered.");
+        }
 
         if(kv.value().contains("drop")) {
             delete_field_names.insert(field_name);

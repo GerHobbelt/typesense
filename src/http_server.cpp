@@ -15,10 +15,10 @@ HttpServer::HttpServer(const std::string & version, const std::string & listen_a
                        uint32_t listen_port, const std::string & ssl_cert_path, const std::string & ssl_cert_key_path,
                        const uint64_t ssl_refresh_interval_ms, bool cors_enabled,
                        const std::set<std::string>& cors_domains, ThreadPool* thread_pool):
-                       SSL_REFRESH_INTERVAL_MS(ssl_refresh_interval_ms),
-                       exit_loop(false), version(version), listen_address(listen_address), listen_port(listen_port),
-                       ssl_cert_path(ssl_cert_path), ssl_cert_key_path(ssl_cert_key_path),
-                       cors_enabled(cors_enabled), cors_domains(cors_domains), thread_pool(thread_pool) {
+        SSL_REFRESH_INTERVAL_MS(ssl_refresh_interval_ms),
+        exit_loop(false), version(version), listen_address(listen_address), listen_port(listen_port),
+        ssl_cert_path(ssl_cert_path), ssl_cert_key_path(ssl_cert_key_path),
+        cors_enabled(cors_enabled), cors_domains(cors_domains), thread_pool(thread_pool) {
     accept_ctx = new h2o_accept_ctx_t();
     h2o_config_init(&config);
     hostconf = h2o_config_register_host(&config, h2o_iovec_init(H2O_STRLIT("default")), 65535);
@@ -34,8 +34,11 @@ HttpServer::HttpServer(const std::string & version, const std::string & listen_a
     message_dispatcher = new http_message_dispatcher;
     message_dispatcher->init(ctx.loop);
 
-    ssl_refresh_timer.timer.expire_at = 0;  // used during destructor
-    metrics_refresh_timer.timer.expire_at = 0;  // used during destructor
+    // used during destructor
+    ssl_refresh_timer.timer.expire_at = 0;
+    metrics_refresh_timer.timer.expire_at = 0;
+
+    meta_thread_pool = new ThreadPool(4);
 
     accept_ctx->ssl_ctx = nullptr;
 }
@@ -269,12 +272,12 @@ void HttpServer::on_res_generator_dispose(void *self) {
         custom_generator->res()->final = true;
         custom_generator->res()->generator = nullptr;
         custom_generator->res()->is_alive = false;
+        custom_generator->req()->is_diposed = true;
         custom_generator->req()->notify();
         custom_generator->res()->notify();
     }
 
     // without this, warning about memory allocated by std::string leaking happens
-    std::string().swap(custom_generator->h2o_handler->api_auth_key_sent);
     delete custom_generator;
 }
 
@@ -306,11 +309,18 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     std::string metric_identifier = http_method + " " + path_without_query;
     AppMetrics::get_instance().increment_count(metric_identifier, 1);
 
+    std::string client_ip = "0.0.0.0";
+
+    if(Config::get_instance().get_enable_access_logging() ||
+       Config::get_instance().get_log_slow_requests_time_ms() >= 0) {
+        client_ip = http_req::get_ip_addr(req).ip;
+    }
+
     if(Config::get_instance().get_enable_access_logging()) {
         uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
         auto epoch_millis = now / 1000;
-        AppMetrics::get_instance().write_access_log(epoch_millis, http_req::get_ip_addr(req).ip, metric_identifier);
+        AppMetrics::get_instance().write_access_log(epoch_millis, client_ip.c_str(), metric_identifier);
     }
 
     // Handle CORS
@@ -387,14 +397,13 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
 
     // Extract auth key from header. If that does not exist, look for a GET parameter.
     ssize_t auth_header_cursor = h2o_find_header_by_str(&req->headers, http_req::AUTH_HEADER, strlen(http_req::AUTH_HEADER), -1);
+    std::string api_auth_key_sent;
 
     if(auth_header_cursor != -1) {
         h2o_iovec_t & slot = req->headers.entries[auth_header_cursor].value;
-        const std::string api_auth_key_sent = std::string(slot.base, slot.len);
-        // NOTE: directly using `h2o_handler->api_auth_key_sent` without an intermediate string causes memory errors
-        h2o_handler->api_auth_key_sent = api_auth_key_sent;
+        api_auth_key_sent = std::string(slot.base, slot.len);
     } else if(query_map.count(http_req::AUTH_HEADER) != 0) {
-        h2o_handler->api_auth_key_sent = query_map[http_req::AUTH_HEADER];
+        api_auth_key_sent = query_map[http_req::AUTH_HEADER];
     }
 
     route_path *rpath = nullptr;
@@ -412,8 +421,11 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
          !(
              root_resource == "health" || root_resource == "debug" ||
              root_resource == "stats.json" || root_resource == "metrics.json" ||
-             root_resource == "sequence" || root_resource == "operations" || root_resource == "config"
+             root_resource == "sequence" || root_resource == "operations" ||
+             root_resource == "config" || root_resource == "status"
          );
+
+    bool use_meta_thread_pool = (root_resource == "status");
 
     if(needs_readiness_check) {
         bool write_op = is_write_request(root_resource, http_method);
@@ -446,7 +458,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
         // multi_search needs to be handled later because the API key could be part of request body and
         // the whole request body might not be available right now.
         bool authenticated = h2o_handler->http_server->auth_handler(query_map, embedded_params_vec, body, *rpath,
-                                                                    h2o_handler->api_auth_key_sent);
+                                                                    api_auth_key_sent);
         if(!authenticated) {
             std::string message = std::string("{\"message\": \"Forbidden - a valid `") + http_req::AUTH_HEADER +
                                   "` header must be sent.\"}";
@@ -455,7 +467,8 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     }
 
     std::shared_ptr<http_req> request = std::make_shared<http_req>(req, rpath->http_method, path_without_query,
-                                                                   route_hash, query_map, embedded_params_vec, body);
+                                                                   route_hash, query_map, embedded_params_vec,
+                                                                   api_auth_key_sent, body, client_ip);
 
     // add custom generator with a dispose function for cleaning up resources
     h2o_custom_generator_t* custom_gen = new h2o_custom_generator_t;
@@ -485,7 +498,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
         // Full request body is already available, so we don't care if handler is async or not
         //LOG(INFO) << "Full request body is already available: " << req->entity.len;
         request->last_chunk_aggregate = true;
-        return process_request(request, response, rpath, h2o_handler);
+        return process_request(request, response, rpath, h2o_handler, use_meta_thread_pool);
     } else {
         // Only partial request body is available.
         // If rpath->async_req is true, the request handler function will be invoked multiple times, for each chunk
@@ -608,7 +621,7 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
 
         // default value for last_chunk_aggregate is false
         request->last_chunk_aggregate = (is_end_stream == 1);
-        process_request(request, response, custom_generator->rpath, custom_generator->h2o_handler);
+        process_request(request, response, custom_generator->rpath, custom_generator->h2o_handler, false);
         return 0;
     }
 
@@ -632,7 +645,8 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
 }
 
 int HttpServer::process_request(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response,
-                                route_path *rpath, const h2o_custom_req_handler_t *handler) {
+                                route_path *rpath, const h2o_custom_req_handler_t *handler,
+                                const bool use_meta_thread_pool) {
 
     //LOG(INFO) << "process_request called";
     const std::string& root_resource = (rpath->path_parts.empty()) ? "" : rpath->path_parts[0];
@@ -640,7 +654,7 @@ int HttpServer::process_request(const std::shared_ptr<http_req>& request, const 
     if(root_resource == "multi_search") {
         // We can authenticate only when the full request body is available
         bool authenticated = handler->http_server->auth_handler(request->params, request->embedded_params_vec,
-                                                                request->body, *rpath, handler->api_auth_key_sent);
+                                                                request->body, *rpath, request->api_auth_key);
         if(!authenticated) {
             std::string message = std::string("{\"message\": \"Forbidden - a valid `") + http_req::AUTH_HEADER +
                                   "` header must be sent.\"}";
@@ -655,11 +669,13 @@ int HttpServer::process_request(const std::shared_ptr<http_req>& request, const 
         return 0;
     }
 
-    auto http_server = handler->http_server;
     auto message_dispatcher = handler->http_server->get_message_dispatcher();
 
+    auto thread_pool = use_meta_thread_pool ? handler->http_server->get_meta_thread_pool() :
+                       handler->http_server->get_thread_pool();
+
     // LOG(INFO) << "Before enqueue res: " << response
-    handler->http_server->get_thread_pool()->enqueue([rpath, message_dispatcher, request, response]() {
+    thread_pool->enqueue([rpath, message_dispatcher, request, response]() {
         // call the API handler
         //LOG(INFO) << "Wait for response " << response.get() << ", action: " << rpath->_get_action();
         (rpath->handler)(request, response);
@@ -902,6 +918,9 @@ HttpServer::~HttpServer() {
 
     SSL_CTX_free(accept_ctx->ssl_ctx);
     delete accept_ctx;
+
+    meta_thread_pool->shutdown();
+    delete meta_thread_pool;
 }
 
 http_message_dispatcher* HttpServer::get_message_dispatcher() const {
@@ -929,6 +948,10 @@ bool HttpServer::get_route(uint64_t hash, route_path** found_rpath) {
 
 uint64_t HttpServer::node_state() const {
     return replication_state->node_state();
+}
+
+nlohmann::json HttpServer::node_status() {
+    return replication_state->get_status();
 }
 
 bool HttpServer::on_stream_response_message(void *data) {
@@ -1064,4 +1087,8 @@ int64_t HttpServer::get_num_queued_writes() {
 
 bool HttpServer::is_leader() const {
     return replication_state->is_leader();
+}
+
+ThreadPool* HttpServer::get_meta_thread_pool() const {
+    return meta_thread_pool;
 }

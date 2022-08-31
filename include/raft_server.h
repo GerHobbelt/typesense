@@ -82,6 +82,19 @@ public:
     void Run();
 };
 
+class TimedSnapshotClosure : public braft::Closure {
+private:
+    ReplicationState* replication_state;
+
+public:
+
+    TimedSnapshotClosure(ReplicationState *replication_state) : replication_state(replication_state){}
+
+    ~TimedSnapshotClosure() {}
+
+    void Run();
+};
+
 struct cached_disk_stat_t {
     const static size_t REFRESH_INTERVAL_SECS = 30;
     uint64_t disk_total_bytes = 0;
@@ -149,6 +162,9 @@ private:
 
     cached_disk_stat_t cached_disk_stat;
 
+    const uint64_t snapshot_interval_s;     // frequency of actual snapshotting
+    uint64_t last_snapshot_ts;              // when last snapshot ran
+
 public:
 
     static constexpr const char* log_dir_name = "log";
@@ -162,7 +178,7 @@ public:
 
     // Starts this node
     int start(const butil::EndPoint & peering_endpoint, int api_port,
-              int election_timeout_ms, int snapshot_interval_s,
+              int election_timeout_ms, int snapshot_max_byte_count_per_rpc,
               const std::string & raft_dir, const std::string & nodes,
               const std::atomic<bool>& quit_abruptly);
 
@@ -202,6 +218,7 @@ public:
 
     Store* get_store();
 
+    // for manual / external snapshots
     void do_snapshot(const std::string& snapshot_path, const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
     static std::string to_nodes_config(const butil::EndPoint &peering_endpoint, const int api_port,
@@ -210,6 +227,9 @@ public:
     void set_ext_snapshot_path(const std::string &snapshot_path);
 
     const std::string& get_ext_snapshot_path() const;
+
+    // for timed snapshots
+    void do_snapshot(const std::string& nodes);
 
     void persist_applying_index();
 
@@ -232,6 +252,8 @@ public:
     int64_t get_num_queued_writes();
 
     bool is_leader();
+
+    nlohmann::json get_status();
 
 private:
 
@@ -290,6 +312,6 @@ private:
 
     void do_dummy_write();
 
-    std::string get_leader_url_path(const std::string& leader_addr, const std::string& path,
-                                    const std::string& protocol) const;
+    std::string get_node_url_path(const std::string& node_addr, const std::string& path,
+                                  const std::string& protocol) const;
 };

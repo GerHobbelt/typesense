@@ -2,14 +2,14 @@
 
 
 bool or_iterator_t::at_end(const std::vector<or_iterator_t>& its) {
-    // if any iterator is empty, we stop
+    // if any iterator is invalid, we stop
     for(const auto& it : its) {
-        if(it.valid()) {
-            return false;
+        if(!it.valid()) {
+            return true;
         }
     }
 
-    return true;
+    return false;
 }
 
 bool or_iterator_t::at_end2(const std::vector<or_iterator_t>& its) {
@@ -128,7 +128,7 @@ void or_iterator_t::advance_smallest() {
         }
 
         if(!its[i].valid()) {
-            its[i].destroy();
+            its[i].reset_cache();
             its.erase(its.cbegin() + i);
             i--;
         }
@@ -152,7 +152,7 @@ bool or_iterator_t::skip_to(uint32_t id) {
         it.skip_to(id);
 
         if(!it.valid()) {
-            its[i].destroy();
+            its[i].reset_cache();
             its.erase(its.begin() + i);
             i--;
         } else {
@@ -170,18 +170,42 @@ uint32_t or_iterator_t::id() const {
     return its[curr_index].id();
 }
 
-bool or_iterator_t::take_id(result_iter_state_t& istate, uint32_t id) {
+bool or_iterator_t::take_id(result_iter_state_t& istate, uint32_t id, bool& is_excluded) {
+    is_excluded = false;
+
     // decide if this result id should be excluded
     if(istate.excluded_result_ids_size != 0) {
         if (std::binary_search(istate.excluded_result_ids,
                                istate.excluded_result_ids + istate.excluded_result_ids_size, id)) {
+            is_excluded = true;
             return false;
         }
     }
 
     // decide if this result be matched with filter results
     if(istate.filter_ids_length != 0) {
-        return std::binary_search(istate.filter_ids, istate.filter_ids + istate.filter_ids_length, id);
+        if(istate.filter_ids_index >= istate.filter_ids_length) {
+            return false;
+        }
+
+        // Returns iterator to the first element that is >= to value or last if no such element is found.
+        size_t found_index = std::lower_bound(istate.filter_ids + istate.filter_ids_index,
+                                              istate.filter_ids + istate.filter_ids_length, id) - istate.filter_ids;
+
+        if(found_index == istate.filter_ids_length) {
+            // all elements are lesser than lowest value (id), so we can stop looking
+            istate.filter_ids_index = found_index + 1;
+            return false;
+        } else {
+            if(istate.filter_ids[found_index] == id) {
+                istate.filter_ids_index = found_index + 1;
+                return true;
+            }
+
+            istate.filter_ids_index = found_index;
+        }
+
+        return false;
     }
 
     return true;
@@ -214,7 +238,7 @@ const std::vector<posting_list_t::iterator_t>& or_iterator_t::get_its() const {
 
 or_iterator_t::~or_iterator_t() noexcept {
     for(auto& it: its) {
-        it.destroy();
+        it.reset_cache();
     }
 }
 

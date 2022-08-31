@@ -22,7 +22,6 @@ class HttpServer;
 struct h2o_custom_req_handler_t {
     h2o_handler_t super;
     HttpServer* http_server;
-    std::string api_auth_key_sent;
 };
 
 struct h2o_custom_generator_t {
@@ -57,8 +56,10 @@ public:
 
     h2o_generator_t* generator = nullptr;
 
-    stream_response_state_t(h2o_req_t* _req): req(_req), is_res_start(req->res.status == 0) {
-
+    explicit stream_response_state_t(h2o_req_t* _req): req(_req) {
+        if(req != nullptr) {
+            is_res_start = (req->res.status == 0);
+        }
     }
 
     void set_response(uint32_t status_code, const std::string& content_type, const std::string& body) {
@@ -108,7 +109,8 @@ public:
 
     async_req_res_t(const std::shared_ptr<http_req>& h_req, const std::shared_ptr<http_res>& h_res,
                     const bool destroy_after_use) :
-            req(h_req), res(h_res), destroy_after_use(destroy_after_use), res_state(h_req->_req) {
+            req(h_req), res(h_res), destroy_after_use(destroy_after_use),
+            res_state((std::shared_lock(res->mres), h_req->is_diposed ? nullptr : h_req->_req)) {
 
         std::shared_lock lk(res->mres);
 
@@ -199,6 +201,8 @@ private:
 
     ThreadPool* thread_pool;
 
+    ThreadPool* meta_thread_pool;
+
     bool (*auth_handler)(std::map<std::string, std::string>& params,
                          std::vector<nlohmann::json>& embedded_params_vec,
                          const std::string& body, const route_path& rpath,
@@ -256,6 +260,8 @@ public:
 
     uint64_t node_state() const;
 
+    nlohmann::json node_status();
+
     void set_auth_handler(bool (*handler)(std::map<std::string, std::string>& params,
                                           std::vector<nlohmann::json>& embedded_params_vec, const std::string& body,
                                           const route_path & rpath, const std::string & auth_key));
@@ -301,13 +307,16 @@ public:
 
     ThreadPool* get_thread_pool() const;
 
+    ThreadPool* get_meta_thread_pool() const;
+
     static constexpr const char* STOP_SERVER_MESSAGE = "STOP_SERVER";
     static constexpr const char* STREAM_RESPONSE_MESSAGE = "STREAM_RESPONSE";
     static constexpr const char* REQUEST_PROCEED_MESSAGE = "REQUEST_PROCEED";
     static constexpr const char* DEFER_PROCESSING_MESSAGE = "DEFER_PROCESSING";
 
-    static int process_request(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response, route_path *rpath,
-                               const h2o_custom_req_handler_t *req_handler);
+    static int process_request(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response,
+                               route_path *rpath, const h2o_custom_req_handler_t *req_handler,
+                               bool use_meta_thread_pool);
 
     static void on_deferred_process_request(h2o_timer_t *entry);
 
