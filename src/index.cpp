@@ -464,13 +464,14 @@ Option<uint32_t> Index::validate_index_in_memory(nlohmann::json& document, uint3
             collection->get_filter_ids(referenced_field_name + ":=" + value, documents);
 
             if (documents[0].first != 1) {
+                delete [] documents[0].second;
                 auto match = " `" + referenced_field_name  + "` = `" + value + "` ";
                 return  Option<>(400, documents[0].first < 1 ?
                 "Referenced document having" + match + "not found in the collection `" + tokens[0] + "`." :
                 "Multiple documents having" + match + "found in the collection `" + tokens[0] + "`.");
             }
 
-            document[a_field.name + "_sequence_id"] = collection->get_seq_id_collection_prefix() + std::to_string(*(documents[0].second));
+            document[a_field.name + "_sequence_id"] = *(documents[0].second);
 
             delete [] documents[0].second;
         }
@@ -1678,11 +1679,24 @@ void Index::numeric_not_equals_filter(num_tree_t* const num_tree,
     ids = out;
 }
 
-void Index::do_filtering(uint32_t*& filter_ids,
-                         uint32_t& filter_ids_length,
-                         filter_node_t const* const root) const {
+void Index::do_filtering(filter_node_t* const root) const {
     // auto begin = std::chrono::high_resolution_clock::now();
     const filter a_filter = root->filter_exp;
+
+    bool is_referenced_filter = !a_filter.referenced_collection_name.empty();
+    if (is_referenced_filter) {
+        // Apply filter on referenced collection and get the sequence ids of current collection from the filtered documents.
+        auto& cm = CollectionManager::get_instance();
+        auto collection = cm.get_collection(a_filter.referenced_collection_name);
+
+        auto op = collection->get_reference_filter_ids(a_filter.field_name,
+                                                       cm.get_collection_with_id(collection_id)->get_name(),
+                                                       root->match_index_ids);
+        if (!op.ok()) {
+            return;
+        }
+        return;
+    }
 
     if (a_filter.field_name == "id") {
         // we handle `ids` separately
@@ -1693,17 +1707,9 @@ void Index::do_filtering(uint32_t*& filter_ids,
 
         std::sort(result_ids.begin(), result_ids.end());
 
-        if (filter_ids_length == 0) {
-            filter_ids = new uint32[result_ids.size()];
-            std::copy(result_ids.begin(), result_ids.end(), filter_ids);
-            filter_ids_length = result_ids.size();
-        } else {
-            uint32_t* filtered_results = nullptr;
-            filter_ids_length = ArrayUtils::and_scalar(filter_ids, filter_ids_length, &result_ids[0],
-                                                       result_ids.size(), &filtered_results);
-            delete[] filter_ids;
-            filter_ids = filtered_results;
-        }
+        root->match_index_ids.second = new uint32[result_ids.size()];
+        std::copy(result_ids.begin(), result_ids.end(), root->match_index_ids.second);
+        root->match_index_ids.first = result_ids.size();
 
         return;
     }
@@ -2003,8 +2009,8 @@ void Index::do_filtering(uint32_t*& filter_ids,
         result_ids_len = to_include_ids_len;
     }
 
-    filter_ids = result_ids;
-    filter_ids_length = result_ids_len;
+    root->match_index_ids.first = result_ids_len;
+    root->match_index_ids.second = result_ids;
 
     /*long long int timeMillis =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()
@@ -2013,56 +2019,189 @@ void Index::do_filtering(uint32_t*& filter_ids,
     LOG(INFO) << "Time taken for filtering: " << timeMillis << "ms";*/
 }
 
+void Index::get_filter_matches(filter_node_t* const root, std::vector<std::pair<uint32_t, filter_node_t*>>& vec) const {
+    if (root == nullptr) {
+        return;
+    }
+
+    if (root->isOperator) {
+        if (root->filter_operator == AND) {
+            get_filter_matches(root->left, vec);
+            get_filter_matches(root->right, vec);
+        } else {
+            uint32_t *l_filter_ids = nullptr;
+            uint32_t l_filter_ids_length = 0;
+            if (root->left != nullptr) {
+                rearranging_recursive_filter(l_filter_ids, l_filter_ids_length, root->left);
+            }
+
+            uint32_t *r_filter_ids = nullptr;
+            uint32_t r_filter_ids_length = 0;
+            if (root->right != nullptr) {
+                rearranging_recursive_filter(r_filter_ids, r_filter_ids_length, root->right);
+            }
+
+            root->match_index_ids.first = ArrayUtils::or_scalar(
+                    l_filter_ids, l_filter_ids_length, r_filter_ids,
+                    r_filter_ids_length, &(root->match_index_ids.second));
+
+            delete[] l_filter_ids;
+            delete[] r_filter_ids;
+
+            vec.emplace_back(root->match_index_ids.first, root);
+        }
+
+        return;
+    }
+
+    do_filtering(root);
+    vec.emplace_back(root->match_index_ids.first, root);
+}
+
+void evaluate_rearranged_filter_tree(uint32_t*& filter_ids,
+                                     uint32_t& filter_ids_length,
+                                     filter_node_t* const root,
+                                     std::vector<std::pair<uint32_t, filter_node_t*>>& vec,
+                                     size_t& index) {
+    if (root == nullptr) {
+        return;
+    }
+
+    if (root->isOperator && root->filter_operator == AND) {
+        uint32_t* l_filter_ids = nullptr;
+        uint32_t l_filter_ids_length = 0;
+        if (root->left != nullptr) {
+            evaluate_rearranged_filter_tree(l_filter_ids, l_filter_ids_length, root->left, vec, index);
+        }
+
+        uint32_t* r_filter_ids = nullptr;
+        uint32_t r_filter_ids_length = 0;
+        if (root->right != nullptr) {
+            evaluate_rearranged_filter_tree(r_filter_ids, r_filter_ids_length, root->right, vec, index);
+        }
+
+        root->match_index_ids.first = ArrayUtils::and_scalar(
+                l_filter_ids, l_filter_ids_length, r_filter_ids,
+                r_filter_ids_length, &(root->match_index_ids.second));
+
+        filter_ids_length = root->match_index_ids.first;
+        filter_ids = root->match_index_ids.second;
+    } else {
+        filter_ids_length = vec[index].first;
+        filter_ids = vec[index].second->match_index_ids.second;
+        index++;
+    }
+}
+
+void Index::rearranging_recursive_filter(uint32_t*& filter_ids, uint32_t& filter_ids_length, filter_node_t* const root) const {
+    std::vector<std::pair<uint32_t, filter_node_t*>> vec;
+    get_filter_matches(root, vec);
+
+    std::sort(vec.begin(), vec.end(),
+              [](const std::pair<uint32_t, filter_node_t*>& lhs, const std::pair<uint32_t, filter_node_t*>& rhs) {
+                  return lhs.first < rhs.first;
+              });
+
+    size_t index = 0;
+    evaluate_rearranged_filter_tree(filter_ids, filter_ids_length, root, vec, index);
+
+    // To disable deletion of filter_ids when filter tree is destructed.
+    root->match_index_ids.second = nullptr;
+}
+
 void Index::recursive_filter(uint32_t*& filter_ids,
                              uint32_t& filter_ids_length,
-                             const filter_node_t* root,
+                             filter_node_t* const root,
                              const bool enable_short_circuit) const {
     if (root == nullptr) {
         return;
     }
 
-    uint32_t* l_filter_ids = nullptr;
-    uint32_t l_filter_ids_length = 0;
-    if (root->left != nullptr) {
-        recursive_filter(l_filter_ids, l_filter_ids_length, root->left,
-                         enable_short_circuit);
-    }
-
-    uint32_t* r_filter_ids = nullptr;
-    uint32_t r_filter_ids_length = 0;
-    if (root->right != nullptr) {
-        recursive_filter(r_filter_ids, r_filter_ids_length, root->right,
-                         enable_short_circuit);
-    }
-
     if (root->isOperator) {
+        uint32_t* l_filter_ids = nullptr;
+        uint32_t l_filter_ids_length = 0;
+        if (root->left != nullptr) {
+            recursive_filter(l_filter_ids, l_filter_ids_length, root->left,
+                             enable_short_circuit);
+        }
+
+        uint32_t* r_filter_ids = nullptr;
+        uint32_t r_filter_ids_length = 0;
+        if (root->right != nullptr) {
+            recursive_filter(r_filter_ids, r_filter_ids_length, root->right,
+                             enable_short_circuit);
+        }
+
         uint32_t* filtered_results = nullptr;
         if (root->filter_operator == AND) {
             filter_ids_length = ArrayUtils::and_scalar(
-                l_filter_ids, l_filter_ids_length, r_filter_ids,
-                r_filter_ids_length, &filtered_results);
+                    l_filter_ids, l_filter_ids_length, r_filter_ids,
+                    r_filter_ids_length, &filtered_results);
         } else {
             filter_ids_length = ArrayUtils::or_scalar(
-                l_filter_ids, l_filter_ids_length, r_filter_ids,
-                r_filter_ids_length, &filtered_results);
+                    l_filter_ids, l_filter_ids_length, r_filter_ids,
+                    r_filter_ids_length, &filtered_results);
         }
 
         delete[] l_filter_ids;
         delete[] r_filter_ids;
 
         filter_ids = filtered_results;
-    } else if (root->left == nullptr && root->right == nullptr) {
-        do_filtering(filter_ids, filter_ids_length, root);
+        return;
+    }
+
+    do_filtering(root);
+    filter_ids_length = root->match_index_ids.first;
+    filter_ids = root->match_index_ids.second;
+
+    // Prevents double deletion. We'll be deleting this array upstream and when the filter tree is destructed.
+    root->match_index_ids.second = nullptr;
+}
+
+void Index::adaptive_filter(uint32_t*& filter_ids,
+                            uint32_t& filter_ids_length,
+                            filter_node_t* const filter_tree_root,
+                            const bool enable_short_circuit) const {
+    if (filter_tree_root == nullptr) {
+        return;
+    }
+
+    if (filter_tree_root->metrics != nullptr &&
+    (*filter_tree_root->metrics).filter_exp_count > 2 &&
+    (*filter_tree_root->metrics).and_operator_count > 0 &&
+    // If there are more || in the filter tree than &&, we'll not gain much by rearranging the filter tree.
+    ((float) (*filter_tree_root->metrics).or_operator_count / (float) (*filter_tree_root->metrics).and_operator_count < 0.5)) {
+        rearranging_recursive_filter(filter_ids, filter_ids_length, filter_tree_root);
     } else {
-        // malformed
+        recursive_filter(filter_ids, filter_ids_length, filter_tree_root, false);
     }
 }
 
 void Index::do_filtering_with_lock(uint32_t*& filter_ids,
                                    uint32_t& filter_ids_length,
-                                   filter_node_t const* const& filter_tree_root) const {
+                                   filter_node_t* filter_tree_root) const {
     std::shared_lock lock(mutex);
-    recursive_filter(filter_ids, filter_ids_length, filter_tree_root, false);
+    adaptive_filter(filter_ids, filter_ids_length, filter_tree_root, false);
+}
+
+void Index::do_reference_filtering_with_lock(std::pair<uint32_t, uint32_t*>& reference_index_ids,
+                                             filter_node_t* filter_tree_root,
+                                             const std::string& reference_field_name) const {
+    std::shared_lock lock(mutex);
+    adaptive_filter(reference_index_ids.second, reference_index_ids.first, filter_tree_root, false);
+
+    std::vector<uint32> vector;
+    vector.reserve(reference_index_ids.first);
+
+    for (uint32_t i = 0; i < reference_index_ids.first; i++) {
+        auto filtered_doc_id = reference_index_ids.second[i];
+
+        // Extract the sequence_id from the reference field.
+        vector.push_back(sort_index.at(reference_field_name)->at(filtered_doc_id));
+    }
+
+    std::sort(vector.begin(), vector.end());
+    std::copy(vector.begin(), vector.end(), reference_index_ids.second);
 }
 
 void Index::run_search(search_args* search_params) {
@@ -2528,7 +2667,7 @@ void Index::search_infix(const std::string& query, const std::string& field_name
 
 void Index::search(std::vector<query_tokens_t>& field_query_tokens, const std::vector<search_field_t>& the_fields,
                    const text_match_type_t match_type,
-                   filter_node_t const* const& filter_tree_root, std::vector<facet>& facets, facet_query_t& facet_query,
+                   filter_node_t* filter_tree_root, std::vector<facet>& facets, facet_query_t& facet_query,
                    const std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
                    const std::vector<uint32_t>& excluded_ids, std::vector<sort_by>& sort_fields_std,
                    const std::vector<uint32_t>& num_typos, Topster* topster, Topster* curated_topster,
@@ -2557,7 +2696,7 @@ void Index::search(std::vector<query_tokens_t>& field_query_tokens, const std::v
 
     std::shared_lock lock(mutex);
 
-    recursive_filter(filter_ids, filter_ids_length, filter_tree_root, true);
+    adaptive_filter(filter_ids, filter_ids_length, filter_tree_root, true);
 
     if (filter_tree_root != nullptr && filter_ids_length == 0) {
         delete [] filter_ids;
@@ -4600,7 +4739,7 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
             field_values[i] = &seq_id_sentinel_value;
         } else if (sort_fields_std[i].name == sort_field_const::eval) {
             field_values[i] = &eval_sentinel_value;
-            recursive_filter(sort_fields_std[i].eval.ids, sort_fields_std[i].eval.size, sort_fields_std[i].eval.filter_tree_root, true);
+            adaptive_filter(sort_fields_std[i].eval.ids, sort_fields_std[i].eval.size, sort_fields_std[i].eval.filter_tree_root, true);
         } else if (search_schema.count(sort_fields_std[i].name) != 0 && search_schema.at(sort_fields_std[i].name).sort) {
             if (search_schema.at(sort_fields_std[i].name).type == field_types::GEOPOINT_ARRAY) {
                 geopoint_indices.push_back(i);

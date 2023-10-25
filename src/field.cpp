@@ -2,6 +2,7 @@
 #include "field.h"
 #include "magic_enum.hpp"
 #include <stack>
+#include <collection_manager.h>
 
 Option<bool> filter::parse_geopoint_filter_value(std::string& raw_value,
                                                  const std::string& format_err_msg,
@@ -382,7 +383,9 @@ Option<bool> toFilter(const std::string expression,
 Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
                          const tsl::htrie_map<char, field>& search_schema,
                          const Store* store,
-                         const std::string& doc_id_prefix) {
+                         const std::string& doc_id_prefix,
+                         int& and_operator_count,
+                         int& or_operator_count) {
     std::stack<filter_node_t*> nodeStack;
 
     while (!postfix.empty()) {
@@ -405,12 +408,36 @@ Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
             auto operandA = nodeStack.top();
             nodeStack.pop();
 
+            expression == "&&" ? and_operator_count++ : or_operator_count++;
             filter_node = new filter_node_t(expression == "&&" ? AND : OR, operandA, operandB);
         } else {
             filter filter_exp;
-            Option<bool> toFilter_op = toFilter(expression, filter_exp, search_schema, store, doc_id_prefix);
-            if (!toFilter_op.ok()) {
-                return toFilter_op;
+
+            // Expected value: $Collection(...)
+            bool is_referenced_filter = (expression[0] == '$' && expression[expression.size() - 1] == ')');
+            if (is_referenced_filter) {
+                size_t parenthesis_index = expression.find('(');
+
+                std::string collection_name = expression.substr(1, parenthesis_index - 1);
+                auto& cm = CollectionManager::get_instance();
+                auto collection = cm.get_collection(collection_name);
+                if (collection == nullptr) {
+                    return Option<bool>(400, "Referenced collection `" + collection_name + "` not found.");
+                }
+
+                filter_exp = {expression.substr(parenthesis_index + 1, expression.size() - parenthesis_index - 2)};
+                filter_exp.referenced_collection_name = collection_name;
+
+                auto op = collection->validate_reference_filter(filter_exp.field_name);
+                if (!op.ok()) {
+                    return Option<bool>(400, "Failed to parse reference filter on `" + collection_name +
+                                                "` collection: " + op.error());
+                }
+            } else {
+                Option<bool> toFilter_op = toFilter(expression, filter_exp, search_schema, store, doc_id_prefix);
+                if (!toFilter_op.ok()) {
+                    return toFilter_op;
+                }
             }
 
             filter_node = new filter_node_t(filter_exp);
@@ -454,10 +481,21 @@ Option<bool> filter::parse_filter_query(const std::string& filter_query,
         return toPostfix_op;
     }
 
-    Option<bool> toParseTree_op = toParseTree(postfix, root, search_schema, store, doc_id_prefix);
+    int postfix_size = (int) postfix.size(), and_operator_count = 0, or_operator_count = 0;
+    Option<bool> toParseTree_op = toParseTree(postfix,
+                                              root,
+                                              search_schema,
+                                              store,
+                                              doc_id_prefix,
+                                              and_operator_count,
+                                              or_operator_count);
     if (!toParseTree_op.ok()) {
         return toParseTree_op;
     }
+
+    root->metrics = new filter_tree_metrics{static_cast<int>(postfix_size - (and_operator_count + or_operator_count)),
+                     and_operator_count,
+                     or_operator_count};
 
     return Option<bool>(true);
 }
@@ -699,7 +737,7 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
     if (!field_json[fields::reference].get<std::string>().empty()) {
         the_fields.emplace_back(
-                field(field_json[fields::name].get<std::string>() + "_sequence_id", "string", false,
+                field(field_json[fields::name].get<std::string>() + "_sequence_id", "int64", false,
                       field_json[fields::optional], true)
         );
     }

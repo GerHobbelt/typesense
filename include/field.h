@@ -9,7 +9,6 @@
 #include <sparsepp.h>
 #include <tsl/htrie_map.h>
 #include "json.hpp"
-#include <regex>
 
 namespace field_types {
     // first field value indexed will determine the type
@@ -78,7 +77,7 @@ struct field {
 
     static constexpr int VAL_UNKNOWN = 2;
 
-    std::string reference;      // Reference to another collection.
+    std::string reference;      // Foo.bar (reference to bar field in Foo collection).
 
     field() {}
 
@@ -279,17 +278,11 @@ struct field {
                                               const std::string & default_sorting_field,
                                               nlohmann::json& fields_json) {
         bool found_default_sorting_field = false;
-        const std::regex sequence_id_pattern(".*_sequence_id$");
 
         // Check for duplicates in field names
         std::map<std::string, std::vector<const field*>> unique_fields;
 
         for(const field & field: fields) {
-            if (std::regex_match(field.name, sequence_id_pattern)) {
-                // Don't add foo_sequence_id field.
-                continue;
-            }
-
             unique_fields[field.name].push_back(&field);
 
             if(field.name == "id") {
@@ -455,6 +448,9 @@ struct filter {
     // aggregated and then this flag is checked if negation on the aggregated result is required.
     bool apply_not_equals = false;
 
+    // Would store `Foo` in case of a filter expression like `$Foo(bar := baz)`
+    std::string referenced_collection_name;
+
     static const std::string RANGE_OPERATOR() {
         return "..";
     }
@@ -534,12 +530,20 @@ struct filter {
                                            filter_node_t*& root);
 };
 
+struct filter_tree_metrics {
+    int filter_exp_count;
+    int and_operator_count;
+    int or_operator_count;
+};
+
 struct filter_node_t {
     filter filter_exp;
     FILTER_OPERATOR filter_operator;
     bool isOperator;
     filter_node_t* left;
     filter_node_t* right;
+    std::pair<uint32_t, uint32_t*> match_index_ids = {0, nullptr};
+    filter_tree_metrics* metrics = nullptr;
 
     filter_node_t(filter filter_exp)
             : filter_exp(std::move(filter_exp)),
@@ -556,6 +560,8 @@ struct filter_node_t {
               right(right) {}
 
     ~filter_node_t() {
+        delete metrics;
+        delete[] match_index_ids.second;
         delete left;
         delete right;
     }
