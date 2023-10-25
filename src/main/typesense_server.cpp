@@ -1,6 +1,6 @@
 #include "typesense_server_utils.h"
 #include "core_api.h"
-#include "config.h"
+#include "tsconfig.h"
 #include "stackprinter.h"
 #include "backward.hpp"
 
@@ -30,6 +30,7 @@ void master_server_routes() {
 
     server->get("/collections/:collection/documents/:id", get_fetch_document);
     server->patch("/collections/:collection/documents/:id", patch_update_document);
+    server->patch("/collections/:collection/documents", patch_update_documents);
     server->del("/collections/:collection/documents/:id", del_remove_document);
 
     server->get("/collections/:collection/overrides", get_overrides);
@@ -78,11 +79,14 @@ void master_server_routes() {
     server->post("/operations/db/compact", post_compact_db, false, false);
 
     server->get("/limits", get_rate_limits);
+    server->get("/limits/active", get_active_throttles);
+    server->get("/limits/exceeds", get_limit_exceed_counts);
     server->get("/limits/:id", get_rate_limit);
     server->post("/limits", post_rate_limit);
     server->put("/limits/:id", put_rate_limit);
     server->del("/limits/:id", del_rate_limit);
-
+    server->del("/limits/active/:id", del_throttle);
+    server->del("/limits/exceeds/:id", del_exceed);
     server->post("/config", post_config, false, false);
 }
 

@@ -32,7 +32,9 @@
 
 static constexpr size_t ARRAY_FACET_DIM = 4;
 using facet_map_t = spp::sparse_hash_map<uint32_t, facet_hash_values_t>;
+using single_val_facet_map_t = spp::sparse_hash_map<uint32_t, uint64_t>;
 using array_mapped_facet_t = std::array<facet_map_t*, ARRAY_FACET_DIM>;
+using array_mapped_single_val_facet_t = std::array<single_val_facet_map_t*, ARRAY_FACET_DIM>;
 
 static constexpr size_t ARRAY_INFIX_DIM = 4;
 using array_mapped_infix_t = std::vector<tsl::htrie_set<char>*>;
@@ -139,6 +141,8 @@ struct search_args {
     std::vector<std::vector<KV*>> override_result_kvs;
 
     vector_query_t& vector_query;
+    size_t facet_sample_percent;
+    size_t facet_sample_threshold;
 
     search_args(std::vector<query_tokens_t> field_query_tokens, std::vector<search_field_t> search_fields,
                 const text_match_type_t match_type,
@@ -153,7 +157,8 @@ struct search_args {
                 size_t concurrency, size_t search_cutoff_ms,
                 size_t min_len_1typo, size_t min_len_2typo, size_t max_candidates, const std::vector<enable_t>& infixes,
                 const size_t max_extra_prefix, const size_t max_extra_suffix, const size_t facet_query_num_typos,
-                const bool filter_curated_hits, const enable_t split_join_tokens, vector_query_t& vector_query) :
+                const bool filter_curated_hits, const enable_t split_join_tokens, vector_query_t& vector_query,
+                size_t facet_sample_percent, size_t facet_sample_threshold) :
             field_query_tokens(field_query_tokens),
             search_fields(search_fields), match_type(match_type), filter_tree_root(filter_tree_root), facets(facets),
             included_ids(included_ids), excluded_ids(excluded_ids), sort_fields_std(sort_fields_std),
@@ -167,7 +172,8 @@ struct search_args {
             min_len_1typo(min_len_1typo), min_len_2typo(min_len_2typo), max_candidates(max_candidates),
             infixes(infixes), max_extra_prefix(max_extra_prefix), max_extra_suffix(max_extra_suffix),
             facet_query_num_typos(facet_query_num_typos), filter_curated_hits(filter_curated_hits),
-            split_join_tokens(split_join_tokens), vector_query(vector_query) {
+            split_join_tokens(split_join_tokens), vector_query(vector_query),
+            facet_sample_percent(facet_sample_percent), facet_sample_threshold(facet_sample_threshold) {
 
         const size_t topster_size = std::max((size_t)1, max_hits);  // needs to be atleast 1 since scoring is mandatory
         topster = new Topster(topster_size, group_limit);
@@ -318,6 +324,9 @@ private:
     // facet_field => (seq_id => values)
     spp::sparse_hash_map<std::string, array_mapped_facet_t> facet_index_v3;
 
+    // facet_field => (seq_id => hash)
+    spp::sparse_hash_map<std::string, array_mapped_single_val_facet_t> single_val_facet_index_v3;
+
     // sort_field => (seq_id => value)
     spp::sparse_hash_map<std::string, spp::sparse_hash_map<uint32_t, int64_t>*> sort_index;
 
@@ -365,6 +374,7 @@ private:
     void log_leaves(int cost, const std::string &token, const std::vector<art_leaf *> &leaves) const;
 
     void do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
+                   bool estimate_facets, size_t facet_sample_percent,
                    const std::vector<facet_info_t>& facet_infos,
                    size_t group_limit, const std::vector<std::string>& group_by_fields,
                    const uint32_t* result_ids, size_t results_size) const;
@@ -469,6 +479,11 @@ private:
                                         const size_t num_search_fields,
                                         std::vector<size_t>& popular_field_ids);
 
+    void numeric_not_equals_filter(num_tree_t* const num_tree,
+                                   const int64_t value,
+                                   uint32_t*& ids,
+                                   size_t& ids_len) const;
+
     void do_filtering(uint32_t*& filter_ids,
                       uint32_t& filter_ids_length,
                       filter_node_t const* const root) const;
@@ -537,6 +552,8 @@ private:
     static void remove_facet_token(const field& search_field, spp::sparse_hash_map<std::string, art_tree*>& search_index,
                                    const std::string& token, uint32_t seq_id);
 
+    void initialize_facet_indexes(const field& facet_field);
+    
 public:
     // for limiting number of results on multiple candidates / query rewrites
     enum {TYPO_TOKENS_THRESHOLD = 1};
@@ -655,7 +672,7 @@ public:
                 size_t max_candidates, const std::vector<enable_t>& infixes, const size_t max_extra_prefix,
                 const size_t max_extra_suffix, const size_t facet_query_num_typos,
                 const bool filter_curated_hits, enable_t split_join_tokens,
-                const vector_query_t& vector_query) const;
+                const vector_query_t& vector_query, size_t facet_sample_percent, size_t facet_sample_threshold) const;
 
     void remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name);
 

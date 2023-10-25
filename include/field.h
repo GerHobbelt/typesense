@@ -436,6 +436,10 @@ struct filter {
     std::string field_name;
     std::vector<std::string> values;
     std::vector<NUM_COMPARATOR> comparators;
+    // Would be set when `field: != ...` is encountered with a string field or `field: != [ ... ]` is encountered in the
+    // case of int and float fields. During filtering, all the results of matching the field against the values are
+    // aggregated and then this flag is checked if negation on the aggregated result is required.
+    bool apply_not_equals = false;
 
     static const std::string RANGE_OPERATOR() {
         return "..";
@@ -473,6 +477,10 @@ struct filter {
             num_comparator = GREATER_THAN_EQUALS;
         }
 
+        else if(comp_and_value.compare(0, 2, "!=") == 0) {
+            num_comparator = NOT_EQUALS;
+        }
+
         else if(comp_and_value.compare(0, 1, "<") == 0) {
             num_comparator = LESS_THAN;
         }
@@ -491,7 +499,7 @@ struct filter {
 
         if(num_comparator == LESS_THAN || num_comparator == GREATER_THAN) {
             comp_and_value = comp_and_value.substr(1);
-        } else if(num_comparator == LESS_THAN_EQUALS || num_comparator == GREATER_THAN_EQUALS) {
+        } else if(num_comparator == LESS_THAN_EQUALS || num_comparator == GREATER_THAN_EQUALS || num_comparator == NOT_EQUALS) {
             comp_and_value = comp_and_value.substr(2);
         }
 
@@ -505,7 +513,7 @@ struct filter {
                                                     std::string& processed_filter_val,
                                                     NUM_COMPARATOR& num_comparator);
 
-    static Option<bool> parse_filter_query(const std::string& simple_filter_query,
+    static Option<bool> parse_filter_query(const std::string& filter_query,
                                            const tsl::htrie_map<char, field>& search_schema,
                                            const Store* store,
                                            const std::string& doc_id_prefix,
@@ -663,8 +671,36 @@ struct facet {
 
     facet_stats_t stats;
 
-    explicit facet(const std::string& field_name): field_name(field_name) {
+    //dictionary of key=>pair(range_id, range_val)
+    std::map<int64_t, std::string> facet_range_map;
 
+    bool is_range_query;
+
+    bool sampled = false;
+
+    bool get_range(int64_t key, std::pair<int64_t, std::string>& range_pair)
+    {
+        if(facet_range_map.empty())
+        {
+            LOG (ERROR) << "Facet range is not defined!!!";
+        }
+        auto it = facet_range_map.lower_bound(key);
+
+        if(it != facet_range_map.end())
+        {
+            range_pair.first = it->first;
+            range_pair.second = it->second;
+            return true;
+        }
+
+        return false;
+    }
+
+    explicit facet(const std::string& field_name, 
+        std::map<int64_t, std::string> facet_range = {}, bool is_range_q = false)
+        :field_name(field_name){
+            facet_range_map = facet_range;
+            is_range_query = is_range_q;
     }
 };
 

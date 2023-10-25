@@ -292,9 +292,6 @@ int start_raft_server(ReplicationState& replication_state, const std::string& st
         exit(-1);
     }
 
-    // NOTE: braft uses `election_timeout_ms / 2` as the brpc channel `timeout_ms` configuration,
-    // which in turn is the upper bound for brpc `connect_timeout_ms` value.
-    // Reference: https://github.com/apache/incubator-brpc/blob/122770d/docs/en/client.md#timeout
     size_t election_timeout_ms = 5000;
 
     if (replication_state.start(peering_endpoint, api_port, election_timeout_ms, snapshot_max_byte_count_per_rpc, state_dir,
@@ -449,7 +446,7 @@ int run_server(const Config & config, const std::string & version, void (*master
                            config.get_api_key(), quit_raft_service, batch_indexer);
     
     RateLimitManager *rateLimitManager = RateLimitManager::getInstance();
-    auto rate_limit_manager_init = rateLimitManager->init(&store);
+    auto rate_limit_manager_init = rateLimitManager->init(&meta_store);
 
     if(!rate_limit_manager_init.ok()) {
         LOG(INFO) << "Failed to initialize rate limit manager: " << rate_limit_manager_init.error();

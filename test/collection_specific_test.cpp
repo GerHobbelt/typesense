@@ -2917,4 +2917,3 @@ TEST_F(CollectionSpecificTest, DontHighlightPunctuation) {
 
     collectionManager.drop_collection("coll1");
 }
-

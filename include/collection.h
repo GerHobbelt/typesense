@@ -229,7 +229,8 @@ private:
                                            const tsl::htrie_map<char, field>& search_schema,
                                            std::vector<std::string>& processed_search_fields,
                                            bool extract_only_string_fields,
-                                           bool enable_nested_fields);
+                                           bool enable_nested_fields,
+                                           const bool handle_wildcard = true);
 
     bool is_nested_array(const nlohmann::json& obj, std::vector<std::string> path_parts, size_t part_i) const;
 
@@ -377,6 +378,11 @@ public:
                             const DIRTY_VALUES& dirty_values=DIRTY_VALUES::COERCE_OR_REJECT,
                             const bool& return_doc=false, const bool& return_id=false);
 
+    Option<nlohmann::json> update_matching_filter(const std::string& filter_query,
+                                                  const std::string & json_str,
+                                                  std::string& req_dirty_values,
+                                                  const int batch_size = 1000);
+
     Option<bool> populate_include_exclude_fields_lk(const spp::sparse_hash_set<std::string>& include_fields,
                                                      const spp::sparse_hash_set<std::string>& exclude_fields,
                                                      tsl::htrie_set<char>& include_fields_full,
@@ -423,10 +429,12 @@ public:
                                   const std::string& vector_query_str = "",
                                   const bool enable_highlight_v1 = true,
                                   const uint64_t search_time_start_us = 0,
-                                  const text_match_type_t match_type = max_score) const;
+                                  const text_match_type_t match_type = max_score,
+                                  const size_t facet_sample_percent = 100,
+                                  const size_t facet_sample_threshold = 0) const;
 
-    Option<bool> get_filter_ids(const std::string & simple_filter_query,
-                                std::vector<std::pair<size_t, uint32_t*>>& index_ids);
+    Option<bool> get_filter_ids(const std::string & filter_query,
+                                std::vector<std::pair<size_t, uint32_t*>>& index_ids) const;
 
     Option<nlohmann::json> get(const std::string & id) const;
 
@@ -445,6 +453,8 @@ public:
     std::string get_fallback_field_type();
 
     bool get_enable_nested_fields();
+
+    Option<bool> parse_facet(const std::string& facet_field, std::vector<facet>& facets) const;
 
     // Override operations
 

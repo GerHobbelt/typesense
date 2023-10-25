@@ -703,6 +703,9 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     const char *ENABLE_HIGHLIGHT_V1 = "enable_highlight_v1";
 
+    const char *FACET_SAMPLE_PERCENT = "facet_sample_percent";
+    const char *FACET_SAMPLE_THRESHOLD = "facet_sample_threshold";
+
     // enrich params with values from embedded params
     for(auto& item: embedded_params.items()) {
         if(item.key() == "expires_at") {
@@ -727,7 +730,6 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     }
 
     // end check for mandatory params
-
 
     const std::string& raw_query = req_params[QUERY];
     std::vector<uint32_t> num_typos = {2};
@@ -782,6 +784,9 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     bool enable_highlight_v1 = true;
     text_match_type_t match_type = max_score;
 
+    size_t facet_sample_percent = 100;
+    size_t facet_sample_threshold = 0;
+
     std::unordered_map<std::string, size_t*> unsigned_int_values = {
         {MIN_LEN_1TYPO, &min_len_1typo},
         {MIN_LEN_2TYPO, &min_len_2typo},
@@ -800,6 +805,8 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {MAX_CANDIDATES, &max_candidates},
         {FACET_QUERY_NUM_TYPOS, &facet_query_num_typos},
         {FILTER_CURATED_HITS, &filter_curated_hits_option},
+        {FACET_SAMPLE_PERCENT, &facet_sample_percent},
+        {FACET_SAMPLE_THRESHOLD, &facet_sample_threshold},
     };
 
     std::unordered_map<std::string, std::string*> str_values = {
@@ -898,7 +905,13 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
             auto find_str_list_it = str_list_values.find(key);
             if(find_str_list_it != str_list_values.end()) {
-                StringUtils::split(val, *find_str_list_it->second, ",");
+
+                if(key == FACET_BY){
+                    StringUtils::split_facet(val, *find_str_list_it->second);
+                }
+                else{
+                    StringUtils::split(val, *find_str_list_it->second, ",");
+                }
                 continue;
             }
 
@@ -997,7 +1010,9 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
                                                           vector_query,
                                                           enable_highlight_v1,
                                                           start_ts,
-                                                          match_type
+                                                          match_type,
+                                                          facet_sample_percent,
+                                                          facet_sample_threshold
                                                         );
 
     uint64_t timeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
