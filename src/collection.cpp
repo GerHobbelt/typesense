@@ -893,7 +893,7 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
         }
 
         if (sort_field_std.name != sort_field_const::text_match && sort_field_std.name != sort_field_const::eval &&
-            sort_field_std.name != sort_field_const::seq_id && sort_field_std.name != sort_field_const::group_count) {
+            sort_field_std.name != sort_field_const::seq_id && sort_field_std.name != sort_field_const::group_found) {
                 
             const auto field_it = search_schema.find(sort_field_std.name);
             if(field_it == search_schema.end() || !field_it.value().sort || !field_it.value().index) {
@@ -903,8 +903,8 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
             }
         }
 
-        if(sort_field_std.name == sort_field_const::group_count && is_group_by_query == false) {
-            std::string error = "group_by parameters should not be empty when using sort_by group_count";
+        if(sort_field_std.name == sort_field_const::group_found && is_group_by_query == false) {
+            std::string error = "group_by parameters should not be empty when using sort_by group_found";
             return Option<bool>(404, error);
         }
         
@@ -1171,6 +1171,11 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
                 if(TextEmbedderManager::model_dir.empty()) {
                     std::string error = "Text embedding is not enabled. Please set `model-dir` at startup.";
+                    return Option<nlohmann::json>(400, error);
+                }
+
+                if(raw_query == "*") {
+                    std::string error = "Wildcard query is not supported for embedding fields.";
                     return Option<nlohmann::json>(400, error);
                 }
 
@@ -1840,11 +1845,15 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
             if(field_order_kv->match_score_index == CURATED_RECORD_IDENTIFIER) {
                 wrapper_doc["curated"] = true;
             } else if(field_order_kv->match_score_index >= 0) {
-                wrapper_doc["text_match"] = field_order_kv->scores[field_order_kv->match_score_index];
+                if(vector_query.field_name.empty()) {
+                    wrapper_doc["text_match"] = field_order_kv->scores[field_order_kv->match_score_index];
 
-                wrapper_doc["text_match_info"] = nlohmann::json::object();
-                populate_text_match_info(wrapper_doc["text_match_info"],
-                                         field_order_kv->scores[field_order_kv->match_score_index], match_type);
+                    wrapper_doc["text_match_info"] = nlohmann::json::object();
+                    populate_text_match_info(wrapper_doc["text_match_info"],
+                                            field_order_kv->scores[field_order_kv->match_score_index], match_type);
+                } else {
+                    wrapper_doc["rank_fusion_score"] = Index::int64_t_to_float(field_order_kv->scores[field_order_kv->match_score_index]);
+                }
             }
 
             nlohmann::json geo_distances;
@@ -2474,7 +2483,7 @@ void Collection::populate_result_kvs(Topster *topster, std::vector<std::vector<K
         int group_sort_order = 1;
 
         for(int i = 0; i < sort_by_fields.size(); ++i) {
-            if(sort_by_fields[i].name == sort_field_const::group_count) {
+            if(sort_by_fields[i].name == sort_field_const::group_found) {
                 group_count_index = i;
                 
                 if(sort_by_fields[i].order == sort_field_const::asc) {
