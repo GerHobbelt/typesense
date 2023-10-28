@@ -2455,6 +2455,10 @@ void Collection::parse_search_query(const std::string &query, std::vector<std::s
             }
 
             for(auto& sub_token: sub_tokens) {
+                if(sub_token.size() > 100) {
+                    sub_token.erase(100);
+                }
+
                 if(exclude_operator_prior) {
                     if(phrase_search_op_prior) {
                         phrase.push_back(sub_token);
@@ -3363,10 +3367,12 @@ Option<bool> Collection::remove_if_found(uint32_t seq_id, const bool remove_from
     return Option<bool>(true);
 }
 
-Option<uint32_t> Collection::add_override(const override_t & override) {
-    bool inserted = store->insert(Collection::get_override_key(name, override.id), override.to_json().dump());
-    if(!inserted) {
-        return Option<uint32_t>(500, "Error while storing the override on disk.");
+Option<uint32_t> Collection::add_override(const override_t & override, bool write_to_store) {
+    if(write_to_store) {
+        bool inserted = store->insert(Collection::get_override_key(name, override.id), override.to_json().dump());
+        if(!inserted) {
+            return Option<uint32_t>(500, "Error while storing the override on disk.");
+        }
     }
 
     std::unique_lock lock(mutex);
@@ -3583,7 +3589,7 @@ Option<bool> Collection::parse_pinned_hits(const std::string& pinned_hits_str,
     return Option<bool>(true);
 }
 
-Option<bool> Collection::add_synonym(const nlohmann::json& syn_json) {
+Option<bool> Collection::add_synonym(const nlohmann::json& syn_json, bool write_to_store) {
     std::shared_lock lock(mutex);
     synonym_t synonym;
     Option<bool> syn_op = synonym_t::parse(syn_json, synonym);
@@ -3592,7 +3598,7 @@ Option<bool> Collection::add_synonym(const nlohmann::json& syn_json) {
         return syn_op;
     }
 
-    return synonym_index->add_synonym(name, synonym);
+    return synonym_index->add_synonym(name, synonym, write_to_store);
 }
 
 bool Collection::get_synonym(const std::string& id, synonym_t& synonym) {
