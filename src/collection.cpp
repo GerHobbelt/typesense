@@ -137,12 +137,15 @@ Option<doc_seq_id_t> Collection::to_doc(const std::string & json_str, nlohmann::
                                                     "` in the collection `" + reference_collection_name + "` must be indexed.");
             }
 
+            // Get the doc id of the referenced document.
             auto value = document[field_name].get<std::string>();
             filter_result_t filter_result;
             collection->get_filter_ids(reference_field_name + ":=" + value, filter_result);
 
             if (filter_result.count != 1) {
                 auto match = " `" + reference_field_name + ": " + value + "` ";
+
+                // Constraints similar to foreign key apply here. The reference match must be unique and not null.
                 return  Option<doc_seq_id_t>(400, filter_result.count < 1 ?
                                                   "Referenced document having" + match + "not found in the collection `"
                                                   + reference_collection_name + "`." :
@@ -2390,9 +2393,14 @@ void Collection::parse_search_query(const std::string &query, std::vector<std::s
             }
 
             if(!token.empty() && (token.back() == '"' || (token[0] == '"' && token.size() == 1))) {
-                // handles single token phrase and a phrase with padded space, like: "some query " here
-                end_of_phrase = true;
-                token = token.substr(0, token.size()-1);
+                if(phrase_search_op_prior) {
+                    // handles single token phrase and a phrase with padded space, like: "some query "
+                    end_of_phrase = true;
+                    token = token.substr(0, token.size()-1);
+                } else if(token[0] == '"' && token.size() == 1) {
+                    // handles front padded phrase query, e.g. " some query"
+                    phrase_search_op_prior = true;
+                }
             }
 
             // retokenize using collection config (handles hyphens being part of the query)
@@ -2576,21 +2584,6 @@ Option<bool> Collection::get_reference_filter_ids(const std::string & filter_que
     // Reference helper field has the sequence id of other collection's documents.
     auto field_name = reference_field_op.get() + REFERENCE_HELPER_FIELD_SUFFIX;
     return index->do_reference_filtering_with_lock(filter_tree_root, filter_result, name, field_name);
-}
-
-Option<bool> Collection::validate_reference_filter(const std::string& filter_query) const {
-    std::shared_lock lock(mutex);
-
-    const std::string doc_id_prefix = std::to_string(collection_id) + "_" + DOC_ID_PREFIX + "_";
-    filter_node_t* filter_tree_root = nullptr;
-    Option<bool> filter_op = filter::parse_filter_query(filter_query, search_schema,
-                                                        store, doc_id_prefix, filter_tree_root);
-    if(!filter_op.ok()) {
-        return filter_op;
-    }
-
-    delete filter_tree_root;
-    return Option<bool>(true);
 }
 
 bool Collection::facet_value_to_string(const facet &a_facet, const facet_count_t &facet_count,
