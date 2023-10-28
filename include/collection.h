@@ -265,6 +265,8 @@ private:
                                                  const spp::sparse_hash_set<std::string>& exclude_fields,
                                                  tsl::htrie_set<char>& include_fields_full,
                                                  tsl::htrie_set<char>& exclude_fields_full) const;
+    
+
 
 public:
 
@@ -345,6 +347,8 @@ public:
                                 const DIRTY_VALUES dirty_values,
                                 const std::string& id="");
 
+    Option<bool> embed_fields(nlohmann::json& document);
+
     static uint32_t get_seq_id_from_key(const std::string & key);
 
     Option<bool> get_document_from_store(const std::string & seq_id_key, nlohmann::json & document, bool raw_doc = false) const;
@@ -356,8 +360,9 @@ public:
 
     static void remove_flat_fields(nlohmann::json& document);
 
-    static void prune_doc(nlohmann::json& doc, const tsl::htrie_set<char>& include_names,
-                          const tsl::htrie_set<char>& exclude_names, const std::string& parent_name = "", size_t depth = 0);
+    static Option<bool> prune_doc(nlohmann::json& doc, const tsl::htrie_set<char>& include_names,
+                          const tsl::htrie_set<char>& exclude_names, const std::string& parent_name = "", size_t depth = 0,
+                          const reference_filter_result_t* reference_filter_result = nullptr);
 
     const Index* _get_index() const;
 
@@ -401,7 +406,7 @@ public:
                                                      tsl::htrie_set<char>& include_fields_full,
                                                      tsl::htrie_set<char>& exclude_fields_full) const;
 
-    Option<nlohmann::json> search(const std::string & query, const std::vector<std::string> & search_fields,
+    Option<nlohmann::json> search(std::string query, const std::vector<std::string> & search_fields,
                                   const std::string & filter_query, const std::vector<std::string> & facet_fields,
                                   const std::vector<sort_by> & sort_fields, const std::vector<uint32_t>& num_typos,
                                   size_t per_page = 10, size_t page = 1,
@@ -446,12 +451,13 @@ public:
                                   const size_t facet_sample_percent = 100,
                                   const size_t facet_sample_threshold = 0) const;
 
-    Option<bool> get_filter_ids(const std::string & filter_query,
-                                std::vector<std::pair<size_t, uint32_t*>>& index_ids) const;
+    Option<bool> get_filter_ids(const std::string & filter_query, filter_result_t& filter_result) const;
+
+    Option<std::string> get_reference_field(const std::string & collection_name) const;
 
     Option<bool> get_reference_filter_ids(const std::string & filter_query,
-                                          const std::string & collection_name,
-                                          std::pair<uint32_t, uint32_t*>& reference_index_ids) const;
+                                          filter_result_t& filter_result,
+                                          const std::string & collection_name) const;
 
     Option<bool> validate_reference_filter(const std::string& filter_query) const;
 
@@ -515,8 +521,8 @@ public:
 
     void process_highlight_fields(const std::vector<search_field_t>& search_fields,
                                   const std::vector<std::string>& raw_search_fields,
-                                  const tsl::htrie_set<char>& exclude_fields,
                                   const tsl::htrie_set<char>& include_fields,
+                                  const tsl::htrie_set<char>& exclude_fields,
                                   const std::vector<std::string>& highlight_field_names,
                                   const std::vector<std::string>& highlight_full_field_names,
                                   const std::vector<enable_t>& infixes,
