@@ -1160,6 +1160,8 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
         const auto& fquery_hashes = facet_infos[findex].hashes;
         const bool should_compute_stats = facet_infos[findex].should_compute_stats;
 
+        auto sort_index_it = sort_index.find(a_facet.field_name);
+
         size_t mod_value = 100 / facet_sample_percent;
 
         facet_map_t::iterator facet_map_it;
@@ -1218,14 +1220,11 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                     compute_facet_stats(a_facet, fhash, facet_field.type);
                 }
                 if(a_facet.is_range_query) {
-                    auto sort_index_it = sort_index.find(a_facet.field_name);
-                
                     if(sort_index_it != sort_index.end()){
                         auto doc_id_val_map = sort_index_it->second;
                         auto doc_seq_id_it = doc_id_val_map->find(doc_seq_id);
                 
                         if(doc_seq_id_it != doc_id_val_map->end()){
-                
                             int64_t doc_val = doc_seq_id_it->second;
                             std::pair<int64_t, std::string> range_pair {};
                             if(a_facet.get_range(doc_val, range_pair)) {
@@ -6142,18 +6141,36 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
 void Index::get_doc_changes(const index_operation_t op, nlohmann::json& update_doc,
                             const nlohmann::json& old_doc, nlohmann::json& new_doc, nlohmann::json& del_doc) {
 
-    // construct new doc with old doc values first
-    for(auto it = old_doc.begin(); it != old_doc.end(); ++it) {
-        if(op == UPSERT && !update_doc.contains(it.key())) {
-            del_doc[it.key()] = it.value();
-        } else {
-            new_doc[it.key()] = it.value();
+    if(op == UPSERT) {
+        new_doc = update_doc;
+    } else {
+        new_doc = old_doc;
+        new_doc.merge_patch(update_doc);
+        if(old_doc.contains(".flat")) {
+            new_doc[".flat"] = old_doc[".flat"];
+            for(auto& fl: update_doc[".flat"]) {
+                new_doc[".flat"].push_back(fl);
+            }
         }
     }
 
-    // now override new doc with updated doc values and also create del doc
+    for(auto it = old_doc.begin(); it != old_doc.end(); ++it) {
+        if(it.value().is_object() || (it.value().is_array() && (it.value().empty() || it.value()[0].is_object()))) {
+            continue;
+        }
+
+        if(op == UPSERT && !update_doc.contains(it.key())) {
+            del_doc[it.key()] = it.value();
+        }
+    }
+
     auto it = update_doc.begin();
     for(; it != update_doc.end(); ) {
+        if(it.value().is_object() || (it.value().is_array() && (it.value().empty() || it.value()[0].is_object()))) {
+            ++it;
+            continue;
+        }
+
         // if the update doc contains a field that exists in old, we record that (for delete + reindex)
         bool field_exists_in_old_doc = (old_doc.count(it.key()) != 0);
         if(field_exists_in_old_doc) {
@@ -6168,7 +6185,6 @@ void Index::get_doc_changes(const index_operation_t op, nlohmann::json& update_d
             new_doc.erase(it.key());
             it = update_doc.erase(it);
         } else {
-            new_doc[it.key()] = it.value();
             ++it;
         }
     }
@@ -6193,6 +6209,10 @@ void Index::scrub_reindex_doc(const tsl::htrie_map<char, field>& search_schema,
 
         const auto& search_field_it = search_schema.find(field_name);
         if(search_field_it == search_schema.end()) {
+            continue;
+        }
+
+        if(it.value().is_object() || (it.value().is_array() && (it.value().empty() || it.value()[0].is_object()))) {
             continue;
         }
 
