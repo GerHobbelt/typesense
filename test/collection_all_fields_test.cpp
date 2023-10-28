@@ -1600,15 +1600,17 @@ TEST_F(CollectionAllFieldsTest, CreateFromFieldJSONInvalidField) {
 
     std::vector<field> fields;
     std::string fallback_field_type;
-    size_t num_auto_detect_fields;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
 
-    auto field_op = field::json_field_to_field(false, field_json, fields, fallback_field_type, num_auto_detect_fields);
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
 
     ASSERT_FALSE(field_op.ok());
-    ASSERT_EQ("Property `create_from` must be an array of existing string fields.", field_op.error());
+    ASSERT_EQ("Property `create_from` can only be used with array of string fields.", field_op.error());
 }
 
 TEST_F(CollectionAllFieldsTest, CreateFromFieldNoModelDir) {
+    TextEmbedderManager::model_dir = std::string();
     nlohmann::json field_json;
     field_json["name"] = "embedding";
     field_json["type"] = "float[]";
@@ -1616,12 +1618,13 @@ TEST_F(CollectionAllFieldsTest, CreateFromFieldNoModelDir) {
 
     std::vector<field> fields;
     std::string fallback_field_type;
-    size_t num_auto_detect_fields;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
 
-    auto field_op = field::json_field_to_field(false, field_json, fields, fallback_field_type, num_auto_detect_fields);
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
 
     ASSERT_FALSE(field_op.ok());
-    ASSERT_EQ("Property `create_from` must be an array of existing string fields.", field_op.error());
+    ASSERT_EQ("Text embedding is not enabled. Please set `model-dir` at startup.", field_op.error());
 }
 
 TEST_F(CollectionAllFieldsTest, CreateFromNotArray) {
@@ -1633,9 +1636,10 @@ TEST_F(CollectionAllFieldsTest, CreateFromNotArray) {
 
     std::vector<field> fields;
     std::string fallback_field_type;
-    size_t num_auto_detect_fields;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
 
-    auto field_op = field::json_field_to_field(false, field_json, fields, fallback_field_type, num_auto_detect_fields);
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
 
     ASSERT_FALSE(field_op.ok());
     ASSERT_EQ("Property `create_from` must be an array.", field_op.error());
@@ -1646,24 +1650,24 @@ TEST_F(CollectionAllFieldsTest, ModelPathWithoutCreateFrom) {
     nlohmann::json field_json;
     field_json["name"] = "embedding";
     field_json["type"] = "float[]";
-    field_json["model_path"] = "model.onnx";
+    field_json["model_name"] = "model";
 
     std::vector<field> fields;
     std::string fallback_field_type;
-    size_t num_auto_detect_fields;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
 
-    auto field_op = field::json_field_to_field(false, field_json, fields, fallback_field_type, num_auto_detect_fields);
-
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
     ASSERT_FALSE(field_op.ok());
-    ASSERT_EQ("Property `model_path` can only be used with `create_from`.", field_op.error());
+    ASSERT_EQ("Property `model_name` can only be used with `create_from`.", field_op.error());
 }
 
 
 TEST_F(CollectionAllFieldsTest, CreateFromBasicValid) {
 
     TextEmbedderManager::model_dir = "./models/";
-    HttpClient::get_instance().download_file(TextEmbedderManager::DEFAULT_MODEL_URL, TextEmbedderManager::model_dir + TextEmbedderManager::DEFAULT_MODEL_NAME);
-    HttpClient::get_instance().download_file(TextEmbedderManager::DEFAULT_VOCAB_URL, TextEmbedderManager::model_dir + TextEmbedderManager::DEFAULT_VOCAB_NAME);
+    HttpClient::get_instance().download_file(TextEmbedderManager::DEFAULT_MODEL_URL, TextEmbedderManager::get_absolute_model_path(TextEmbedderManager::DEFAULT_MODEL_NAME));
+    HttpClient::get_instance().download_file(TextEmbedderManager::DEFAULT_VOCAB_URL, TextEmbedderManager::get_absolute_vocab_path());
 
     field embedding = field("embedding", field_types::FLOAT_ARRAY, false);
     embedding.create_from.push_back("name");
