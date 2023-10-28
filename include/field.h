@@ -11,7 +11,6 @@
 #include <tsl/htrie_map.h>
 #include "json.hpp"
 #include "text_embedder_manager.h"
-#include <regex>
 
 namespace field_types {
     // first field value indexed will determine the type
@@ -514,7 +513,7 @@ struct filter {
     bool apply_not_equals = false;
 
     // Would store `Foo` in case of a filter expression like `$Foo(bar := baz)`
-    std::string referenced_collection_name;
+    std::string referenced_collection_name = "";
 
     static const std::string RANGE_OPERATOR() {
         return "..";
@@ -607,7 +606,6 @@ struct filter_node_t {
     bool isOperator;
     filter_node_t* left = nullptr;
     filter_node_t* right = nullptr;
-    filter_tree_metrics* metrics = nullptr;
 
     filter_node_t(filter filter_exp)
             : filter_exp(std::move(filter_exp)),
@@ -624,7 +622,6 @@ struct filter_node_t {
               right(right) {}
 
     ~filter_node_t() {
-        delete metrics;
         delete left;
         delete right;
     }
