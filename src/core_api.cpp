@@ -15,6 +15,7 @@
 #include "lru/lru.hpp"
 #include "ratelimit_manager.h"
 #include "event_manager.h"
+#include "http_proxy.h"
 
 using namespace std::chrono_literals;
 
@@ -774,7 +775,7 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
         }
     }
 
-    res->content_type_header = "application/octet-stream";
+    res->content_type_header = "text/plain; charset=utf8";
     res->status_code = 200;
 
     stream_response(req, res);
@@ -2134,5 +2135,45 @@ bool del_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared
     }
 
     res->set_200(R"({"ok": true)");
+    return true;
+}
+
+
+bool post_proxy(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    HttpProxy& proxy = HttpProxy::get_instance();
+
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    std::string body, url, method;
+    std::unordered_map<std::string, std::string> headers;
+
+    try {
+        body = req_json["body"].get<std::string>();
+        url = req_json["url"].get<std::string>();
+        method = req_json["method"].get<std::string>();
+        headers = req_json["headers"].get<std::unordered_map<std::string, std::string>>();
+    } catch(const std::exception& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    auto response = proxy.send(url, method, body, headers);
+    
+    if(response.status_code != 200) {
+        int code = response.status_code;
+        res->set_body(code, response.body);
+        return false;
+    }
+
+    res->set_200(response.body);
     return true;
 }
