@@ -1568,12 +1568,12 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
         return Option<nlohmann::json>(408, "Request Timeout");
     }
 
-    if(match_score_index >= 0 && sort_fields_std[match_score_index].text_match_buckets > 1) {
+    if(match_score_index >= 0 && sort_fields_std[match_score_index].text_match_buckets > 0) {
         size_t num_buckets = sort_fields_std[match_score_index].text_match_buckets;
         const size_t max_kvs_bucketed = std::min<size_t>(DEFAULT_TOPSTER_SIZE, raw_result_kvs.size());
 
         if(max_kvs_bucketed >= num_buckets) {
-            std::vector<int64_t> result_scores(max_kvs_bucketed);
+            spp::sparse_hash_map<uint64_t, int64_t> result_scores;
 
             // only first `max_kvs_bucketed` elements are bucketed to prevent pagination issues past 250 records
             size_t block_len = (max_kvs_bucketed / num_buckets);
@@ -1582,7 +1582,7 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                 int64_t anchor_score = raw_result_kvs[i][0]->scores[raw_result_kvs[i][0]->match_score_index];
                 size_t j = 0;
                 while(j < block_len && i+j < max_kvs_bucketed) {
-                    result_scores[i+j] = raw_result_kvs[i+j][0]->scores[raw_result_kvs[i+j][0]->match_score_index];
+                    result_scores[raw_result_kvs[i+j][0]->key] = raw_result_kvs[i+j][0]->scores[raw_result_kvs[i+j][0]->match_score_index];
                     raw_result_kvs[i+j][0]->scores[raw_result_kvs[i+j][0]->match_score_index] = anchor_score;
                     j++;
                 }
@@ -1596,7 +1596,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
             // restore original scores
             for(i = 0; i < max_kvs_bucketed; i++) {
-                raw_result_kvs[i][0]->scores[raw_result_kvs[i][0]->match_score_index] = result_scores[i];
+                raw_result_kvs[i][0]->scores[raw_result_kvs[i][0]->match_score_index] =
+                        result_scores[raw_result_kvs[i][0]->key];
             }
         }
     }
@@ -1801,6 +1802,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
             // remove fields from highlight doc that were not highlighted
             if(!hfield_names.empty()) {
                 prune_doc(highlight_res, hfield_names, tsl::htrie_set<char>(), "");
+            } else {
+                highlight_res.clear();
             }
 
             if(enable_highlight_v1) {
@@ -2816,7 +2819,9 @@ void Collection::highlight_result(const std::string& raw_query, const field &sea
 
     highlight_nested_field(highlight_doc, highlight_doc, path_parts, 0, false, -1,
                            [&](nlohmann::json& h_obj, bool is_arr_obj_ele, int array_i) {
-        if(!h_obj.is_string()) {
+        if(h_obj.is_object()) {
+            return ;
+        } else if(!h_obj.is_string()) {
             auto val_back = h_obj;
             h_obj = nlohmann::json::object();
             h_obj["snippet"] = to_string(val_back);
