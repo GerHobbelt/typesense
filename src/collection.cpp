@@ -563,7 +563,7 @@ Option<uint32_t> Collection::index_in_memory(nlohmann::json &document, uint32_t 
                                              const index_operation_t op, const DIRTY_VALUES& dirty_values) {
     std::unique_lock lock(mutex);
 
-    Option<uint32_t> validation_op = Index::validate_index_in_memory(document, seq_id, default_sorting_field,
+    Option<uint32_t> validation_op = validator_t::validate_index_in_memory(document, seq_id, default_sorting_field,
                                                                      search_schema, op,
                                                                      fallback_field_type, dirty_values);
 
@@ -714,7 +714,8 @@ void Collection::curate_results(string& actual_query, const string& filter_query
 
 Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<sort_by> & sort_fields,
                                                               std::vector<sort_by>& sort_fields_std,
-                                                              const bool is_wildcard_query) const {
+                                                              const bool is_wildcard_query, 
+                                                              const bool is_group_by_query) const {
 
     size_t num_sort_expressions = 0;
 
@@ -887,7 +888,9 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
             }
         }
 
-        if (sort_field_std.name != sort_field_const::text_match && sort_field_std.name != sort_field_const::eval) {
+        if (sort_field_std.name != sort_field_const::text_match && sort_field_std.name != sort_field_const::eval &&
+            sort_field_std.name != sort_field_const::seq_id && sort_field_std.name != sort_field_const::group_count) {
+                
             const auto field_it = search_schema.find(sort_field_std.name);
             if(field_it == search_schema.end() || !field_it.value().sort || !field_it.value().index) {
                 std::string error = "Could not find a field named `" + sort_field_std.name +
@@ -896,6 +899,11 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
             }
         }
 
+        if(sort_field_std.name == sort_field_const::group_count && is_group_by_query == false) {
+            std::string error = "group_by parameters should not be empty when using sort_by group_count";
+            return Option<bool>(404, error);
+        }
+        
         StringUtils::toupper(sort_field_std.order);
 
         if(sort_field_std.order != sort_field_const::asc && sort_field_std.order != sort_field_const::desc) {
@@ -1246,16 +1254,18 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
     const std::vector<std::string>& search_fields = reordered_search_fields.empty() ? processed_search_fields
                                                                                     : reordered_search_fields;
-    std::vector<facet> facets;
 
     const std::string doc_id_prefix = std::to_string(collection_id) + "_" + DOC_ID_PREFIX + "_";
     filter_node_t* filter_tree_root = nullptr;
     Option<bool> parse_filter_op = filter::parse_filter_query(filter_query, search_schema,
                                                               store, doc_id_prefix, filter_tree_root);
+    std::unique_ptr<filter_node_t> filter_tree_root_guard(filter_tree_root);
+
     if(!parse_filter_op.ok()) {
         return Option<nlohmann::json>(parse_filter_op.code(), parse_filter_op.error());
     }
 
+    std::vector<facet> facets;
     // validate facet fields
     for(const std::string & facet_field: facet_fields) {
         
@@ -1344,7 +1354,6 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
     std::vector<std::vector<KV*>> override_result_kvs;
 
     size_t total_found = 0;
-    spp::sparse_hash_set<uint64_t> groups_processed;  // used to calculate total_found for grouped query
 
     std::vector<uint32_t> excluded_ids;
     std::vector<std::pair<uint32_t, uint32_t>> included_ids; // ID -> position
@@ -1400,9 +1409,11 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
     std::vector<sort_by>& sort_fields_std = sort_fields_guard.sort_fields_std;
 
     bool is_wildcard_query = (query == "*");
+    bool is_group_by_query = group_by_fields.size() > 0;
 
     if(curated_sort_by.empty()) {
-        auto sort_validation_op = validate_and_standardize_sort_fields(sort_fields, sort_fields_std, is_wildcard_query);
+        auto sort_validation_op = validate_and_standardize_sort_fields(sort_fields, 
+                                    sort_fields_std, is_wildcard_query, is_group_by_query);
         if(!sort_validation_op.ok()) {
             return Option<nlohmann::json>(sort_validation_op.code(), sort_validation_op.error());
         }
@@ -1413,8 +1424,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
             return Option<nlohmann::json>(400, "Parameter `sort_by` is malformed.");
         }
 
-        auto sort_validation_op = validate_and_standardize_sort_fields(curated_sort_fields, sort_fields_std,
-                                                                       is_wildcard_query);
+        auto sort_validation_op = validate_and_standardize_sort_fields(curated_sort_fields, 
+                                    sort_fields_std, is_wildcard_query, is_group_by_query);
         if(!sort_validation_op.ok()) {
             return Option<nlohmann::json>(sort_validation_op.code(), sort_validation_op.error());
         }
@@ -1496,6 +1507,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                                                  filter_curated_hits, split_join_tokens, vector_query,
                                                  facet_sample_percent, facet_sample_threshold);
 
+    std::unique_ptr<search_args> search_params_guard(search_params);
+
     auto search_op = index->run_search(search_params, name);
     if (!search_op.ok()) {
         return Option<nlohmann::json>(search_op.code(), search_op.error());
@@ -1509,8 +1522,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
     topster.sort();
     curated_topster.sort();
 
-    populate_result_kvs(&topster, raw_result_kvs);
-    populate_result_kvs(&curated_topster, override_result_kvs);
+    populate_result_kvs(&topster, raw_result_kvs, search_params->groups_processed, sort_fields_std);
+    populate_result_kvs(&curated_topster, override_result_kvs, search_params->groups_processed, sort_fields_std);
 
     // for grouping we have to aggregate group set sizes to a count value
     if(group_limit) {
@@ -1853,6 +1866,12 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
         if(group_limit) {
             group_hits["group_key"] = group_key;
+
+            const auto& itr = search_params->groups_processed.find(kv_group[0]->distinct_key);
+            
+            if(itr != search_params->groups_processed.end()) {
+                group_hits["found"] = itr->second;
+            }
             result["grouped_hits"].push_back(group_hits);
         }
     }
@@ -1861,6 +1880,11 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
     
     // populate facets
     for(facet & a_facet: facets) {
+        // Don't return zero counts for a wildcard facet.
+        if (a_facet.is_wildcard_match && a_facet.result_map.size() == 0) {
+            continue;
+        }
+
         // check for search cutoff elapse
         if((std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().
             time_since_epoch()).count() - search_begin_us) > search_stop_us) {
@@ -2017,11 +2041,6 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
         facet_result["stats"]["total_values"] = facet_hash_counts.size();
         result["facet_counts"].push_back(facet_result);
     }
-
-    // free search params
-    delete search_params;
-
-    delete filter_tree_root;
 
     result["search_cutoff"] = search_cutoff;
 
@@ -2428,15 +2447,39 @@ void Collection::parse_search_query(const std::string &query, std::vector<std::s
     }
 }
 
-void Collection::populate_result_kvs(Topster *topster, std::vector<std::vector<KV *>> &result_kvs) {
+void Collection::populate_result_kvs(Topster *topster, std::vector<std::vector<KV *>> &result_kvs,
+                                const spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed, 
+                                const std::vector<sort_by>& sort_by_fields) {
     if(topster->distinct) {
         // we have to pick top-K groups
         Topster gtopster(topster->MAX_SIZE);
+
+        int group_count_index = -1;
+        int group_sort_order = 1;
+
+        for(int i = 0; i < sort_by_fields.size(); ++i) {
+            if(sort_by_fields[i].name == sort_field_const::group_count) {
+                group_count_index = i;
+                
+                if(sort_by_fields[i].order == sort_field_const::asc) {
+                    group_sort_order *= -1;
+                } 
+
+                break;
+            }
+        }
 
         for(auto& group_topster: topster->group_kv_map) {
             group_topster.second->sort();
             if(group_topster.second->size != 0) {
                 KV* kv_head = group_topster.second->getKV(0);
+                
+                if(group_count_index >= 0) {
+                    const auto& itr = groups_processed.find(kv_head->distinct_key);
+                    if(itr != groups_processed.end()) {
+                        kv_head->scores[group_count_index] = itr->second * group_sort_order;
+                    }
+                }
                 gtopster.add(kv_head);
             }
         }
@@ -2518,6 +2561,22 @@ Option<bool> Collection::get_reference_filter_ids(const std::string & filter_que
     auto field_name = reference_field_op.get() + REFERENCE_HELPER_FIELD_SUFFIX;
     auto filter_op = index->do_reference_filtering_with_lock(filter_tree_root, filter_result, field_name);
     if (!filter_op.ok()) {
+        return filter_op;
+    }
+
+    delete filter_tree_root;
+    return Option<bool>(true);
+}
+
+Option<bool> Collection::validate_reference_filter(const std::string& filter_query) const {
+    std::shared_lock lock(mutex);
+
+    const std::string doc_id_prefix = std::to_string(collection_id) + "_" + DOC_ID_PREFIX + "_";
+    filter_node_t* filter_tree_root = nullptr;
+    Option<bool> filter_op = filter::parse_filter_query(filter_query, search_schema,
+                                                        store, doc_id_prefix, filter_tree_root);
+
+    if(!filter_op.ok()) {
         return filter_op;
     }
 
@@ -3004,6 +3063,12 @@ bool Collection::handle_highlight_text(std::string& text, bool normalise, const 
                 // group unicode code points and calculate number of actual characters
                 while(k <= tok_end) {
                     k++;
+
+                    if(tokenizer.should_skip_char(text[k])) {
+                        // used to handle special characters inside a tokenized word, e.g. `foo-bar`
+                        continue;
+                    }
+
                     if ((text[k] & 0xC0) == 0x80) k++;
                     if ((text[k] & 0xC0) == 0x80) k++;
                     if ((text[k] & 0xC0) == 0x80) k++;
@@ -4123,7 +4188,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
         }
 
         // validate existing data on disk for compatibility via updated_search_schema
-        auto validate_op = Index::validate_index_in_memory(document, seq_id, default_sorting_field,
+        auto validate_op = validator_t::validate_index_in_memory(document, seq_id, default_sorting_field,
                                                            updated_search_schema,
                                                            index_operation_t::CREATE,
                                                            fallback_field_type,
@@ -4545,6 +4610,10 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
 
         facets.emplace_back(std::move(a_facet));
     } else if (facet_field.find('*') != std::string::npos) { // Wildcard
+       if (facet_field[facet_field.size() - 1] != '*') {
+           return Option<bool>(404, "Only prefix matching with a wildcard is allowed.");
+       }
+
         // Trim * from the end.
         auto prefix = facet_field.substr(0, facet_field.size() - 1);
         auto pair = search_schema.equal_prefix_range(prefix);
@@ -4559,9 +4628,7 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
         for (auto field = pair.first; field != pair.second; field++) {
             if (field->facet) {
                 facets.emplace_back(facet(field->name));
-            } else {
-                std::string error = "Field `" + field->name + "` is not marked as a facet in the schema.";
-                return Option<bool>(404, error);
+                facets.back().is_wildcard_match = true;
             }
         }
    } else {

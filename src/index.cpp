@@ -407,171 +407,6 @@ bool validate_object_field(nlohmann::json& doc, const field& a_field) {
     return false;
 }
 
-Option<uint32_t> Index::validate_index_in_memory(nlohmann::json& document, uint32_t seq_id,
-                                                 const std::string & default_sorting_field,
-                                                 const tsl::htrie_map<char, field> & search_schema,
-                                                 const index_operation_t op,
-                                                 const std::string& fallback_field_type,
-                                                 const DIRTY_VALUES& dirty_values) {
-
-    bool missing_default_sort_field = (!default_sorting_field.empty() && document.count(default_sorting_field) == 0);
-
-    if((op != UPDATE && op != EMPLACE) && missing_default_sort_field) {
-        return Option<>(400, "Field `" + default_sorting_field  + "` has been declared as a default sorting field, "
-                                                                  "but is not found in the document.");
-    }
-
-    for(const auto& a_field: search_schema) {
-        const std::string& field_name = a_field.name;
-
-        if(field_name == "id" || a_field.is_object()) {
-            continue;
-        }
-
-        if((a_field.optional || op == UPDATE || op == EMPLACE) && document.count(field_name) == 0) {
-            continue;
-        }
-
-        if(document.count(field_name) == 0) {
-            return Option<>(400, "Field `" + field_name  + "` has been declared in the schema, "
-                                                           "but is not found in the document.");
-        }
-
-        if(a_field.optional && document[field_name].is_null()) {
-            // we will ignore `null` on an option field
-            if(op != UPDATE && op != EMPLACE) {
-                // for updates, the erasure is done later since we need to keep the key for overwrite
-                document.erase(field_name);
-            }
-            continue;
-        }
-
-        nlohmann::json::iterator dummy_iter;
-        bool array_ele_erased = false;
-
-        if(a_field.type == field_types::STRING && !document[field_name].is_string()) {
-            Option<uint32_t> coerce_op = coerce_string(dirty_values, fallback_field_type, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-            if(!coerce_op.ok()) {
-                return coerce_op;
-            }
-        } else if(a_field.type == field_types::INT32) {
-            if(!document[field_name].is_number_integer()) {
-                Option<uint32_t> coerce_op = coerce_int32_t(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-                if(!coerce_op.ok()) {
-                    return coerce_op;
-                }
-            }
-        } else if(a_field.type == field_types::INT64 && !document[field_name].is_number_integer()) {
-            Option<uint32_t> coerce_op = coerce_int64_t(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-            if(!coerce_op.ok()) {
-                return coerce_op;
-            }
-        } else if(a_field.type == field_types::FLOAT && !document[field_name].is_number()) {
-            // using `is_number` allows integer to be passed to a float field
-            Option<uint32_t> coerce_op = coerce_float(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-            if(!coerce_op.ok()) {
-                return coerce_op;
-            }
-        } else if(a_field.type == field_types::BOOL && !document[field_name].is_boolean()) {
-            Option<uint32_t> coerce_op = coerce_bool(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-            if(!coerce_op.ok()) {
-                return coerce_op;
-            }
-        } else if(a_field.type == field_types::GEOPOINT) {
-            if(!document[field_name].is_array() || document[field_name].size() != 2) {
-                return Option<>(400, "Field `" + field_name  + "` must be a 2 element array: [lat, lng].");
-            }
-
-            if(!(document[field_name][0].is_number() && document[field_name][1].is_number())) {
-                // one or more elements is not an number, try to coerce
-                Option<uint32_t> coerce_op = coerce_geopoint(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-                if(!coerce_op.ok()) {
-                    return coerce_op;
-                }
-            }
-        } else if(a_field.is_array()) {
-            if(!document[field_name].is_array()) {
-                if(a_field.optional && (dirty_values == DIRTY_VALUES::DROP ||
-                                        dirty_values == DIRTY_VALUES::COERCE_OR_DROP)) {
-                    document.erase(field_name);
-                    continue;
-                } else {
-                    return Option<>(400, "Field `" + field_name  + "` must be an array.");
-                }
-            }
-
-            nlohmann::json::iterator it = document[field_name].begin();
-
-            // Handle a geopoint[] type inside an array of object: it won't be an array of array, so cannot iterate
-            if(a_field.nested && a_field.type == field_types::GEOPOINT_ARRAY &&
-                it->is_number() && document[field_name].size() == 2) {
-                const auto& item = document[field_name];
-                if(!(item[0].is_number() && item[1].is_number())) {
-                    // one or more elements is not an number, try to coerce
-                    Option<uint32_t> coerce_op = coerce_geopoint(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                    if(!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                }
-
-                continue;
-            }
-
-            for(; it != document[field_name].end(); ) {
-                const auto& item = it.value();
-                array_ele_erased = false;
-
-                if (a_field.type == field_types::STRING_ARRAY && !item.is_string()) {
-                    Option<uint32_t> coerce_op = coerce_string(dirty_values, fallback_field_type, a_field, document, field_name, it, true, array_ele_erased);
-                    if (!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                } else if (a_field.type == field_types::INT32_ARRAY && !item.is_number_integer()) {
-                    Option<uint32_t> coerce_op = coerce_int32_t(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                    if (!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                } else if (a_field.type == field_types::INT64_ARRAY && !item.is_number_integer()) {
-                    Option<uint32_t> coerce_op = coerce_int64_t(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                    if (!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                } else if (a_field.type == field_types::FLOAT_ARRAY && !item.is_number()) {
-                    // we check for `is_number` to allow whole numbers to be passed into float fields
-                    Option<uint32_t> coerce_op = coerce_float(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                    if (!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                } else if (a_field.type == field_types::BOOL_ARRAY && !item.is_boolean()) {
-                    Option<uint32_t> coerce_op = coerce_bool(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                    if (!coerce_op.ok()) {
-                        return coerce_op;
-                    }
-                } else if (a_field.type == field_types::GEOPOINT_ARRAY) {
-                    if(!item.is_array() || item.size() != 2) {
-                        return Option<>(400, "Field `" + field_name  + "` must contain 2 element arrays: [ [lat, lng],... ].");
-                    }
-
-                    if(!(item[0].is_number() && item[1].is_number())) {
-                        // one or more elements is not an number, try to coerce
-                        Option<uint32_t> coerce_op = coerce_geopoint(dirty_values, a_field, document, field_name, it, true, array_ele_erased);
-                        if(!coerce_op.ok()) {
-                            return coerce_op;
-                        }
-                    }
-                }
-
-                if(!array_ele_erased) {
-                    // if it is erased, the iterator will be reassigned
-                    it++;
-                }
-            }
-        }
-    }
-
-    return Option<>(200);
-}
-
 void Index::validate_and_preprocess(Index *index, std::vector<index_record>& iter_batch,
                                     const size_t batch_start_index, const size_t batch_size,
                                     const std::string& default_sorting_field,
@@ -597,7 +432,7 @@ void Index::validate_and_preprocess(Index *index, std::vector<index_record>& ite
             }
 
             if(do_validation) {
-                Option<uint32_t> validation_op = validate_index_in_memory(index_rec.doc, index_rec.seq_id,
+                Option<uint32_t> validation_op = validator_t::validate_index_in_memory(index_rec.doc, index_rec.seq_id,
                                                                           default_sorting_field,
                                                                           search_schema,
                                                                           index_rec.operation,
@@ -1147,6 +982,10 @@ void Index::tokenize_string_with_facets(const std::string& text, bool is_facet, 
             continue;
         }
 
+        if(token.size() > 100) {
+            token.erase(100);
+        }
+
         token_to_offsets[token].push_back(token_index + 1);
         last_token = token;
 
@@ -1190,6 +1029,10 @@ void Index::tokenize_string_array_with_facets(const std::vector<std::string>& st
         while(tokenizer.next(token, token_index)) {
             if(token.empty()) {
                 continue;
+            }
+
+            if(token.size() > 100) {
+                token.erase(100);
             }
 
             token_to_offsets[token].push_back(token_index + 1);
@@ -1405,7 +1248,7 @@ void Index::search_all_candidates(const size_t num_search_fields,
                                   std::vector<std::vector<art_leaf*>>& searched_queries,
                                   tsl::htrie_map<char, token_leaf>& qtoken_set,
                                   Topster* topster,
-                                  spp::sparse_hash_set<uint64_t>& groups_processed,
+                                  spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                   uint32_t*& all_result_ids, size_t& all_result_ids_len,
                                   const size_t typo_tokens_threshold,
                                   const size_t group_limit,
@@ -1482,7 +1325,7 @@ void Index::search_candidates(const uint8_t & field_id, bool field_is_array,
                               std::vector<token_candidates> & token_candidates_vec,
                               std::vector<std::vector<art_leaf*>> & searched_queries,
                               Topster* topster,
-                              spp::sparse_hash_set<uint64_t>& groups_processed,
+                              spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                               uint32_t** all_result_ids, size_t & all_result_ids_len,
                               size_t& field_num_results,
                               const size_t typo_tokens_threshold,
@@ -2268,7 +2111,7 @@ bool Index::static_filter_query_eval(const override_t* override,
     if ((override->rule.match == override_t::MATCH_EXACT && override->rule.query == query) ||
         (override->rule.match == override_t::MATCH_CONTAINS &&
          StringUtils::contains_word(query, override->rule.query))) {
-        filter_node_t* new_filter_tree_root;
+        filter_node_t* new_filter_tree_root = nullptr;
         Option<bool> filter_op = filter::parse_filter_query(override->filter_by, search_schema,
                                                             store, "", new_filter_tree_root);
         if (filter_op.ok()) {
@@ -2423,7 +2266,7 @@ void Index::process_filter_overrides(const std::vector<const override_t*>& filte
                                                       token_order, absorbed_tokens, filter_by_clause);
 
             if (resolved_override) {
-                filter_node_t* new_filter_tree_root;
+                filter_node_t* new_filter_tree_root = nullptr;
                 Option<bool> filter_op = filter::parse_filter_query(filter_by_clause, search_schema,
                                                                     store, "", new_filter_tree_root);
                 if (filter_op.ok()) {
@@ -2488,7 +2331,7 @@ bool Index::check_for_overrides(const token_ordering& token_order, const string&
             std::vector<facet> facets;
             std::vector<std::vector<art_leaf*>> searched_queries;
             Topster* topster = nullptr;
-            spp::sparse_hash_set<uint64_t> groups_processed;
+            spp::sparse_hash_map<uint64_t, uint32_t> groups_processed;
             uint32_t* result_ids = nullptr;
             size_t result_ids_len = 0;
             size_t field_num_results = 0;
@@ -2645,7 +2488,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                    const size_t per_page,
                    const size_t page, const token_ordering token_order, const std::vector<bool>& prefixes,
                    const size_t drop_tokens_threshold, size_t& all_result_ids_len,
-                   spp::sparse_hash_set<uint64_t>& groups_processed,
+                   spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                    std::vector<std::vector<art_leaf*>>& searched_queries,
                    tsl::htrie_map<char, token_leaf>& qtoken_set,
                    std::vector<std::vector<KV*>>& raw_result_kvs, std::vector<std::vector<KV*>>& override_result_kvs,
@@ -2732,7 +2575,6 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 uint64_t distinct_id = seq_id;
                 if (group_limit != 0) {
                     distinct_id = get_distinct_id(group_by_fields, seq_id);
-                    groups_processed.emplace(distinct_id);
                 }
 
                 int64_t scores[3] = {0};
@@ -2741,7 +2583,11 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
                 result_ids.push_back(seq_id);
                 KV kv(searched_queries.size(), seq_id, distinct_id, match_score_index, scores);
-                topster->add(&kv);
+                int ret = topster->add(&kv);
+
+                if(group_limit != 0 && ret < 2) {
+                    groups_processed[distinct_id]++;
+                }
 
                 if (result_ids.size() == page * per_page) {
                     break;
@@ -2824,7 +2670,6 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 uint64_t distinct_id = seq_id;
                 if (group_limit != 0) {
                     distinct_id = get_distinct_id(group_by_fields, seq_id);
-                    groups_processed.emplace(distinct_id);
                 }
 
                 auto vec_dist_score = (field_vector_index->distance_type == cosine) ? std::abs(dist_label.first) :
@@ -2837,7 +2682,11 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 //LOG(INFO) << "SEQ_ID: " << seq_id << ", score: " << dist_label.first;
 
                 KV kv(searched_queries.size(), seq_id, distinct_id, match_score_index, scores);
-                topster->add(&kv);
+                int ret = topster->add(&kv);
+
+                if(group_limit != 0 && ret < 2) {
+                    groups_processed[distinct_id]++;
+                }
                 nearest_ids.push_back(seq_id);
             }
 
@@ -3296,7 +3145,7 @@ void Index::fuzzy_search_fields(const std::vector<search_field_t>& the_fields,
                                 const std::vector<uint32_t>& num_typos,
                                 std::vector<std::vector<art_leaf*>> & searched_queries,
                                 tsl::htrie_map<char, token_leaf>& qtoken_set,
-                                Topster* topster, spp::sparse_hash_set<uint64_t>& groups_processed,
+                                Topster* topster, spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                 uint32_t*& all_result_ids, size_t & all_result_ids_len,
                                 const size_t group_limit, const std::vector<std::string>& group_by_fields,
                                 bool prioritize_exact_match,
@@ -3692,7 +3541,7 @@ void Index::search_across_fields(const std::vector<token_t>& query_tokens,
                                  const text_match_type_t match_type,
                                  const std::vector<sort_by>& sort_fields,
                                  Topster* topster,
-                                 spp::sparse_hash_set<uint64_t>& groups_processed,
+                                 spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                  std::vector<std::vector<art_leaf*>>& searched_queries,
                                  tsl::htrie_map<char, token_leaf>& qtoken_set,
                                  const size_t group_limit,
@@ -3841,7 +3690,6 @@ void Index::search_across_fields(const std::vector<token_t>& query_tokens,
         uint64_t distinct_id = seq_id;
         if(group_limit != 0) {
             distinct_id = get_distinct_id(group_by_fields, seq_id);
-            groups_processed.emplace(distinct_id);
         }
 
         int64_t scores[3] = {0};
@@ -3895,7 +3743,11 @@ void Index::search_across_fields(const std::vector<token_t>& query_tokens,
         if(match_score_index != -1) {
             kv.scores[match_score_index] = aggregated_score;
         }
-        topster->add(&kv);
+
+        int ret = topster->add(&kv);
+        if(group_limit != 0 && ret < 2) {
+            groups_processed[distinct_id]++;
+        }
         result_ids.push_back(seq_id);
     });
 
@@ -4266,7 +4118,7 @@ void Index::do_synonym_search(const std::vector<search_field_t>& the_fields,
                               Topster* actual_topster,
                               std::vector<std::vector<token_t>>& q_pos_synonyms,
                               int syn_orig_num_tokens,
-                              spp::sparse_hash_set<uint64_t>& groups_processed,
+                              spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                               std::vector<std::vector<art_leaf*>>& searched_queries,
                               uint32_t*& all_result_ids, size_t& all_result_ids_len,
                               const uint32_t* filter_ids, const uint32_t filter_ids_length,
@@ -4303,7 +4155,7 @@ void Index::do_infix_search(const size_t num_search_fields, const std::vector<se
                             const std::vector<size_t>& geopoint_indices,
                             const std::vector<uint32_t>& curated_ids_sorted,
                             uint32_t*& all_result_ids, size_t& all_result_ids_len,
-                            spp::sparse_hash_set<uint64_t>& groups_processed) const {
+                            spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed) const {
 
     for(size_t field_id = 0; field_id < num_search_fields; field_id++) {
         auto& field_name = the_fields[field_id].name;
@@ -4360,11 +4212,13 @@ void Index::do_infix_search(const size_t num_search_fields, const std::vector<se
                     uint64_t distinct_id = seq_id;
                     if(group_limit != 0) {
                         distinct_id = get_distinct_id(group_by_fields, seq_id);
-                        groups_processed.emplace(distinct_id);
                     }
 
                     KV kv(searched_queries.size(), seq_id, distinct_id, match_score_index, scores);
-                    actual_topster->add(&kv);
+                    int ret = actual_topster->add(&kv);
+                    if(group_limit != 0 && ret < 2) {
+                        groups_processed[distinct_id]++;
+                    }
 
                     if(((i + 1) % (1 << 12)) == 0) {
                         BREAK_CIRCUIT_BREAKER
@@ -4498,7 +4352,7 @@ void Index::compute_facet_infos(const std::vector<facet>& facets, facet_query_t&
 
             std::vector<std::vector<art_leaf*>> searched_queries;
             Topster* topster = nullptr;
-            spp::sparse_hash_set<uint64_t> groups_processed;
+            spp::sparse_hash_map<uint64_t, uint32_t> groups_processed;
             uint32_t* field_result_ids = nullptr;
             size_t field_result_ids_len = 0;
             size_t field_num_results = 0;
@@ -4616,7 +4470,7 @@ void Index::curate_filtered_ids(filter_node_t const* const& filter_tree_root, co
 void Index::search_wildcard(filter_node_t const* const& filter_tree_root,
                             const std::map<size_t, std::map<size_t, uint32_t>>& included_ids_map,
                             const std::vector<sort_by>& sort_fields, Topster* topster, Topster* curated_topster,
-                            spp::sparse_hash_set<uint64_t>& groups_processed,
+                            spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                             std::vector<std::vector<art_leaf*>>& searched_queries, const size_t group_limit,
                             const std::vector<std::string>& group_by_fields, const std::set<uint32_t>& curated_ids,
                             const std::vector<uint32_t>& curated_ids_sorted, const uint32_t* exclude_token_ids,
@@ -4636,7 +4490,7 @@ void Index::search_wildcard(filter_node_t const* const& filter_tree_root,
     const size_t window_size = (num_threads == 0) ? 0 :
                                (filter_ids_length + num_threads - 1) / num_threads;  // rounds up
 
-    spp::sparse_hash_set<uint64_t> tgroups_processed[num_threads];
+    spp::sparse_hash_map<uint64_t, uint64_t> tgroups_processed[num_threads];
     Topster* topsters[num_threads];
     std::vector<posting_list_t::iterator_t> plists;
 
@@ -4695,11 +4549,14 @@ void Index::search_wildcard(filter_node_t const* const& filter_tree_root,
                 uint64_t distinct_id = seq_id;
                 if(group_limit != 0) {
                     distinct_id = get_distinct_id(group_by_fields, seq_id);
-                    tgroups_processed[thread_id].emplace(distinct_id);
                 }
 
                 KV kv(searched_queries.size(), seq_id, distinct_id, match_score_index, scores);
-                topsters[thread_id]->add(&kv);
+                int ret = topsters[thread_id]->add(&kv);
+
+                if(group_limit != 0 && ret < 2) {
+                    tgroups_processed[thread_id][distinct_id]++;
+                }
 
                 if(check_for_circuit_break && ((i + 1) % (1 << 15)) == 0) {
                     // check only once every 2^15 docs to reduce overhead
@@ -4722,7 +4579,10 @@ void Index::search_wildcard(filter_node_t const* const& filter_tree_root,
     search_cutoff = parent_search_cutoff;
 
     for(size_t thread_id = 0; thread_id < num_processed; thread_id++) {
-        groups_processed.insert(tgroups_processed[thread_id].begin(), tgroups_processed[thread_id].end());
+        //groups_processed.insert(tgroups_processed[thread_id].begin(), tgroups_processed[thread_id].end());
+        for(const auto& it : tgroups_processed[thread_id]) {
+            groups_processed[it.first]+= it.second;
+        } 
         aggregate_topster(topster, topsters[thread_id]);
         delete topsters[thread_id];
     }
@@ -4749,7 +4609,8 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
 
         if (sort_fields_std[i].name == sort_field_const::text_match) {
             field_values[i] = &text_match_sentinel_value;
-        } else if (sort_fields_std[i].name == sort_field_const::seq_id) {
+        } else if (sort_fields_std[i].name == sort_field_const::seq_id || 
+            sort_fields_std[i].name == sort_field_const::group_count) {
             field_values[i] = &seq_id_sentinel_value;
         } else if (sort_fields_std[i].name == sort_field_const::eval) {
             field_values[i] = &eval_sentinel_value;
@@ -4787,7 +4648,7 @@ void Index::search_field(const uint8_t & field_id,
                          const int last_typo,
                          const int max_typos,
                          std::vector<std::vector<art_leaf*>> & searched_queries,
-                         Topster* topster, spp::sparse_hash_set<uint64_t>& groups_processed,
+                         Topster* topster, spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                          uint32_t** all_result_ids, size_t & all_result_ids_len, size_t& field_num_results,
                          const size_t group_limit, const std::vector<std::string>& group_by_fields,
                          bool prioritize_exact_match,
@@ -5087,7 +4948,7 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
                           const uint8_t & field_id, const bool field_is_array, const uint32_t total_cost,
                           Topster* topster,
                           const std::vector<art_leaf *> &query_suggestion,
-                          spp::sparse_hash_set<uint64_t>& groups_processed,
+                          spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                           const uint32_t seq_id, const int sort_order[3],
                           std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values,
                           const std::vector<size_t>& geopoint_indices,
@@ -5285,12 +5146,14 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
 
     if(group_limit != 0) {
         distinct_id = get_distinct_id(group_by_fields, seq_id);
-        groups_processed.emplace(distinct_id);
     }
 
     //LOG(INFO) << "Seq id: " << seq_id << ", match_score: " << match_score;
     KV kv(query_index, seq_id, distinct_id, match_score_index, scores);
-    topster->add(&kv);
+    int ret = topster->add(&kv);
+    if(group_limit != 0 && ret < 2) {
+        groups_processed[distinct_id]++;
+    }
 
     //long long int timeNanos = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin).count();
     //LOG(INFO) << "Time taken for results iteration: " << timeNanos << "ms";
@@ -5824,380 +5687,6 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
             vector_index.erase(del_field.name);
         }
     }
-}
-
-Option<uint32_t> Index::coerce_string(const DIRTY_VALUES& dirty_values, const std::string& fallback_field_type,
-                                      const field& a_field, nlohmann::json &document,
-                                      const std::string &field_name, nlohmann::json::iterator& array_iter,
-                                      bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "an array of" : "a";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " string.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " string.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-        return Option<uint32_t>(200);
-    }
-
-    // we will try to coerce the value to a string
-
-    if (item.is_number_integer()) {
-        item = std::to_string((int64_t)item);
-    }
-
-    else if(item.is_number_float()) {
-        item = StringUtils::float_to_str((float)item);
-    }
-
-    else if(item.is_boolean()) {
-        item = item == true ? "true" : "false";
-    }
-
-    else {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                if(a_field.nested && item.is_array()) {
-                    return Option<>(400, "Field `" + field_name + "` has an incorrect type. "
-                                      "Hint: field inside an array of objects must be an array type as well.");
-                }
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " string.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            if(a_field.nested && item.is_array()) {
-                return Option<>(400, "Field `" + field_name + "` has an incorrect type. "
-                                      "Hint: field inside an array of objects must be an array type as well.");
-            }
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " string.");
-        }
-    }
-
-    return Option<>(200);
-}
-
-Option<uint32_t> Index::coerce_int32_t(const DIRTY_VALUES& dirty_values, const field& a_field, nlohmann::json &document,
-                                       const std::string &field_name,
-                                       nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "an array of" : "an";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int32.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int32.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-
-        return Option<uint32_t>(200);
-    }
-
-    // try to value coerce into an integer
-
-    if(item.is_number_float()) {
-        item = static_cast<int32_t>(item.get<float>());
-    }
-
-    else if(item.is_boolean()) {
-        item = item == true ? 1 : 0;
-    }
-
-    else if(item.is_string() && StringUtils::is_int32_t(item)) {
-        item = std::atol(item.get<std::string>().c_str());
-    }
-
-    else {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int32.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int32.");
-        }
-    }
-
-    if(document.contains(field_name) && document[field_name].get<int64_t>() > INT32_MAX) {
-        if(a_field.optional && (dirty_values == DIRTY_VALUES::DROP || dirty_values == DIRTY_VALUES::COERCE_OR_REJECT)) {
-            document.erase(field_name);
-        } else {
-            return Option<>(400, "Field `" + field_name  + "` exceeds maximum value of int32.");
-        }
-    }
-
-    return Option<uint32_t>(200);
-}
-
-Option<uint32_t> Index::coerce_int64_t(const DIRTY_VALUES& dirty_values, const field& a_field, nlohmann::json &document,
-                                       const std::string &field_name,
-                                       nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "an array of" : "an";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int64.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int64.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-        return Option<uint32_t>(200);
-    }
-
-    // try to value coerce into an integer
-
-    if(item.is_number_float()) {
-        item = static_cast<int64_t>(item.get<float>());
-    }
-
-    else if(item.is_boolean()) {
-        item = item == true ? 1 : 0;
-    }
-
-    else if(item.is_string() && StringUtils::is_int64_t(item)) {
-        item = std::atoll(item.get<std::string>().c_str());
-    }
-
-    else {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int64.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " int64.");
-        }
-    }
-
-    return Option<uint32_t>(200);
-}
-
-Option<uint32_t> Index::coerce_bool(const DIRTY_VALUES& dirty_values, const field& a_field, nlohmann::json &document,
-                                    const std::string &field_name,
-                                    nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "a array of" : "a";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " bool.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " bool.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-        return Option<uint32_t>(200);
-    }
-
-    // try to value coerce into a bool
-    if (item.is_number_integer() &&
-        (item.get<int64_t>() == 1 || item.get<int64_t>() == 0)) {
-        item = item.get<int64_t>() == 1;
-    }
-
-    else if(item.is_string()) {
-        std::string str_val = item.get<std::string>();
-        StringUtils::tolowercase(str_val);
-        if(str_val == "true") {
-            item = true;
-            return Option<uint32_t>(200);
-        } else if(str_val == "false") {
-            item = false;
-            return Option<uint32_t>(200);
-        } else {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " bool.");
-        }
-    }
-
-    else {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " bool.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " bool.");
-        }
-    }
-
-    return Option<uint32_t>(200);
-}
-
-Option<uint32_t> Index::coerce_geopoint(const DIRTY_VALUES& dirty_values, const field& a_field, nlohmann::json &document,
-                                        const std::string &field_name,
-                                        nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "an array of" : "a";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " geopoint.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " geopoint.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-        return Option<uint32_t>(200);
-    }
-
-    // try to value coerce into a geopoint
-
-    if(!item[0].is_number() && item[0].is_string()) {
-        if(StringUtils::is_float(item[0])) {
-            item[0] = std::stof(item[0].get<std::string>());
-        }
-    }
-
-    if(!item[1].is_number() && item[1].is_string()) {
-        if(StringUtils::is_float(item[1])) {
-            item[1] = std::stof(item[1].get<std::string>());
-        }
-    }
-
-    if(!item[0].is_number() || !item[1].is_number()) {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " geopoint.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " geopoint.");
-        }
-    }
-
-    return Option<uint32_t>(200);
-}
-
-Option<uint32_t> Index::coerce_float(const DIRTY_VALUES& dirty_values, const field& a_field, nlohmann::json &document,
-                                     const std::string &field_name,
-                                     nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
-    std::string suffix = is_array ? "a array of" : "a";
-    auto& item = is_array ? array_iter.value() : document[field_name];
-
-    if(dirty_values == DIRTY_VALUES::REJECT) {
-        return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " float.");
-    }
-
-    if(dirty_values == DIRTY_VALUES::DROP) {
-        if(!a_field.optional) {
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " float.");
-        }
-
-        if(!is_array) {
-            document.erase(field_name);
-        } else {
-            array_iter = document[field_name].erase(array_iter);
-            array_ele_erased = true;
-        }
-        return Option<uint32_t>(200);
-    }
-
-    // try to value coerce into a float
-
-    if(item.is_string() && StringUtils::is_float(item)) {
-        item = std::atof(item.get<std::string>().c_str());
-    }
-
-    else if(item.is_boolean()) {
-        item = item == true ? 1.0 : 0.0;
-    }
-
-    else {
-        if(dirty_values == DIRTY_VALUES::COERCE_OR_DROP) {
-            if(!a_field.optional) {
-                return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " float.");
-            }
-
-            if(!is_array) {
-                document.erase(field_name);
-            } else {
-                array_iter = document[field_name].erase(array_iter);
-                array_ele_erased = true;
-            }
-        } else {
-            // COERCE_OR_REJECT / non-optional + DROP
-            return Option<>(400, "Field `" + field_name  + "` must be " + suffix + " float.");
-        }
-    }
-
-    return Option<uint32_t>(200);
 }
 
 void Index::get_doc_changes(const index_operation_t op, nlohmann::json& update_doc,
