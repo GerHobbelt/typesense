@@ -656,9 +656,9 @@ void Collection::curate_results(string& actual_query, const string& filter_query
             bool filter_by_match = (override.rule.query.empty() && override.rule.match.empty() &&
                                    !override.rule.filter_by.empty() && override.rule.filter_by == filter_query);
 
-            bool query_match = (override.rule.match == override_t::MATCH_EXACT && override.rule.query == query) ||
+            bool query_match = (override.rule.match == override_t::MATCH_EXACT && override.rule.normalized_query == query) ||
                    (override.rule.match == override_t::MATCH_CONTAINS &&
-                    StringUtils::contains_word(query, override.rule.query));
+                    StringUtils::contains_word(query, override.rule.normalized_query));
 
             if (filter_by_match || query_match) {
                 if(!override.rule.filter_by.empty() && override.rule.filter_by != filter_query) {
@@ -690,7 +690,7 @@ void Collection::curate_results(string& actual_query, const string& filter_query
                     actual_query = override.replace_query;
                 } else if(override.remove_matched_tokens && override.filter_by.empty()) {
                     // don't prematurely remove tokens from query because dynamic filtering will require them
-                    StringUtils::replace_all(query, override.rule.query, "");
+                    StringUtils::replace_all(query, override.rule.normalized_query, "");
                     StringUtils::trim(query);
                     if(query.empty()) {
                         query = "*";
@@ -3519,7 +3519,7 @@ Option<bool> Collection::get_document_from_store(const std::string &seq_id_key,
 
     if(!raw_doc && enable_nested_fields) {
         std::vector<field> flattened_fields;
-        field::flatten_doc(document, nested_fields, true, flattened_fields);
+        field::flatten_doc(document, nested_fields, {}, true, flattened_fields);
     }
 
     return Option<bool>(true);
@@ -3708,7 +3708,7 @@ Option<bool> Collection::batch_alter_data(const std::vector<field>& alter_fields
 
         if(enable_nested_fields) {
             std::vector<field> flattened_fields;
-            field::flatten_doc(document, nested_fields, true, flattened_fields);
+            field::flatten_doc(document, nested_fields, {}, true, flattened_fields);
         }
 
         index_record record(num_found_docs, seq_id, document, index_operation_t::CREATE, DIRTY_VALUES::REJECT);
@@ -4391,13 +4391,6 @@ Option<bool> Collection::detect_new_fields(nlohmann::json& document,
                 auto& dynamic_field = dyn_field_it->second;
 
                 if(std::regex_match (kv.key(), std::regex(dynamic_field.name))) {
-                    // unless the field is auto or string*, ignore field name matching regexp pattern
-                    if(kv.key() == dynamic_field.name && !dynamic_field.is_auto() &&
-                       !dynamic_field.is_string_star()) {
-                        skip_field = true;
-                        break;
-                    }
-
                     // to prevent confusion we also disallow dynamic field names that contain ".*"
                     if((kv.key() != ".*" && kv.key().find(".*") != std::string::npos)) {
                         skip_field = true;
@@ -4445,7 +4438,7 @@ Option<bool> Collection::detect_new_fields(nlohmann::json& document,
         }
 
         std::vector<field> flattened_fields;
-        auto flatten_op = field::flatten_doc(document, nested_fields, is_update, flattened_fields);
+        auto flatten_op = field::flatten_doc(document, nested_fields, dyn_fields, is_update, flattened_fields);
         if(!flatten_op.ok()) {
             return flatten_op;
         }
@@ -4550,7 +4543,7 @@ bool Collection::get_enable_nested_fields() {
 
 Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector<facet>& facets) const{
    const std::regex base_pattern(".+\\(.*\\)");
-   const std::regex range_pattern("[[a-zA-Z]+:\\[([0-9]+)\\, ([0-9]+)\\]");
+   const std::regex range_pattern("[[a-zA-Z]+:\\[([0-9]+)\\,\\s*([0-9]+)\\]");
    
    if(facet_field.find(":") != std::string::npos) { //range based facet
         if(!std::regex_match(facet_field, base_pattern)){
