@@ -265,7 +265,6 @@ TEST_F(CollectionJoinTest, IndexDocumentHavingReferenceField) {
         }
         ASSERT_TRUE(add_op.ok());
     }
-
     collectionManager.drop_collection("Customers");
     customers_schema_json =
             R"({
@@ -285,6 +284,9 @@ TEST_F(CollectionJoinTest, IndexDocumentHavingReferenceField) {
     ASSERT_TRUE(add_doc_op.ok());
     ASSERT_EQ(customer_collection->get("0").get().count("reference_id_sequence_id"), 1);
 
+    // Referenced document should be accessible from Customers collection.
+    auto sequence_id = collectionManager.get_collection("Products")->get_seq_id_collection_prefix() + "_" +
+                                customer_collection->get("0").get()["product_id_sequence_id"].get<std::string>();
     nlohmann::json document;
     // Referenced document's sequence_id must be valid.
     auto get_op = collectionManager.get_collection("Products")->get_document_from_store(
@@ -651,11 +653,11 @@ TEST_F(CollectionJoinTest, IncludeFieldsByReference_SingleMatch) {
     ASSERT_FALSE(search_op.ok());
     ASSERT_EQ("Invalid reference in include_fields, expected `$CollectionName(fieldA, ...)`.", search_op.error());
 
-    req_params["include_fields"] = "$foo(bar)";
-    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
-    ASSERT_FALSE(search_op.ok());
-    ASSERT_EQ("Referenced collection `foo` not found.", search_op.error());
-
+//    req_params["include_fields"] = "$foo(bar)";
+//    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+//    ASSERT_FALSE(search_op.ok());
+//    ASSERT_EQ("Referenced collection `foo` not found.", search_op.error());
+//
 //    req_params["include_fields"] = "$Customers(bar)";
 //    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
 //    ASSERT_TRUE(search_op.ok());

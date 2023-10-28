@@ -641,11 +641,32 @@ struct reference_filter_result_t {
 struct filter_result_t {
     uint32_t count = 0;
     uint32_t* docs = nullptr;
-    reference_filter_result_t* reference_filter_result = nullptr;
+    // Collection name -> Reference filter result
+    std::map<std::string, reference_filter_result_t*> reference_filter_results;
+
+    filter_result_t() {}
+
+    filter_result_t(uint32_t count, uint32_t* docs) : count(count), docs(docs) {}
+
+    filter_result_t& operator=(filter_result_t&& obj) noexcept {
+        if (&obj == this)
+            return *this;
+
+        count = obj.count;
+        docs = obj.docs;
+        reference_filter_results = std::map(obj.reference_filter_results);
+
+        obj.docs = nullptr;
+        obj.reference_filter_results.clear();
+
+        return *this;
+    }
 
     ~filter_result_t() {
         delete[] docs;
-        delete[] reference_filter_result;
+        for (const auto &item: reference_filter_results) {
+            delete[] item.second;
+        }
     }
 };
 

@@ -268,6 +268,8 @@ private:
     
 
 
+    Option<std::string> get_reference_field(const std::string & collection_name) const;
+
 public:
 
     enum {MAX_ARRAY_MATCHES = 5};
@@ -454,8 +456,6 @@ public:
                                   const size_t facet_sample_threshold = 0) const;
 
     Option<bool> get_filter_ids(const std::string & filter_query, filter_result_t& filter_result) const;
-
-    Option<std::string> get_reference_field(const std::string & collection_name) const;
 
     Option<bool> get_reference_filter_ids(const std::string & filter_query,
                                           filter_result_t& filter_result,
