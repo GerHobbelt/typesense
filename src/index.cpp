@@ -1491,11 +1491,11 @@ bool Index::field_is_indexed(const std::string& field_name) const {
     geopoint_index.count(field_name) != 0;
 }
 
-Option<bool> Index::_do_filtering(filter_node_t* const root,
-                                  filter_result_t& result,
-                                  const std::string& collection_name,
-                                  const uint32_t& context_ids_length,
-                                  uint32_t* const& context_ids) const {
+Option<bool> Index::do_filtering(filter_node_t* const root,
+                                 filter_result_t& result,
+                                 const std::string& collection_name,
+                                 const uint32_t& context_ids_length,
+                                 uint32_t* const& context_ids) const {
     // auto begin = std::chrono::high_resolution_clock::now();
     const filter a_filter = root->filter_exp;
 
@@ -2055,7 +2055,7 @@ Option<bool> Index::_approximate_filter_ids(const filter& a_filter,
 }
 
 Option<bool> Index::rearrange_filter_tree(filter_node_t* const root,
-                                          uint32_t& filter_ids_length,
+                                          uint32_t& approx_filter_ids_length,
                                           const std::string& collection_name) const {
     if (root == nullptr) {
         return Option(true);
@@ -2079,9 +2079,9 @@ Option<bool> Index::rearrange_filter_tree(filter_node_t* const root,
         }
 
         if (root->filter_operator == AND) {
-            filter_ids_length = std::min(l_filter_ids_length, r_filter_ids_length);
+            approx_filter_ids_length = std::min(l_filter_ids_length, r_filter_ids_length);
         } else {
-            filter_ids_length = l_filter_ids_length + r_filter_ids_length;
+            approx_filter_ids_length = l_filter_ids_length + r_filter_ids_length;
         }
 
         if (l_filter_ids_length > r_filter_ids_length) {
@@ -2091,7 +2091,7 @@ Option<bool> Index::rearrange_filter_tree(filter_node_t* const root,
         return Option(true);
     }
 
-    _approximate_filter_ids(root->filter_exp, filter_ids_length, collection_name);
+    _approximate_filter_ids(root->filter_exp, approx_filter_ids_length, collection_name);
     return Option(true);
 }
 
@@ -2144,42 +2144,24 @@ Option<bool> Index::recursive_filter(filter_node_t* const root,
             }
         }
 
-        uint32_t* filtered_results = nullptr;
         if (root->filter_operator == AND) {
-            result.count = ArrayUtils::and_scalar(
-                    l_result.docs, l_result.count, r_result.docs,
-                    r_result.count, &filtered_results);
+            filter_result_t::and_filter_results(l_result, r_result, result);
         } else {
+            uint32_t* filtered_results = nullptr;
             result.count = ArrayUtils::or_scalar(
                     l_result.docs, l_result.count, r_result.docs,
                     r_result.count, &filtered_results);
-        }
 
-        result.docs = filtered_results;
-        if (!l_result.reference_filter_results.empty() || !r_result.reference_filter_results.empty()) {
-            copy_reference_ids(!l_result.reference_filter_results.empty() ? l_result : r_result, result);
+            result.docs = filtered_results;
+            if (!l_result.reference_filter_results.empty() || !r_result.reference_filter_results.empty()) {
+                copy_reference_ids(!l_result.reference_filter_results.empty() ? l_result : r_result, result);
+            }
         }
 
         return Option(true);
     }
 
-    return _do_filtering(root, result, collection_name, context_ids_length, context_ids);
-}
-
-Option<bool> Index::adaptive_filter(filter_node_t* const filter_tree_root,
-                                    filter_result_t& result,
-                                    const std::string& collection_name) const {
-    if (filter_tree_root == nullptr) {
-        return Option(true);
-    }
-
-    uint32_t filter_ids_length = 0;
-    auto op = rearrange_filter_tree(filter_tree_root, filter_ids_length, collection_name);
-    if (!op.ok()) {
-        return op;
-    }
-
-    return recursive_filter(filter_tree_root, result, collection_name);
+    return do_filtering(root, result, collection_name, context_ids_length, context_ids);
 }
 
 Option<bool> Index::do_filtering_with_lock(filter_node_t* const filter_tree_root,
@@ -2187,7 +2169,7 @@ Option<bool> Index::do_filtering_with_lock(filter_node_t* const filter_tree_root
                                            const std::string& collection_name) const {
     std::shared_lock lock(mutex);
 
-    auto filter_op = adaptive_filter(filter_tree_root, filter_result, collection_name);
+    auto filter_op = recursive_filter(filter_tree_root, filter_result, collection_name);
     if (!filter_op.ok()) {
         return filter_op;
     }
@@ -2202,7 +2184,7 @@ Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter
     std::shared_lock lock(mutex);
 
     filter_result_t reference_filter_result;
-    auto filter_op = adaptive_filter(filter_tree_root, reference_filter_result);
+    auto filter_op = recursive_filter(filter_tree_root, reference_filter_result);
     if (!filter_op.ok()) {
         return filter_op;
     }
@@ -2730,9 +2712,14 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                    const std::string& collection_name) const {
     std::shared_lock lock(mutex);
 
+    uint32_t filter_ids_length = 0;
+    auto rearrange_op = rearrange_filter_tree(filter_tree_root, filter_ids_length, collection_name);
+    if (!rearrange_op.ok()) {
+        return rearrange_op;
+    }
+
     filter_result_t filter_result;
-    // process the filters
-    auto filter_op = adaptive_filter(filter_tree_root, filter_result, collection_name);
+    auto filter_op = recursive_filter(filter_tree_root, filter_result, collection_name);
     if (!filter_op.ok()) {
         return filter_op;
     }
@@ -4840,7 +4827,7 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
         } else if (sort_fields_std[i].name == sort_field_const::eval) {
             field_values[i] = &eval_sentinel_value;
             filter_result_t result;
-            adaptive_filter(sort_fields_std[i].eval.filter_tree_root, result);
+            recursive_filter(sort_fields_std[i].eval.filter_tree_root, result);
             sort_fields_std[i].eval.ids = result.docs;
             sort_fields_std[i].eval.size = result.count;
             result.docs = nullptr;
