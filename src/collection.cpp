@@ -51,6 +51,12 @@ Collection::Collection(const std::string& name, const uint32_t collection_id, co
         symbols_to_index(to_char_array(symbols_to_index)), token_separators(to_char_array(token_separators)),
         index(init_index()) {
 
+    for (auto const& field: fields) {
+        if (!field.create_from.empty()) {
+            embedding_fields.emplace(field.name, field);
+        }
+    }
+
     this->num_documents = 0;
 }
 
@@ -253,7 +259,7 @@ nlohmann::json Collection::get_summary_json() const {
         field_json[fields::infix] = coll_field.infix;
         field_json[fields::locale] = coll_field.locale;
         
-        if(coll_field.create_from.size() > 0) {
+        if(!coll_field.create_from.empty()) {
             field_json[fields::create_from] = coll_field.create_from;
         }
 
@@ -587,7 +593,7 @@ Option<uint32_t> Collection::index_in_memory(nlohmann::json &document, uint32_t 
     std::unique_lock lock(mutex);
 
     Option<uint32_t> validation_op = validator_t::validate_index_in_memory(document, seq_id, default_sorting_field,
-                                                                     search_schema, op,
+                                                                     search_schema, op, false,
                                                                      fallback_field_type, dirty_values);
 
     if(!validation_op.ok()) {
@@ -1008,7 +1014,7 @@ Option<bool> Collection::extract_field_name(const std::string& field_name,
     for(auto kv = prefix_it.first; kv != prefix_it.second; ++kv) {
         bool exact_key_match = (kv.key().size() == field_name.size());
         bool exact_primitive_match = exact_key_match && !kv.value().is_object();
-        bool text_embedding = kv.value().type == field_types::FLOAT_ARRAY && kv.value().create_from.size() > 0;
+        bool text_embedding = kv.value().type == field_types::FLOAT_ARRAY && !kv.value().create_from.empty();
 
         if(extract_only_string_fields && !kv.value().is_string() && !text_embedding) {
             if(exact_primitive_match && !is_wildcard) {
@@ -1082,7 +1088,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                                   const uint64_t search_time_start_us,
                                   const text_match_type_t match_type,
                                   const size_t facet_sample_percent,
-                                  const size_t facet_sample_threshold) const {
+                                  const size_t facet_sample_threshold,
+                                  const size_t page_offset) const {
 
     std::shared_lock lock(mutex);
 
@@ -1340,18 +1347,15 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
         }
     }
 
-    // check for valid pagination
-    if(page < 1) {
-        std::string message = "Page must be an integer of value greater than 0.";
-        return Option<nlohmann::json>(422, message);
-    }
-
     if(per_page > PER_PAGE_MAX) {
         std::string message = "Only upto " + std::to_string(PER_PAGE_MAX) + " hits can be fetched per page.";
         return Option<nlohmann::json>(422, message);
     }
 
-    if((page * per_page) > limit_hits) {
+    size_t offset = (page != 0) ? (per_page * (page - 1)) : page_offset;
+    size_t fetch_size = offset + per_page;
+
+    if(fetch_size > limit_hits) {
         std::string message = "Only upto " + std::to_string(limit_hits) + " hits can be fetched. " +
                 "Ensure that `page` and `per_page` parameters are within this range.";
         return Option<nlohmann::json>(422, message);
@@ -1361,9 +1365,9 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
     // ensure that `max_hits` never exceeds number of documents in collection
     if(search_fields.size() <= 1 || raw_query == "*") {
-        max_hits = std::min(std::max((page * per_page), max_hits), get_num_documents());
+        max_hits = std::min(std::max(fetch_size, max_hits), get_num_documents());
     } else {
-        max_hits = std::min(std::max((page * per_page), max_hits), get_num_documents());
+        max_hits = std::min(std::max(fetch_size, max_hits), get_num_documents());
     }
 
     if(token_order == NOT_SET) {
@@ -1520,7 +1524,7 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                                                  match_type,
                                                  filter_tree_root, facets, included_ids, excluded_ids,
                                                  sort_fields_std, facet_query, num_typos, max_facet_values, max_hits,
-                                                 per_page, page, token_order, prefixes,
+                                                 per_page, offset, token_order, prefixes,
                                                  drop_tokens_threshold, typo_tokens_threshold,
                                                  group_by_fields, group_limit, default_sorting_field,
                                                  prioritize_exact_match, prioritize_token_position,
@@ -1654,10 +1658,10 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
         facet_query_last_token = facet_query_tokens.empty() ? "" : facet_query_tokens.back();
     }
 
-    const long start_result_index = (page - 1) * per_page;
+    const long start_result_index = offset;
 
     // `end_result_index` could be -1 when max_hits is 0
-    const long end_result_index = std::min((page * per_page), std::min(max_hits, result_group_kvs.size())) - 1;
+    const long end_result_index = std::min(fetch_size, std::min(max_hits, result_group_kvs.size())) - 1;
 
     // handle which fields have to be highlighted
 
@@ -3767,7 +3771,7 @@ Option<bool> Collection::batch_alter_data(const std::vector<field>& alter_fields
             nested_fields.erase(del_field.name);
         }
 
-        if(del_field.create_from.size() > 0) {
+        if(!del_field.create_from.empty()) {
             embedding_fields.erase(del_field.name);
         }
 
@@ -4065,7 +4069,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                 return Option<bool>(400, "Field `" + field_name + "` is not part of collection schema.");
             }
 
-            if(found_field && field_it.value().create_from.size() > 0) {
+            if(found_field && !field_it.value().create_from.empty()) {
                 updated_embedding_fields.erase(field_it.key());
             }
 
@@ -4074,7 +4078,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                 updated_search_schema.erase(field_it.key());
                 updated_nested_fields.erase(field_it.key());
                 
-                if(field_it.value().create_from.size() > 0) {
+                if(!field_it.value().create_from.empty()) {
                     updated_embedding_fields.erase(field_it.key());
                 }
 
@@ -4088,7 +4092,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                             updated_search_schema.erase(prefix_kv.key());
                             updated_nested_fields.erase(prefix_kv.key());
 
-                            if(prefix_kv.value().create_from.size() > 0) {
+                            if(!prefix_kv.value().create_from.empty()) {
                                 updated_embedding_fields.erase(prefix_kv.key());
                             }
                         }
@@ -4141,7 +4145,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                     addition_fields.push_back(f);
                 }
 
-                if(f.create_from.size() > 0) {
+                if(!f.create_from.empty()) {
                     return Option<bool>(400, "Embedding fields can only be added at the time of collection creation.");
                 }
 
@@ -4156,7 +4160,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                             updated_search_schema.emplace(prefix_kv.key(), prefix_kv.value());
                             updated_nested_fields.emplace(prefix_kv.key(), prefix_kv.value());
 
-                            if(prefix_kv.value().create_from.size() > 0) {
+                            if(!prefix_kv.value().create_from.empty()) {
                                 return Option<bool>(400, "Embedding fields can only be added at the time of collection creation.");
                             }
 
@@ -4231,6 +4235,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
         auto validate_op = validator_t::validate_index_in_memory(document, seq_id, default_sorting_field,
                                                            updated_search_schema,
                                                            index_operation_t::CREATE,
+                                                           false,
                                                            fallback_field_type,
                                                            DIRTY_VALUES::REJECT);
         if(!validate_op.ok()) {
@@ -4479,7 +4484,7 @@ Index* Collection::init_index() {
             nested_fields.emplace(field.name, field);
         }
 
-        if(field.create_from.size() > 0) {
+        if(!field.create_from.empty()) {
             embedding_fields.emplace(field.name, field);
         }
 
@@ -4755,45 +4760,22 @@ Option<bool> Collection::populate_include_exclude_fields_lk(const spp::sparse_ha
 
 
 Option<bool> Collection::embed_fields(nlohmann::json& document) {
+    auto validate_res = validate_embed_fields(document, true);
+    if(!validate_res.ok()) {
+        return validate_res;
+    }
     for(const auto& field : embedding_fields) {
-        if(TextEmbedderManager::model_dir.empty()) {
-            return Option<bool>(400, "Text embedding is not enabled. Please set `model-dir` at startup.");
-        }
         std::string text_to_embed;
         for(const auto& field_name : field.create_from) {
             auto field_it = search_schema.find(field_name);
-            if(field_it != search_schema.end()) {
-                if(field_it.value().type == field_types::STRING) {
-                    if(document.find(field_name) != document.end()) {
-                        if(document[field_name].is_string()) {
-                            text_to_embed += document[field_name].get<std::string>() + " ";
-                        } else {
-                            return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                        }
-                    }
-                } else if(field_it.value().type == field_types::STRING_ARRAY) {
-                    if(document.find(field_name) != document.end()) {
-                        if(document[field_name].is_array()) {
-                            for(const auto& val : document[field_name]) {
-                                if(val.is_string()) {
-                                    text_to_embed += val.get<std::string>() + " ";
-                                } else {
-                                    return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                                }
-                            }
-                        } else {
-                            return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                        }
-                    }
+            if(field_it.value().type == field_types::STRING) {
+                text_to_embed += document[field_name].get<std::string>() + " ";
+            } else if(field_it.value().type == field_types::STRING_ARRAY) {
+                for(const auto& val : document[field_name]) {
+                    text_to_embed += val.get<std::string>() + " ";
                 }
-                 else {
-                    return Option<bool>(400, "Field `" + field_name + "` is not a string nor string array. Can not create vector from it.");
-                }
-            } else {
-                return Option<bool>(400, "Field `" + field_name + "` is not a valid field.");
             }
         }
-
         TextEmbedderManager& embedder_manager = TextEmbedderManager::get_instance();
         auto embedder = embedder_manager.get_text_embedder(field.model_name.size() > 0 ? field.model_name : TextEmbedderManager::DEFAULT_MODEL_NAME);
         std::vector<float> embedding = embedder->Embed(text_to_embed);
@@ -4803,41 +4785,58 @@ Option<bool> Collection::embed_fields(nlohmann::json& document) {
     return Option<bool>(true);
 }
 
+Option<bool> Collection::validate_embed_fields(const nlohmann::json& document, const bool& error_if_field_not_found) const {
+    if(!embedding_fields.empty() && TextEmbedderManager::model_dir.empty()) {
+        return Option<bool>(400, "Text embedding is not enabled. Please set `model-dir` at startup.");
+    }
+    for(const auto& field : embedding_fields) {
+        for(const auto& field_name : field.create_from) {
+            auto schema_field_it = search_schema.find(field_name);
+            auto doc_field_it = document.find(field_name);
+            if(schema_field_it == search_schema.end()) {
+                return Option<bool>(400, "Field `" + field.name + "` has invalid fields to create embeddings from.");
+            }
+            if(doc_field_it == document.end()) {
+                if(error_if_field_not_found) {
+                    return Option<bool>(400, "Field `" + field_name + "` is needed to create embedding.");
+                } else {
+                    continue;
+                }
+            }
+            if((schema_field_it.value().type == field_types::STRING && !doc_field_it.value().is_string()) || 
+                (schema_field_it.value().type == field_types::STRING_ARRAY && !doc_field_it.value().is_array())) {
+                return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
+            }
+            if(doc_field_it.value().is_array()) {
+                for(const auto& val : doc_field_it.value()) {
+                    if(!val.is_string()) {
+                        return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
+                    }
+                }
+            }
+        }
+    }
+
+    return Option<bool>(true);
+}
+
 Option<bool> Collection::embed_fields_update(const nlohmann::json& old_doc, nlohmann::json& new_doc) {
+    auto validate_res = validate_embed_fields(new_doc, false);
+    if(!validate_res.ok()) {
+        return validate_res;
+    }
     nlohmann::json new_doc_copy = new_doc;
     for(const auto& field : embedding_fields) {
-        if(TextEmbedderManager::model_dir.empty()) {
-            return Option<bool>(400, "Text embedding is not enabled. Please set `model-dir` at startup.");
-        }
         std::string text_to_embed;
         for(const auto& field_name : field.create_from) {
             auto field_it = search_schema.find(field_name);
-            if(field_it != search_schema.end()) {
-                nlohmann::json value = (new_doc.find(field_name) != new_doc.end()) ? new_doc[field_name] : old_doc[field_name];
-                if(field_it.value().type == field_types::STRING) {
-                    if(value.is_string()) {
-                        text_to_embed += value.get<std::string>() + " ";
-                    } else {
-                        return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                    }
-                } else if(field_it.value().type == field_types::STRING_ARRAY) {
-                    if(value.is_array()) {
-                        for(const auto& val : value) {
-                            if(val.is_string()) {
-                                text_to_embed += val.get<std::string>() + " ";
-                            } else {
-                                return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                            }
-                        }
-                    } else {
-                        return Option<bool>(400, "Field `" + field_name + "` has malformed data.");
-                    }
+            nlohmann::json value = (new_doc.find(field_name) != new_doc.end()) ? new_doc[field_name] : old_doc[field_name];
+            if(field_it.value().type == field_types::STRING) {
+                text_to_embed += value.get<std::string>() + " ";
+            } else if(field_it.value().type == field_types::STRING_ARRAY) {
+                for(const auto& val : value) {
+                    text_to_embed += val.get<std::string>() + " ";
                 }
-                 else {
-                    return Option<bool>(400, "Field `" + field_name + "` is not a string nor string array. Can not create vector from it.");
-                }
-            } else {
-                return Option<bool>(400, "Field `" + field_name + "` is not a valid field.");
             }
         }
 
@@ -4861,7 +4860,7 @@ void Collection::process_remove_field_for_embedding_fields(const field& the_fiel
         }));
         embedding_field = *actual_field;
         // store to remove embedding field if it has no field names in 'create_from' anymore.
-        if(embedding_field.create_from.size() == 0) {
+        if(embedding_field.create_from.empty()) {
             empty_fields.push_back(actual_field);
         }
     }

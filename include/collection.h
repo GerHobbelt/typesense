@@ -209,6 +209,9 @@ private:
                                                       std::vector<sort_by>& sort_fields_std,
                                                       bool is_wildcard_query, bool is_group_by_query = false) const;
 
+    
+    Option<bool> validate_embed_fields(const nlohmann::json& document, const bool& error_if_field_not_found) const;
+
     Option<bool> persist_collection_meta();
 
     Option<bool> batch_alter_data(const std::vector<field>& alter_fields,
@@ -461,7 +464,8 @@ public:
                                   const uint64_t search_time_start_us = 0,
                                   const text_match_type_t match_type = max_score,
                                   const size_t facet_sample_percent = 100,
-                                  const size_t facet_sample_threshold = 0) const;
+                                  const size_t facet_sample_threshold = 0,
+                                  const size_t page_offset = UINT32_MAX) const;
 
     Option<bool> get_filter_ids(const std::string & filter_query, filter_result_t& filter_result) const;
 
