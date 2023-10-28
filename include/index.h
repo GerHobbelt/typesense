@@ -418,6 +418,7 @@ private:
                                std::vector<tok_candidates>& token_candidates_vec,
                                std::vector<std::vector<art_leaf*>>& searched_queries,
                                tsl::htrie_map<char, token_leaf>& qtoken_set,
+                               const std::vector<token_t>& dropped_tokens,
                                Topster* topster,
                                spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                uint32_t*& all_result_ids, size_t& all_result_ids_len,
@@ -532,6 +533,12 @@ private:
                                    const std::string& token, uint32_t seq_id);
 
     void initialize_facet_indexes(const field& facet_field);
+
+
+
+    static Option<bool> embed_fields(nlohmann::json& document, 
+                                            const tsl::htrie_map<char, field>& embedding_fields,
+                                            const tsl::htrie_map<char, field> & search_schema);          
     
 public:
     // for limiting number of results on multiple candidates / query rewrites
@@ -663,6 +670,7 @@ public:
                                           const size_t batch_start_index, const size_t batch_size,
                                           const std::string & default_sorting_field,
                                           const tsl::htrie_map<char, field> & search_schema,
+                                          const tsl::htrie_map<char, field> & embedding_fields,
                                           const std::string& fallback_field_type,
                                           const std::vector<char>& token_separators,
                                           const std::vector<char>& symbols_to_index,
@@ -672,6 +680,7 @@ public:
                                      std::vector<index_record>& iter_batch,
                                      const std::string& default_sorting_field,
                                      const tsl::htrie_map<char, field>& search_schema,
+                                     const tsl::htrie_map<char, field> & embedding_fields,
                                      const std::string& fallback_field_type,
                                      const std::vector<char>& token_separators,
                                      const std::vector<char>& symbols_to_index,
@@ -827,8 +836,8 @@ public:
 
     void fuzzy_search_fields(const std::vector<search_field_t>& the_fields,
                              const std::vector<token_t>& query_tokens,
+                             const std::vector<token_t>& dropped_tokens,
                              const text_match_type_t match_type,
-                             const bool dropped_tokens,
                              const uint32_t* exclude_token_ids,
                              size_t exclude_token_ids_size,
                              const uint32_t* filter_ids, size_t filter_ids_length,
@@ -876,6 +885,7 @@ public:
                               spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                               std::vector<std::vector<art_leaf*>>& searched_queries,
                               tsl::htrie_map<char, token_leaf>& qtoken_set,
+                              const std::vector<token_t>& dropped_tokens,
                               const size_t group_limit,
                               const std::vector<std::string>& group_by_fields,
                               bool prioritize_exact_match,

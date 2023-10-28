@@ -162,7 +162,7 @@ private:
 
     void remove_document(const nlohmann::json & document, const uint32_t seq_id, bool remove_from_store);
 
-    void process_remove_field_for_embedding_fields(const field& the_field);
+    void process_remove_field_for_embedding_fields(const field& the_field, std::vector<field>& garbage_fields);
 
     void curate_results(string& actual_query, const string& filter_query, bool enable_overrides, bool already_segmented,
                         const std::map<size_t, std::vector<std::string>>& pinned_hits,
@@ -210,8 +210,6 @@ private:
                                                       bool is_wildcard_query, bool is_group_by_query = false) const;
 
     
-    Option<bool> validate_embed_fields(const nlohmann::json& document, const bool& error_if_field_not_found) const;
-
     Option<bool> persist_collection_meta();
 
     Option<bool> batch_alter_data(const std::vector<field>& alter_fields,
@@ -358,9 +356,6 @@ public:
                                 const DIRTY_VALUES dirty_values,
                                 const std::string& id="");
 
-    Option<bool> embed_fields(nlohmann::json& document);
-
-    Option<bool> embed_fields_update(const nlohmann::json& old_doc, nlohmann::json& new_doc);
 
     static uint32_t get_seq_id_from_key(const std::string & key);
 
