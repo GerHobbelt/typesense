@@ -10,7 +10,7 @@ TextEmbedder::TextEmbedder(const std::string& model_name) {
     // create environment
     Ort::SessionOptions session_options;
     std::string abs_path = TextEmbedderManager::get_absolute_model_path(model_name);
-    LOG(INFO) << "Loading model from: " << abs_path;
+    LOG(INFO) << "Loading model from disk: " << abs_path;
     session_ = std::make_unique<Ort::Session>(env_, abs_path.c_str(), session_options);
     std::ifstream config_file(TextEmbedderManager::get_absolute_config_path(model_name));
     nlohmann::json config;
@@ -36,8 +36,29 @@ TextEmbedder::TextEmbedder(const std::string& model_name) {
     }
 }
 
-TextEmbedder::TextEmbedder(const std::string& openai_model_path, const std::string& api_key) : api_key(api_key), openai_model_path(openai_model_path) {
+TextEmbedder::TextEmbedder(const nlohmann::json& model_config) {
+    auto model_name = model_config["model_name"].get<std::string>();
+    LOG(INFO) << "Loading model from remote: " << model_name;
+    auto model_namespace = TextEmbedderManager::get_model_namespace(model_name);
 
+    if(model_namespace == "openai") {
+        auto api_key = model_config["api_key"].get<std::string>();
+
+        remote_embedder_ = std::make_unique<OpenAIEmbedder>(model_name, api_key);
+    } else if(model_namespace == "google") {
+        auto api_key = model_config["api_key"].get<std::string>();
+
+        remote_embedder_ = std::make_unique<GoogleEmbedder>(api_key);
+    } else if(model_namespace == "gcp") {
+        auto project_id = model_config["project_id"].get<std::string>();
+        auto model_name = model_config["model_name"].get<std::string>();
+        auto access_token = model_config["access_token"].get<std::string>();
+        auto refresh_token = model_config["refresh_token"].get<std::string>();
+        auto client_id = model_config["client_id"].get<std::string>();
+        auto client_secret = model_config["client_secret"].get<std::string>();
+
+        remote_embedder_ = std::make_unique<GCPEmbedder>(project_id, model_name, access_token, refresh_token, client_id, client_secret);
+    }
 }
 
 
@@ -55,25 +76,11 @@ std::vector<float> TextEmbedder::mean_pooling(const std::vector<std::vector<floa
 }
 
 Option<std::vector<float>> TextEmbedder::Embed(const std::string& text) {
-    if(is_openai()) {
-        HttpClient& client = HttpClient::get_instance();
-        std::unordered_map<std::string, std::string> headers;
-        std::map<std::string, std::string> res_headers;
-        headers["Authorization"] = "Bearer " + api_key;
-        headers["Content-Type"] = "application/json";
-        std::string res;
-            nlohmann::json req_body;
-        req_body["input"] = text;
-        // remove "openai/" prefix
-        req_body["model"] = openai_model_path.substr(7);
-        auto res_code = client.post_response(TextEmbedder::OPENAI_CREATE_EMBEDDING, req_body.dump(), res, res_headers, headers);
-        if (res_code != 200) {
-            LOG(ERROR) << "OpenAI API error: " << res;
-            return Option<std::vector<float>>(400, "OpenAI API error: " + res);
-        }
-        return Option<std::vector<float>>(nlohmann::json::parse(res)["data"][0]["embedding"].get<std::vector<float>>());
+    if(is_remote()) {
+        return remote_embedder_->Embed(text);
     } else {
-        LOG(INFO) << "Embedding text: " << text;
+        // Cannot run same model in parallel, so lock the mutex
+        std::lock_guard<std::mutex> lock(mutex_);
         auto encoded_input = tokenizer_->Encode(text);
         // create input tensor object from data values
         Ort::AllocatorWithDefaultOptions allocator;
@@ -120,34 +127,17 @@ Option<std::vector<float>> TextEmbedder::Embed(const std::string& text) {
 
 Option<std::vector<std::vector<float>>> TextEmbedder::batch_embed(const std::vector<std::string>& inputs) {
     std::vector<std::vector<float>> outputs;
-    if(!is_openai()) {
+    if(!is_remote()) {
         // for now only openai is supported for batch embedding
         for(const auto& input : inputs) {
             outputs.push_back(Embed(input).get());
         }
     } else {
-        nlohmann::json req_body;
-        req_body["input"] = inputs;
-        // remove "openai/" prefix
-        req_body["model"] = openai_model_path.substr(7);
-        std::unordered_map<std::string, std::string> headers;
-        headers["Authorization"] = "Bearer " + api_key;
-        headers["Content-Type"] = "application/json";
-        std::map<std::string, std::string> res_headers;
-        std::string res;
-        HttpClient& client = HttpClient::get_instance();
-
-        auto res_code = client.post_response(OPENAI_CREATE_EMBEDDING, req_body.dump(), res, res_headers, headers);
-
-        if(res_code != 200) {
-            LOG(ERROR) << "OpenAI API error: " << res;
-            return Option<std::vector<std::vector<float>>>(400, res);
+        auto embed_op  = remote_embedder_->batch_embed(inputs);
+        if(!embed_op.ok()) {
+            return Option<std::vector<std::vector<float>>>(embed_op.code(), embed_op.error());
         }
-
-        nlohmann::json res_json = nlohmann::json::parse(res);
-        for(auto& data : res_json["data"]) {
-            outputs.push_back(data["embedding"].get<std::vector<float>>());
-        }
+        outputs = embed_op.get();
     }
     return Option<std::vector<std::vector<float>>>(outputs);
 }
@@ -155,14 +145,42 @@ Option<std::vector<std::vector<float>>> TextEmbedder::batch_embed(const std::vec
 TextEmbedder::~TextEmbedder() {
 }
 
+Option<bool> TextEmbedder::is_model_valid(const nlohmann::json& model_config, unsigned int& num_dims) {
+    auto model_name = model_config["model_name"].get<std::string>();
 
-bool TextEmbedder::is_model_valid(const std::string& model_name, unsigned int& num_dims) {
-    LOG(INFO) << "Loading model: " << model_name;
+    if(TextEmbedderManager::is_remote_model(model_name)) {
+        return validate_remote_model(model_config, num_dims);
+    } else {
+        return validate_local_or_public_model(model_config, num_dims);
+    }
+}
 
-    if(TextEmbedderManager::get_instance().is_public_model(model_name)) {
-        TextEmbedderManager::get_instance().download_public_model(model_name);
+Option<bool> TextEmbedder::validate_remote_model(const nlohmann::json& model_config, unsigned int& num_dims) {
+    auto model_name = model_config["model_name"].get<std::string>();
+    auto model_namespace = TextEmbedderManager::get_model_namespace(model_name);
+
+    if(model_namespace == "openai") {
+        return OpenAIEmbedder::is_model_valid(model_config, num_dims);
+    } else if(model_namespace == "google") {
+        return GoogleEmbedder::is_model_valid(model_config, num_dims);
+    } else if(model_namespace == "gcp") {
+        return GCPEmbedder::is_model_valid(model_config, num_dims);
     }
 
+    return Option<bool>(400, "Invalid model namespace");
+}
+
+Option<bool> TextEmbedder::validate_local_or_public_model(const nlohmann::json& model_config, unsigned int& num_dims) {
+    auto model_name = model_config["model_name"].get<std::string>();
+    LOG(INFO) << "Validating model: " << model_name;
+
+    if(TextEmbedderManager::get_instance().is_public_model(model_name)) {
+       auto res = TextEmbedderManager::get_instance().download_public_model(model_name);
+       if(!res.ok()) {
+              LOG(ERROR) << res.error();
+              return Option<bool>(400, res.error());
+       }
+    }
 
     Ort::SessionOptions session_options;
     Ort::Env env;
@@ -170,54 +188,54 @@ bool TextEmbedder::is_model_valid(const std::string& model_name, unsigned int& n
 
     if(!std::filesystem::exists(abs_path)) {
         LOG(ERROR) << "Model file not found: " << abs_path;
-        return false;
+        return Option<bool>(400, "Model file not found");
     }
 
     if(!TextEmbedderManager::get_instance().is_public_model(model_name)) {
         if(!std::filesystem::exists(TextEmbedderManager::get_absolute_config_path(model_name))) {
             LOG(ERROR) << "Config file not found: " << TextEmbedderManager::get_absolute_config_path(model_name);
-            return false;
+            return Option<bool>(400, "Config file not found");
         }
         std::ifstream config_file(TextEmbedderManager::get_absolute_config_path(model_name));
         nlohmann::json config;
         config_file >> config;
         if(config["model_type"].is_null() || config["vocab_file_name"].is_null()) {
             LOG(ERROR) << "Invalid config file: " << TextEmbedderManager::get_absolute_config_path(model_name);
-            return false;
+            return Option<bool>(400, "Invalid config file");
         }
 
         if(!config["model_type"].is_string() || !config["vocab_file_name"].is_string()) {
             LOG(ERROR) << "Invalid config file: " << TextEmbedderManager::get_absolute_config_path(model_name);
-            return false;
+            return Option<bool>(400, "Invalid config file");
         }
 
         if(!std::filesystem::exists(TextEmbedderManager::get_model_subdir(model_name) + "/" + config["vocab_file_name"].get<std::string>())) {
             LOG(ERROR) << "Vocab file not found: " << TextEmbedderManager::get_model_subdir(model_name) + "/" + config["vocab_file_name"].get<std::string>();
-            return false;
+            return Option<bool>(400, "Vocab file not found");
         }
 
         if(config["model_type"].get<std::string>() != "bert" && config["model_type"].get<std::string>() != "xlm_roberta" && config["model_type"].get<std::string>() != "distilbert") {
             LOG(ERROR) << "Invalid model type: " << config["model_type"].get<std::string>();
-            return false;
+            return Option<bool>(400, "Invalid model type");
         }
     }
 
     Ort::Session session(env, abs_path.c_str(), session_options);
     if(session.GetInputCount() != 3 && session.GetInputCount() != 2) {
         LOG(ERROR) << "Invalid model: input count is not 3 or 2";
-        return false;
+        return Option<bool>(400, "Invalid model: input count is not 3 or 2");
     }
     Ort::AllocatorWithDefaultOptions allocator;
     auto input_ids_name = session.GetInputNameAllocated(0, allocator);
     if (std::strcmp(input_ids_name.get(), "input_ids") != 0) {
         LOG(ERROR) << "Invalid model: input_ids tensor not found";
-        return false;
+        return Option<bool>(400, "Invalid model: input_ids tensor not found");
     }
 
     auto attention_mask_name = session.GetInputNameAllocated(1, allocator);
     if (std::strcmp(attention_mask_name.get(), "attention_mask") != 0) {
         LOG(ERROR) << "Invalid model: attention_mask tensor not found";
-        return false;
+        return Option<bool>(400, "Invalid model: attention_mask tensor not found");
     }
 
 
@@ -225,7 +243,7 @@ bool TextEmbedder::is_model_valid(const std::string& model_name, unsigned int& n
         auto token_type_ids_name = session.GetInputNameAllocated(2, allocator);
         if (std::strcmp(token_type_ids_name.get(), "token_type_ids") != 0) {
             LOG(ERROR) << "Invalid model: token_type_ids tensor not found";
-            return false;
+            return Option<bool>(400, "Invalid model: token_type_ids tensor not found");
         }
     }
 
@@ -242,62 +260,8 @@ bool TextEmbedder::is_model_valid(const std::string& model_name, unsigned int& n
 
     if (!found_output_tensor) {
         LOG(ERROR) << "Invalid model: Output tensor not found";
-        return false;
+        return Option<bool>(400, "Invalid model: Output tensor not found");
     }
-
-    return true;
-}
-
-
-Option<bool> TextEmbedder::is_model_valid(const std::string openai_model_path, const std::string api_key, unsigned int& num_dims) {
-    if (openai_model_path.empty() || api_key.empty() || openai_model_path.length() < 7) {
-        return Option<bool>(400, "Invalid OpenAI model path or API key");
-    }
-
-    HttpClient& client = HttpClient::get_instance();
-    std::unordered_map<std::string, std::string> headers;
-    std::map<std::string, std::string> res_headers;
-    headers["Authorization"] = "Bearer " + api_key;
-    std::string res;
-    auto res_code = client.get_response(TextEmbedder::OPENAI_LIST_MODELS, res, res_headers, headers);
-    if (res_code != 200) {
-        LOG(ERROR) << "OpenAI API error: " << res;
-        return Option<bool>(400, "OpenAI API error: " + res);
-    }
-
-    auto models_json = nlohmann::json::parse(res);
-    bool found = false;
-    // extract model name by removing "openai/" prefix
-    auto model_name = openai_model_path.substr(7);
-    for (auto& model : models_json["data"]) {
-        if (model["id"] == model_name) {
-            found = true;
-            break;
-        }
-    }
-
-    if (!found) {
-        return Option<bool>(400, "OpenAI model not found");
-    }
-
-    // This part is hard coded for now. Because OpenAI API does not provide a way to get the output dimensions of the model.
-    if(model_name.find("-ada-") != std::string::npos) {
-        if(model_name.substr(model_name.length() - 3) == "002") {
-            num_dims = 1536;
-        } else {
-            num_dims = 1024;
-        }
-    }
-    else if(model_name.find("-davinci-") != std::string::npos) {
-        num_dims = 12288;
-    } else if(model_name.find("-curie-") != std::string::npos) {
-        num_dims = 4096;
-    } else if(model_name.find("-babbage-") != std::string::npos) {
-        num_dims = 2048;
-    } else {
-        num_dims = 768;
-    }
-
 
     return Option<bool>(true);
 }

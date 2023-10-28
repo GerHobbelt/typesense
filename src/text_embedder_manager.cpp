@@ -6,21 +6,24 @@ TextEmbedderManager& TextEmbedderManager::get_instance() {
     return instance;
 }
 
-TextEmbedder* TextEmbedderManager::get_text_embedder(const nlohmann::json& model_config) {
+Option<TextEmbedder*>TextEmbedderManager::get_text_embedder(const nlohmann::json& model_config) {
     std::unique_lock<std::mutex> lock(text_embedders_mutex);
     const std::string& model_name = model_config.at("model_name");
     if(text_embedders[model_name] == nullptr) {
-        if(model_config.count("api_key") == 0) {
+        if(!is_remote_model(model_name)) {
             if(is_public_model(model_name)) {
                 // download the model if it doesn't exist
-                download_public_model(model_name);
+                auto res = download_public_model(model_name);
+                if(!res.ok()) {
+                    return Option<TextEmbedder*>(res.code(), res.error());
+                }
             }
             text_embedders[model_name] = std::make_shared<TextEmbedder>(get_model_name_without_namespace(model_name));
         } else {
-            text_embedders[model_name] = std::make_shared<TextEmbedder>(model_name, model_config.at("api_key").get<std::string>());
+            text_embedders[model_name] = std::make_shared<TextEmbedder>(model_config);
         }
     }
-    return text_embedders[model_name].get();
+    return Option<TextEmbedder*>(text_embedders[model_name].get());
 }
 
 void TextEmbedderManager::delete_text_embedder(const std::string& model_path) {
@@ -119,7 +122,7 @@ const bool TextEmbedderManager::check_md5(const std::string& file_path, const st
     }
     return res.str() == target_md5;
 }
-void TextEmbedderManager::download_public_model(const std::string& model_name) {
+Option<bool> TextEmbedderManager::download_public_model(const std::string& model_name) {
     HttpClient& httpClient = HttpClient::get_instance();
     auto model = public_models[model_name];
     auto actual_model_name = get_model_name_without_namespace(model_name);
@@ -127,6 +130,7 @@ void TextEmbedderManager::download_public_model(const std::string& model_name) {
         long res = httpClient.download_file(get_model_url(model), get_absolute_model_path(actual_model_name));
         if(res != 200) {
             LOG(INFO) << "Failed to download public model " << model_name << ": " << res;
+            return Option<bool>(400, "Failed to download model file");
         }
     }
     
@@ -134,9 +138,11 @@ void TextEmbedderManager::download_public_model(const std::string& model_name) {
         long res = httpClient.download_file(get_vocab_url(model), get_absolute_vocab_path(actual_model_name, model.vocab_file_name));
         if(res != 200) {
             LOG(INFO) << "Failed to download default vocab " << model_name << ": " << res;
+            return Option<bool>(400, "Failed to download vocab file");
         }
     }
 
+    return Option<bool>(true);
 }
 
 const bool TextEmbedderManager::is_public_model(const std::string& model_name) {
@@ -248,4 +254,17 @@ const std::string TextEmbedderManager::get_model_url(const text_embedding_model&
 
 const std::string TextEmbedderManager::get_vocab_url(const text_embedding_model& model) {
     return MODELS_REPO_URL + model.model_name + "/" + model.vocab_file_name;
+}
+
+const std::string TextEmbedderManager::get_model_namespace(const std::string& model_name) {
+    if(model_name.find("/") != std::string::npos) {
+        return model_name.substr(0, model_name.find("/"));
+    } else {
+        return "ts";
+    }
+}
+
+const bool TextEmbedderManager::is_remote_model(const std::string& model_name) {
+    auto model_namespace = get_namespace(model_name);
+    return model_namespace.ok() && (model_namespace.get() == "openai" || model_namespace.get() == "google" || model_namespace.get() == "gcp");
 }

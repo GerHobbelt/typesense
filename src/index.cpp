@@ -454,8 +454,14 @@ void Index::validate_and_preprocess(Index *index, std::vector<index_record>& ite
                 get_doc_changes(index_rec.operation, search_schema, index_rec.doc, index_rec.old_doc,
                                 index_rec.new_doc, index_rec.del_doc);
                 scrub_reindex_doc(search_schema, index_rec.doc, index_rec.del_doc, index_rec.old_doc);
-                docs_to_embed.push_back(&index_rec.new_doc);
+                for(auto& field: index_rec.doc.items()) {
+                    if(embedding_fields.find(field.key()) != embedding_fields.end()) {
+                        docs_to_embed.push_back(&index_rec.doc);
+                        break;
+                    }
+                }
             } else {
+                handle_doc_ops(search_schema, index_rec.doc, index_rec.old_doc);
                 docs_to_embed.push_back(&index_rec.doc);
             }
 
@@ -6139,7 +6145,7 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
 }
 
 void Index::handle_doc_ops(const tsl::htrie_map<char, field>& search_schema,
-                           nlohmann::json& update_doc, const nlohmann::json& old_doc, nlohmann::json& new_doc) {
+                           nlohmann::json& update_doc, const nlohmann::json& old_doc) {
 
     /*
         {
@@ -6163,7 +6169,6 @@ void Index::handle_doc_ops(const tsl::htrie_map<char, field>& search_schema,
                         }
 
                         auto updated_value = existing_value + item.value().get<int32>();
-                        new_doc[item.key()] = updated_value;
                         update_doc[item.key()] = updated_value;
                     }
                 }
@@ -6183,9 +6188,10 @@ void Index::get_doc_changes(const index_operation_t op, const tsl::htrie_map<cha
     } else {
         new_doc = old_doc;
 
-        handle_doc_ops(search_schema, update_doc, old_doc, new_doc);
+        handle_doc_ops(search_schema, update_doc, old_doc);
 
         new_doc.merge_patch(update_doc);
+
         if(old_doc.contains(".flat")) {
             new_doc[".flat"] = old_doc[".flat"];
             for(auto& fl: update_doc[".flat"]) {
@@ -6466,15 +6472,20 @@ Option<bool> Index::batch_embed_fields(std::vector<nlohmann::json*>& documents,
             text_to_embed.push_back(text);
         }
         TextEmbedderManager& embedder_manager = TextEmbedderManager::get_instance();
-        auto embedder = embedder_manager.get_text_embedder(field.embed[fields::model_config]);
-        auto embedding_op = embedder->batch_embed(text_to_embed);
+        auto embedder_op = embedder_manager.get_text_embedder(field.embed[fields::model_config]);
+
+        if(!embedder_op.ok()) {
+            return Option<bool>(400, embedder_op.error());
+        }
+        
+        auto embedding_op = embedder_op.get()->batch_embed(text_to_embed);
 
         if(!embedding_op.ok()) {
             return Option<bool>(400, embedding_op.error());
         }
 
         auto embeddings = embedding_op.get();
-        for(size_t i = 0; i < documents.size(); i++) {
+        for(size_t i = 0; i < embeddings.size(); i++) {
             (*documents[i])[field.name] = embeddings[i];
         }
     }

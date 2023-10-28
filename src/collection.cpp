@@ -242,14 +242,13 @@ nlohmann::json Collection::get_summary_json() const {
         if(coll_field.embed.count(fields::from) != 0) {
             field_json[fields::embed] = coll_field.embed;
 
-            if(field_json[fields::embed].count(fields::api_key) != 0) {
-                // hide api key with * except first 3 chars
-                std::string api_key = field_json[fields::embed][fields::api_key];
-                if(api_key.size() > 3) {
-                    field_json[fields::embed][fields::api_key] = api_key.replace(3, api_key.size() - 3, api_key.size() - 3, '*');
-                } else {
-                    field_json[fields::embed][fields::api_key] = api_key.replace(0, api_key.size(), api_key.size(), '*');
-                }
+            if(field_json[fields::embed].count(fields::model_config) != 0) {
+                hide_credential(field_json[fields::embed][fields::model_config], "api_key");
+                hide_credential(field_json[fields::embed][fields::model_config], "access_token");
+                hide_credential(field_json[fields::embed][fields::model_config], "refresh_token");
+                hide_credential(field_json[fields::embed][fields::model_config], "client_id");
+                hide_credential(field_json[fields::embed][fields::model_config], "client_secret");
+                hide_credential(field_json[fields::embed][fields::model_config], "project_id");
             }
         }
 
@@ -1189,7 +1188,19 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                 }
 
                 TextEmbedderManager& embedder_manager = TextEmbedderManager::get_instance();
-                auto embedder = embedder_manager.get_text_embedder(search_field.embed[fields::model_config]);
+                auto embedder_op = embedder_manager.get_text_embedder(search_field.embed[fields::model_config]);
+                if(!embedder_op.ok()) {
+                    return Option<nlohmann::json>(400, embedder_op.error());
+                }
+                auto embedder = embedder_op.get();
+
+                if(embedder->is_remote()) {
+                    // return error if prefix search is used with openai embedder
+                    if((prefixes.size() == 1 && prefixes[0] == true) || (prefixes.size() > 1 &&  prefixes[i] == true)) {
+                        std::string error = "Prefix search is not supported for remote embedders.";
+                        return Option<nlohmann::json>(400, error);
+                    }
+                }
 
                 std::string embed_query = embedder_manager.get_query_prefix(search_field.embed[fields::model_config]) + raw_query;
                 auto embedding_op = embedder->Embed(embed_query);
@@ -4235,7 +4246,7 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                                                            index_operation_t::CREATE,
                                                            false,
                                                            fallback_field_type,
-                                                           DIRTY_VALUES::REJECT);
+                                                           DIRTY_VALUES::COERCE_OR_REJECT);
         if(!validate_op.ok()) {
             std::string err_message = validate_op.error();
 
@@ -4781,4 +4792,16 @@ void Collection::process_remove_field_for_embedding_fields(const field& the_fiel
 
     }
 
+}
+
+void Collection::hide_credential(nlohmann::json& json, const std::string& credential_name) {
+    if(json.count(credential_name) != 0) {
+        // hide api key with * except first 3 chars
+        std::string credential_name_str = json[credential_name];
+        if(credential_name_str.size() > 3) {
+            json[credential_name] = credential_name_str.replace(3, credential_name_str.size() - 3, credential_name_str.size() - 3, '*');
+        } else {
+            json[credential_name] = credential_name_str.replace(0, credential_name_str.size(), credential_name_str.size(), '*');
+        }
+    }
 }
