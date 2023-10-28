@@ -5000,6 +5000,27 @@ TEST_F(CollectionTest, UpdateEmbeddingsForUpdatedDocument) {
     ASSERT_NE(embedding_field, updated_embedding_field);
 }
 
+TEST_F(CollectionTest, CreateCollectionWithOpenAI) {
+    nlohmann::json schema = R"({
+                "name": "objects",
+                "fields": [
+                {"name": "name", "type": "string"},
+                {"name": "embedding", "type":"float[]", "embed":{"from": ["name"], "model_config": {"model_name": "openai/text-embedding-ada-002"}}}
+                ]
+            })"_json;
+
+    if (std::getenv("api_key") == nullptr) {
+        LOG(INFO) << "Skipping test as api_key is not set.";
+        return;
+    }
+
+    auto api_key = std::string(std::getenv("api_key"));
+    schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
+    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+}
+
 
 TEST_F(CollectionTest, CreateOpenAIEmbeddingField) {
     nlohmann::json schema = R"({
@@ -5086,7 +5107,7 @@ TEST_F(CollectionTest, PrefixSearchDisabledForOpenAI) {
     auto search_res_op = op.get()->search("dummy", {"embedding"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {true}, Index::DROP_TOKENS_THRESHOLD, dummy_include_exclude, dummy_include_exclude, 10, "", 30, 4, ""); 
 
     ASSERT_FALSE(search_res_op.ok());
-    ASSERT_EQ("Prefix search is not supported for remote embedders.", search_res_op.error());
+    ASSERT_EQ("Prefix search is not supported for remote embedders. Please set `prefix=false` as an additional search parameter to disable prefix searching.", search_res_op.error());
 
     search_res_op = op.get()->search("dummy", {"embedding"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, Index::DROP_TOKENS_THRESHOLD, dummy_include_exclude, dummy_include_exclude, 10, "", 30, 4, ""); 
     ASSERT_TRUE(search_res_op.ok());

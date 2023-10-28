@@ -1197,7 +1197,7 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                 if(embedder->is_remote()) {
                     // return error if prefix search is used with openai embedder
                     if((prefixes.size() == 1 && prefixes[0] == true) || (prefixes.size() > 1 &&  prefixes[i] == true)) {
-                        std::string error = "Prefix search is not supported for remote embedders.";
+                        std::string error = "Prefix search is not supported for remote embedders. Please set `prefix=false` as an additional search parameter to disable prefix searching.";
                         return Option<nlohmann::json>(400, error);
                     }
                 }
@@ -4804,4 +4804,21 @@ void Collection::hide_credential(nlohmann::json& json, const std::string& creden
             json[credential_name] = credential_name_str.replace(0, credential_name_str.size(), credential_name_str.size(), '*');
         }
     }
+}
+Option<bool> Collection::truncate_after_top_k(const string &field_name, size_t k) {
+    std::vector<uint32_t> seq_ids;
+    auto op = index->seq_ids_outside_top_k(field_name, k, seq_ids);
+
+    if(!op.ok()) {
+        return op;
+    }
+
+    for(auto seq_id: seq_ids) {
+        auto remove_op = remove_if_found(seq_id);
+        if(!remove_op.ok()) {
+            LOG(ERROR) << "Error while truncating top k: " << remove_op.error();
+        }
+    }
+
+    return Option<bool>(true);
 }

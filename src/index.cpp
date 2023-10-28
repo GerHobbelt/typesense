@@ -454,10 +454,18 @@ void Index::validate_and_preprocess(Index *index, std::vector<index_record>& ite
                 get_doc_changes(index_rec.operation, search_schema, index_rec.doc, index_rec.old_doc,
                                 index_rec.new_doc, index_rec.del_doc);
                 scrub_reindex_doc(search_schema, index_rec.doc, index_rec.del_doc, index_rec.old_doc);
+
                 for(auto& field: index_rec.doc.items()) {
-                    if(embedding_fields.find(field.key()) != embedding_fields.end()) {
-                        docs_to_embed.push_back(&index_rec.doc);
-                        break;
+                    for(auto& embedding_field : embedding_fields) {
+                        if(!embedding_field.embed[fields::from].is_null()) {
+                            auto embed_from_vector = embedding_field.embed[fields::from].get<std::vector<std::string>>();
+                            for(auto& embed_from: embed_from_vector) {
+                                if(embed_from == field.key()) {
+                                    docs_to_embed.push_back(&index_rec.new_doc);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -6287,6 +6295,18 @@ void Index::scrub_reindex_doc(const tsl::htrie_map<char, field>& search_schema,
 size_t Index::num_seq_ids() const {
     std::shared_lock lock(mutex);
     return seq_ids->num_ids();
+}
+
+Option<bool> Index::seq_ids_outside_top_k(const std::string& field_name, size_t k,
+                                          std::vector<uint32_t>& outside_seq_ids) {
+    auto field_it = numerical_index.find(field_name);
+
+    if(field_it == sort_index.end()) {
+        return Option<bool>(400, "Field not found in numerical index.");
+    }
+
+    field_it->second->seq_ids_outside_top_k(k, outside_seq_ids);
+    return Option<bool>(true);
 }
 
 void Index::resolve_space_as_typos(std::vector<std::string>& qtokens, const string& field_name,
