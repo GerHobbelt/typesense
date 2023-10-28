@@ -25,16 +25,18 @@ http_proxy_res_t HttpProxy::send(const std::string& url, const std::string& meth
     http_proxy_res_t res;
 
     if(method == "GET") {
-        res.status_code = client.get_response(url, res.body, res.headers, headers);
+        res.status_code = client.get_response(url, res.body, res.headers, headers, 30 * 1000);
     } else if(method == "POST") {
-        res.status_code = client.post_response(url, body, res.body, res.headers, headers);
+        res.status_code = client.post_response(url, body, res.body, res.headers, headers, 30 * 1000);
     } else if(method == "PUT") {
-        res.status_code = client.put_response(url, body, res.body, res.headers);
+        res.status_code = client.put_response(url, body, res.body, res.headers, 30 * 1000);
     } else if(method == "DELETE") {
-        res.status_code = client.delete_response(url, res.body, res.headers);
+        res.status_code = client.delete_response(url, res.body, res.headers, 30 * 1000);
     } else {
         res.status_code = 400;
-        res.body = "Invalid method: " + method;
+        nlohmann::json j;
+        j["message"] = "Parameter `method` must be one of GET, POST, PUT, DELETE.";
+        res.body =  j.dump();
     }
 
     // add to cache
