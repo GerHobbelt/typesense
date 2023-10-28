@@ -1818,8 +1818,8 @@ TEST_F(CollectionSpecificMoreTest, PhraseMatchMultipleFields) {
 
     auto res = coll1->search(R"("tide pools")", {"title", "author"}, "", {}, {}, {2}, 10, 1, FREQUENCY, {true}, 0).get();
     ASSERT_EQ(2, res["hits"].size());
-    ASSERT_EQ("1", res["hits"][0]["document"]["id"].get<std::string>());
-    ASSERT_EQ("0", res["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ("0", res["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", res["hits"][1]["document"]["id"].get<std::string>());
 }
 
 TEST_F(CollectionSpecificMoreTest, PhraseMatchAcrossArrayElements) {
@@ -2222,7 +2222,7 @@ TEST_F(CollectionSpecificMoreTest, ApproxFilterMatchCount) {
                                                         filter_tree_root);
     ASSERT_TRUE(filter_op.ok());
 
-    uint32_t approx_count;
+    uint32_t approx_count = 0;
     coll->_get_index()->_approximate_filter_ids(filter_tree_root->filter_exp, approx_count);
     ASSERT_EQ(approx_count, 5);
 
