@@ -11,6 +11,7 @@
 #include <tsl/htrie_map.h>
 #include "json.hpp"
 #include "text_embedder_manager.h"
+#include <regex>
 
 namespace field_types {
     // first field value indexed will determine the type
