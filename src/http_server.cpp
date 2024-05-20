@@ -525,6 +525,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     if(req->proceed_req == nullptr) {
         // Full request body is already available, so we don't care if handler is async or not
         //LOG(INFO) << "Full request body is already available: " << req->entity.len;
+
         request->last_chunk_aggregate = true;
         return process_request(request, response, rpath, h2o_handler, use_meta_thread_pool);
     } else {
@@ -569,13 +570,11 @@ int HttpServer::async_req_cb(void *ctx, int is_end_stream) {
     bool async_req = custom_generator->rpath->async_req;
     bool is_http_v1 = (0x101 <= request->_req->version && request->_req->version < 0x200);
 
-    /*
-    LOG(INFO) << "async_req_cb, chunk.len=" << chunk.len
+    /*LOG(INFO) << "async_req_cb, chunk.len=" << chunk.len
               << ", is_http_v1: " << is_http_v1
-              << ", request->req->entity.len=" << request->req->entity.len
-              << ", content_len: " << request->req->content_length
-              << ", is_end_stream=" << is_end_stream;
-    */
+              << ", request->req->entity.len=" << request->_req->entity.len
+              << ", content_len: " << request->_req->content_length
+              << ", is_end_stream=" << is_end_stream;*/
 
     // disallow specific curl clients from using import call via http2
     // detects: https://github.com/curl/curl/issues/1410
@@ -611,7 +610,6 @@ int HttpServer::async_req_cb(void *ctx, int is_end_stream) {
     }
 
     std::string chunk_str(chunk.base, chunk.len);
-
     request->body += chunk_str;
     request->chunk_len += chunk.len;
 
@@ -634,7 +632,6 @@ int HttpServer::async_req_cb(void *ctx, int is_end_stream) {
     if(can_process_async || is_end_stream) {
         // For async streaming requests, handler should be invoked for every aggregated chunk
         // For a non streaming request, buffer body and invoke only at the end
-
         if(request->first_chunk_aggregate) {
             request->first_chunk_aggregate = false;
         }

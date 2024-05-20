@@ -133,6 +133,11 @@ private:
     /// "field name" -> reference_pair(referenced_collection_name, referenced_field_name)
     spp::sparse_hash_map<std::string, reference_pair> reference_fields;
 
+    /// Contains the info where the current collection is referenced.
+    /// Useful to perform operations such as cascading delete.
+    /// collection_name -> field_name
+    spp::sparse_hash_map<std::string, std::string> referenced_in;
+
     // Keep index as the last field since it is initialized in the constructor via init_index(). Add a new field before it.
     Index* index;
 
@@ -182,9 +187,8 @@ private:
                                           std::vector<field>& new_fields,
                                           bool enable_nested_fields);
 
-    static bool facet_count_compare(const std::pair<uint64_t, facet_count_t>& a,
-                                    const std::pair<uint64_t, facet_count_t>& b) {
-        return std::tie(a.second.count, a.first) > std::tie(b.second.count, b.first);
+    static bool facet_count_compare(const facet_count_t& a, const facet_count_t& b) {
+        return std::tie(a.count, a.fhash) > std::tie(b.count, b.fhash);
     }
 
     static bool facet_count_str_compare(const facet_value_t& a,
@@ -195,7 +199,7 @@ private:
         size_t a_value_size = UINT64_MAX - a.value.size();
         size_t b_value_size = UINT64_MAX - b.value.size();
 
-        return std::tie(a_count, a_value_size) > std::tie(b_count, b_value_size);
+        return std::tie(a_count, a_value_size, a.value) > std::tie(b_count, b_value_size, b.value);
     }
 
     static Option<bool> parse_pinned_hits(const std::string& pinned_hits_str,
@@ -271,10 +275,10 @@ private:
                                                  const spp::sparse_hash_set<std::string>& exclude_fields,
                                                  tsl::htrie_set<char>& include_fields_full,
                                                  tsl::htrie_set<char>& exclude_fields_full) const;
-    
 
+    Option<uint32_t> get_reference_doc_id(const std::string& ref_collection_name, const uint32_t& seq_id) const;
 
-    Option<std::string> get_reference_field(const std::string & collection_name) const;
+    Option<std::string> get_reference_field(const std::string& ref_collection_name) const;
 
     static void hide_credential(nlohmann::json& json, const std::string& credential_name);
 
@@ -372,13 +376,17 @@ public:
     static void remove_flat_fields(nlohmann::json& document);
 
     static Option<bool> prune_doc(nlohmann::json& doc, const tsl::htrie_set<char>& include_names,
-                          const tsl::htrie_set<char>& exclude_names, const std::string& parent_name = "", size_t depth = 0,
-                          const reference_filter_result_t* reference_filter_result = nullptr);
+                                  const tsl::htrie_set<char>& exclude_names, const std::string& parent_name = "",
+                                  size_t depth = 0,
+                                  const std::map<std::string, reference_filter_result_t>& reference_filter_results = {},
+                                  Collection *const collection = nullptr, const uint32_t& seq_id = 0);
 
     const Index* _get_index() const;
 
     bool facet_value_to_string(const facet &a_facet, const facet_count_t &facet_count, const nlohmann::json &document,
                                std::string &value) const;
+
+    std::string get_facet_parent(const std::string& facet_field_name, const nlohmann::json& document) const;
 
     static void populate_result_kvs(Topster *topster, std::vector<std::vector<KV *>> &result_kvs, 
                     const spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed, 
@@ -392,7 +400,7 @@ public:
     void parse_search_query(const std::string &query, std::vector<std::string>& q_include_tokens,
                             std::vector<std::vector<std::string>>& q_exclude_tokens,
                             std::vector<std::vector<std::string>>& q_phrases,
-                            const std::string& locale, const bool already_segmented) const;
+                            const std::string& locale, const bool already_segmented, const std::string& stopword_set="") const;
 
     // PUBLIC OPERATIONS
 
@@ -466,14 +474,13 @@ public:
                                   const size_t facet_sample_percent = 100,
                                   const size_t facet_sample_threshold = 0,
                                   const size_t page_offset = 0,
+                                  facet_index_type_t facet_index_type = HASH,
                                   const size_t remote_embedding_timeout_ms = 30000,
-                                  const size_t remote_embedding_num_try = 2) const;
+                                  const size_t remote_embedding_num_tries = 2,
+                                  const std::string& stopwords_set="",
+                                  const std::vector<std::string>& facet_return_parent = {}) const;
 
     Option<bool> get_filter_ids(const std::string & filter_query, filter_result_t& filter_result) const;
-
-    /// Get approximate count of docs matching a reference filter on foo collection when $foo(...) filter is encountered.
-    Option<bool> get_approximate_reference_filter_ids(const std::string& filter_query,
-                                                      uint32_t& filter_ids_length) const;
 
     Option<bool> get_reference_filter_ids(const std::string& filter_query,
                                           filter_result_t& filter_result,

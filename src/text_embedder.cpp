@@ -8,7 +8,7 @@
 #include <dlfcn.h>
 
 TextEmbedder::TextEmbedder(const std::string& model_name) {
-    // create environment
+    // create environment for local model
     Ort::SessionOptions session_options;
     auto providers = Ort::GetAvailableProviders();
     for(auto& provider : providers) {
@@ -50,13 +50,14 @@ TextEmbedder::TextEmbedder(const std::string& model_name) {
         if (shape.size() == 3 && shape[0] == -1 && shape[1] == -1 && shape[2] > 0) {
             Ort::AllocatorWithDefaultOptions allocator;
             output_tensor_name = std::string(session_->GetOutputNameAllocated(i, allocator).get());
+            num_dim = shape[2];
             break;
         }
     }
 }
 
-TextEmbedder::TextEmbedder(const nlohmann::json& model_config) {
-    auto model_name = model_config["model_name"].get<std::string>();
+TextEmbedder::TextEmbedder(const nlohmann::json& model_config, size_t num_dims) {
+    const std::string& model_name = model_config["model_name"].get<std::string>();
     LOG(INFO) << "Initializing remote embedding model: " << model_name;
     auto model_namespace = TextEmbedderManager::get_model_namespace(model_name);
 
@@ -78,6 +79,8 @@ TextEmbedder::TextEmbedder(const nlohmann::json& model_config) {
 
         remote_embedder_ = std::make_unique<GCPEmbedder>(project_id, model_name, access_token, refresh_token, client_id, client_secret);
     }
+
+    num_dim = num_dims;
 }
 
 
@@ -94,9 +97,9 @@ std::vector<float> TextEmbedder::mean_pooling(const std::vector<std::vector<floa
     return pooled_output;
 }
 
-embedding_res_t TextEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_try) {
+embedding_res_t TextEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
     if(is_remote()) {
-        return remote_embedder_->Embed(text, remote_embedder_timeout_ms, remote_embedding_num_try);
+        return remote_embedder_->Embed(text, remote_embedder_timeout_ms, remote_embedding_num_tries);
     } else {
         // Cannot run same model in parallel, so lock the mutex
         std::lock_guard<std::mutex> lock(mutex_);
@@ -267,7 +270,7 @@ batch_encoded_input_t TextEmbedder::batch_encode(const std::vector<std::string>&
     return encoded_inputs;
 }
 
-Option<bool> TextEmbedder::validate(size_t& num_dims) {
+Option<bool> TextEmbedder::validate() {
     if(session_->GetInputCount() != 3 && session_->GetInputCount() != 2) {
         LOG(ERROR) << "Invalid model: input count is not 3 or 2";
         return Option<bool>(400, "Invalid model: input count is not 3 or 2");
@@ -300,7 +303,6 @@ Option<bool> TextEmbedder::validate(size_t& num_dims) {
     for (size_t i = 0; i < output_tensor_count; i++) {
         auto shape = session_->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape();
         if (shape.size() == 3 && shape[0] == -1 && shape[1] == -1 && shape[2] > 0) {
-            num_dims = shape[2];
             found_output_tensor = true;
             break;
         }
@@ -312,4 +314,8 @@ Option<bool> TextEmbedder::validate(size_t& num_dims) {
     }
 
     return Option<bool>(true);
+}
+
+const size_t TextEmbedder::get_num_dim() const {
+    return num_dim;
 }

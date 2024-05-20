@@ -2,7 +2,7 @@
 #include "parasort.h"
 #include "timsort.hpp"
 
-void num_tree_t::insert(int64_t value, uint32_t id) {
+void num_tree_t::insert(int64_t value, uint32_t id, bool is_facet) {
     if (int64map.count(value) == 0) {
         int64map.emplace(value, SET_COMPACT_IDS(compact_id_list_t::create(1, {id})));
     } else {

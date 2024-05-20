@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <cstdlib>
 #include <collection_manager.h>
+#include <validator.h>
 #include "collection.h"
 #include "text_embedder_manager.h"
 #include "http_client.h"
@@ -2384,16 +2385,16 @@ TEST_F(CollectionTest, UpdateDocument) {
     res = coll1->search("lazy", {"title"}, "", {"tags"}, sort_fields, {0}, 10, 1,
                         token_ordering::FREQUENCY, {true}, 10, spp::sparse_hash_set<std::string>(),
                         spp::sparse_hash_set<std::string>(), 10, "", 5, 5, "title").get();
-
+    
     ASSERT_EQ(1, res["hits"].size());
     ASSERT_EQ(1, res["facet_counts"].size());
     ASSERT_STREQ("tags", res["facet_counts"][0]["field_name"].get<std::string>().c_str());
     ASSERT_EQ(2, res["facet_counts"][0]["counts"].size());
 
-    ASSERT_STREQ("LAZY", res["facet_counts"][0]["counts"][0]["value"].get<std::string>().c_str());
+    ASSERT_STREQ("NEWS", res["facet_counts"][0]["counts"][0]["value"].get<std::string>().c_str());
     ASSERT_EQ(1, (int) res["facet_counts"][0]["counts"][0]["count"]);
 
-    ASSERT_STREQ("NEWS", res["facet_counts"][0]["counts"][1]["value"].get<std::string>().c_str());
+    ASSERT_STREQ("LAZY", res["facet_counts"][0]["counts"][1]["value"].get<std::string>().c_str());
     ASSERT_EQ(1, (int) res["facet_counts"][0]["counts"][1]["count"]);
 
     // upsert only part of the document -- document should be REPLACED
@@ -4983,12 +4984,12 @@ TEST_F(CollectionTest, UpdateEmbeddingsForUpdatedDocument) {
 
 TEST_F(CollectionTest, CreateCollectionWithOpenAI) {
     nlohmann::json schema = R"({
-                "name": "objects",
-                "fields": [
-                {"name": "name", "type": "string"},
-                {"name": "embedding", "type":"float[]", "embed":{"from": ["name"], "model_config": {"model_name": "openai/text-embedding-ada-002"}}}
-                ]
-            })"_json;
+        "name": "objects",
+        "fields": [
+        {"name": "name", "type": "string"},
+        {"name": "embedding", "type":"float[]", "embed":{"from": ["name"], "model_config": {"model_name": "openai/text-embedding-ada-002"}}}
+        ]
+    })"_json;
 
     if (std::getenv("api_key") == nullptr) {
         LOG(INFO) << "Skipping test as api_key is not set.";
@@ -5000,8 +5001,19 @@ TEST_F(CollectionTest, CreateCollectionWithOpenAI) {
     TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
-}
 
+    // create one more collection
+    schema = R"({
+        "name": "objects2",
+        "fields": [
+        {"name": "name", "type": "string"},
+        {"name": "embedding", "type":"float[]", "embed":{"from": ["name"], "model_config": {"model_name": "openai/text-embedding-ada-002"}}}
+        ]
+    })"_json;
+    schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
+    op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+}
 
 TEST_F(CollectionTest, CreateOpenAIEmbeddingField) {
     nlohmann::json schema = R"({

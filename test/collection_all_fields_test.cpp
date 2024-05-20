@@ -313,7 +313,7 @@ TEST_F(CollectionAllFieldsTest, ShouldBeAbleToUpdateSchemaDetectedDocs) {
     // insert multiple docs at the same time
     const size_t NUM_DOCS = 20;
     std::vector<std::string> json_lines;
-    
+
     for(size_t i = 0; i < NUM_DOCS; i++) {
         const std::string &i_str = std::to_string(i);
         doc["title"] = std::string("upserted ") + std::to_string(StringUtils::hash_wy(i_str.c_str(), i_str.size()));
@@ -1679,15 +1679,6 @@ TEST_F(CollectionAllFieldsTest, EmbedFromBasicValid) {
 }
 
 TEST_F(CollectionAllFieldsTest, WrongDataTypeForEmbedFrom) {
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
-    nlohmann::json field_json;
-    field_json["name"] = "embedding";
-    field_json["type"] = "float[]";
-    field_json["embed"] = nlohmann::json::object();
-    field_json["embed"]["from"] = {"age"};
-    field_json["embed"]["model_config"] = nlohmann::json::object();
-    field_json["embed"]["model_config"]["model_name"] = "ts/e5-small";
-
     nlohmann::json schema = R"({
         "name": "obj_coll",
         "fields": [

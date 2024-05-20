@@ -2,13 +2,13 @@
 
 #include <string>
 #include <s2/s2latlng.h>
-#include "art.h"
 #include "option.h"
 #include "string_utils.h"
 #include "logger.h"
 #include "store.h"
 #include <sparsepp.h>
 #include <tsl/htrie_map.h>
+#include <filter.h>
 #include "json.hpp"
 #include "text_embedder_manager.h"
 
@@ -23,6 +23,7 @@ namespace field_types {
     static const std::string INT64 = "int64";
     static const std::string FLOAT = "float";
     static const std::string BOOL = "bool";
+    static const std::string NIL = "nil";
     static const std::string GEOPOINT = "geopoint";
     static const std::string STRING_ARRAY = "string[]";
     static const std::string INT32_ARRAY = "int32[]";
@@ -53,6 +54,7 @@ namespace fields {
     static const std::string embed = "embed";
     static const std::string from = "from";
     static const std::string model_name = "model_name";
+    static const std::string range_index = "range_index";
 
     // Some models require additional parameters to be passed to the model during indexing/querying
     // For e.g. e5-small model requires prefix "passage:" for indexing and "query:" for querying
@@ -92,13 +94,17 @@ struct field {
 
     std::string reference;      // Foo.bar (reference to bar field in Foo collection).
 
+    bool range_index;
+
     field() {}
 
     field(const std::string &name, const std::string &type, const bool facet, const bool optional = false,
           bool index = true, std::string locale = "", int sort = -1, int infix = -1, bool nested = false,
-          int nested_array = 0, size_t num_dim = 0, vector_distance_type_t vec_dist = cosine, std::string reference = "", const nlohmann::json& embed = nlohmann::json()) :
+          int nested_array = 0, size_t num_dim = 0, vector_distance_type_t vec_dist = cosine,
+          std::string reference = "", const nlohmann::json& embed = nlohmann::json(), const bool range_index = false) :
             name(name), type(type), facet(facet), optional(optional), index(index), locale(locale),
-            nested(nested), nested_array(nested_array), num_dim(num_dim), vec_dist(vec_dist), reference(reference), embed(embed) {
+            nested(nested), nested_array(nested_array), num_dim(num_dim), vec_dist(vec_dist), reference(reference),
+            embed(embed), range_index(range_index) {
 
         set_computed_defaults(sort, infix);
     }
@@ -429,217 +435,36 @@ struct field {
                                                        std::vector<field>& fields_vec);
 
     static bool flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_array, bool has_obj_array,
-                            const field& the_field, const std::string& flat_name,
+                            bool is_update, const field& the_field, const std::string& flat_name,
                             const std::unordered_map<std::string, field>& dyn_fields,
                             std::unordered_map<std::string, field>& flattened_fields);
 
     static Option<bool> flatten_field(nlohmann::json& doc, nlohmann::json& obj, const field& the_field,
                                       std::vector<std::string>& path_parts, size_t path_index, bool has_array,
-                                      bool has_obj_array,
+                                      bool has_obj_array, bool is_update,
                                       const std::unordered_map<std::string, field>& dyn_fields,
                                       std::unordered_map<std::string, field>& flattened_fields);
 
     static Option<bool> flatten_doc(nlohmann::json& document, const tsl::htrie_map<char, field>& nested_fields,
                                     const std::unordered_map<std::string, field>& dyn_fields,
-                                    bool missing_is_ok, std::vector<field>& flattened_fields);
+                                    bool is_update, std::vector<field>& flattened_fields);
 
     static void compact_nested_fields(tsl::htrie_map<char, field>& nested_fields);
 };
 
-struct filter_node_t;
-
-struct filter {
-    std::string field_name;
-    std::vector<std::string> values;
-    std::vector<NUM_COMPARATOR> comparators;
-    // Would be set when `field: != ...` is encountered with a string field or `field: != [ ... ]` is encountered in the
-    // case of int and float fields. During filtering, all the results of matching the field against the values are
-    // aggregated and then this flag is checked if negation on the aggregated result is required.
-    bool apply_not_equals = false;
-
-    // Would store `Foo` in case of a filter expression like `$Foo(bar := baz)`
-    std::string referenced_collection_name = "";
-
-    static const std::string RANGE_OPERATOR() {
-        return "..";
-    }
-
-    static Option<bool> validate_numerical_filter_value(field _field, const std::string& raw_value) {
-        if(_field.is_int32() && !StringUtils::is_int32_t(raw_value)) {
-            return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int32.");
-        }
-
-        else if(_field.is_int64() && !StringUtils::is_int64_t(raw_value)) {
-            return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int64.");
-        }
-
-        else if(_field.is_float() && !StringUtils::is_float(raw_value)) {
-            return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not a float.");
-        }
-
-        return Option<bool>(true);
-    }
-
-    static Option<NUM_COMPARATOR> extract_num_comparator(std::string & comp_and_value) {
-        auto num_comparator = EQUALS;
-
-        if(StringUtils::is_integer(comp_and_value) || StringUtils::is_float(comp_and_value)) {
-            num_comparator = EQUALS;
-        }
-
-            // the ordering is important - we have to compare 2-letter operators first
-        else if(comp_and_value.compare(0, 2, "<=") == 0) {
-            num_comparator = LESS_THAN_EQUALS;
-        }
-
-        else if(comp_and_value.compare(0, 2, ">=") == 0) {
-            num_comparator = GREATER_THAN_EQUALS;
-        }
-
-        else if(comp_and_value.compare(0, 2, "!=") == 0) {
-            num_comparator = NOT_EQUALS;
-        }
-
-        else if(comp_and_value.compare(0, 1, "<") == 0) {
-            num_comparator = LESS_THAN;
-        }
-
-        else if(comp_and_value.compare(0, 1, ">") == 0) {
-            num_comparator = GREATER_THAN;
-        }
-
-        else if(comp_and_value.find("..") != std::string::npos) {
-            num_comparator = RANGE_INCLUSIVE;
-        }
-
-        else {
-            return Option<NUM_COMPARATOR>(400, "Numerical field has an invalid comparator.");
-        }
-
-        if(num_comparator == LESS_THAN || num_comparator == GREATER_THAN) {
-            comp_and_value = comp_and_value.substr(1);
-        } else if(num_comparator == LESS_THAN_EQUALS || num_comparator == GREATER_THAN_EQUALS || num_comparator == NOT_EQUALS) {
-            comp_and_value = comp_and_value.substr(2);
-        }
-
-        comp_and_value = StringUtils::trim(comp_and_value);
-
-        return Option<NUM_COMPARATOR>(num_comparator);
-    }
-
-    static Option<bool> parse_geopoint_filter_value(std::string& raw_value,
-                                                    const std::string& format_err_msg,
-                                                    std::string& processed_filter_val,
-                                                    NUM_COMPARATOR& num_comparator);
-
-    static Option<bool> parse_filter_query(const std::string& filter_query,
-                                           const tsl::htrie_map<char, field>& search_schema,
-                                           const Store* store,
-                                           const std::string& doc_id_prefix,
-                                           filter_node_t*& root);
+enum index_operation_t {
+    CREATE,
+    UPSERT,
+    UPDATE,
+    EMPLACE,
+    DELETE
 };
 
-struct filter_node_t {
-    filter filter_exp;
-    FILTER_OPERATOR filter_operator;
-    bool isOperator;
-    filter_node_t* left = nullptr;
-    filter_node_t* right = nullptr;
-
-    filter_node_t(filter filter_exp)
-            : filter_exp(std::move(filter_exp)),
-              isOperator(false),
-              left(nullptr),
-              right(nullptr) {}
-
-    filter_node_t(FILTER_OPERATOR filter_operator,
-                  filter_node_t* left,
-                  filter_node_t* right)
-            : filter_operator(filter_operator),
-              isOperator(true),
-              left(left),
-              right(right) {}
-
-    ~filter_node_t() {
-        delete left;
-        delete right;
-    }
-};
-
-struct reference_filter_result_t {
-    uint32_t count = 0;
-    uint32_t* docs = nullptr;
-
-    reference_filter_result_t& operator=(const reference_filter_result_t& obj) noexcept {
-        if (&obj == this)
-            return *this;
-
-        count = obj.count;
-        docs = new uint32_t[count];
-        memcpy(docs, obj.docs, count * sizeof(uint32_t));
-
-        return *this;
-    }
-
-    ~reference_filter_result_t() {
-        delete[] docs;
-    }
-};
-
-struct filter_result_t {
-    uint32_t count = 0;
-    uint32_t* docs = nullptr;
-    // Collection name -> Reference filter result
-    std::map<std::string, reference_filter_result_t*> reference_filter_results;
-
-    filter_result_t() = default;
-
-    filter_result_t(uint32_t count, uint32_t* docs) : count(count), docs(docs) {}
-
-    filter_result_t& operator=(const filter_result_t& obj) noexcept {
-        if (&obj == this)
-            return *this;
-
-        count = obj.count;
-        docs = new uint32_t[count];
-        memcpy(docs, obj.docs, count * sizeof(uint32_t));
-
-        // Copy every collection's references.
-        for (const auto &item: obj.reference_filter_results) {
-            reference_filter_results[item.first] = new reference_filter_result_t[count];
-
-            for (uint32_t i = 0; i < count; i++) {
-                reference_filter_results[item.first][i] = item.second[i];
-            }
-        }
-
-        return *this;
-    }
-
-    filter_result_t& operator=(filter_result_t&& obj) noexcept {
-        if (&obj == this)
-            return *this;
-
-        count = obj.count;
-        docs = obj.docs;
-        reference_filter_results = std::map(obj.reference_filter_results);
-
-        obj.docs = nullptr;
-        obj.reference_filter_results.clear();
-
-        return *this;
-    }
-
-    ~filter_result_t() {
-        delete[] docs;
-        for (const auto &item: reference_filter_results) {
-            delete[] item.second;
-        }
-    }
-
-    static void and_filter_results(const filter_result_t& a, const filter_result_t& b, filter_result_t& result);
-
-    static void or_filter_results(const filter_result_t& a, const filter_result_t& b, filter_result_t& result);
+enum class DIRTY_VALUES {
+    REJECT = 1,
+    DROP = 2,
+    COERCE_OR_REJECT = 3,
+    COERCE_OR_DROP = 4,
 };
 
 namespace sort_field_const {
@@ -745,6 +570,10 @@ public:
 
 struct facet_count_t {
     uint32_t count = 0;
+    // for value based faceting, actual value is stored here
+    std::string fvalue;
+    // for hash based faceting, hash value is stored here
+    int64_t fhash;
     // used to fetch the actual document and value for representation
     uint32_t doc_id = 0;
     uint32_t array_pos = 0;
@@ -760,12 +589,14 @@ struct facet_stats_t {
 struct facet {
     const std::string field_name;
     spp::sparse_hash_map<uint64_t, facet_count_t> result_map;
+    spp::sparse_hash_map<std::string, facet_count_t> value_result_map;
 
     // used for facet value query
+    spp::sparse_hash_map<std::string, std::vector<std::string>> fvalue_tokens;
     spp::sparse_hash_map<uint64_t, std::vector<std::string>> hash_tokens;
 
     // used for faceting grouped results
-    spp::sparse_hash_map<uint64_t, spp::sparse_hash_set<uint64_t>> hash_groups;
+    spp::sparse_hash_map<uint32_t, spp::sparse_hash_set<uint32_t>> hash_groups;
 
     facet_stats_t stats;
 
@@ -777,17 +608,17 @@ struct facet {
     bool sampled = false;
 
     bool is_wildcard_match = false;
+    
+    bool is_intersected = false;
 
-    bool get_range(int64_t key, std::pair<int64_t, std::string>& range_pair)
-    {
-        if(facet_range_map.empty())
-        {
+    bool get_range(int64_t key, std::pair<int64_t, std::string>& range_pair) {
+        if(facet_range_map.empty()) {
             LOG (ERROR) << "Facet range is not defined!!!";
         }
+
         auto it = facet_range_map.lower_bound(key);
 
-        if(it != facet_range_map.end())
-        {
+        if(it != facet_range_map.end()) {
             range_pair.first = it->first;
             range_pair.second = it->second;
             return true;
@@ -796,19 +627,19 @@ struct facet {
         return false;
     }
 
-    explicit facet(const std::string& field_name, 
-        std::map<int64_t, std::string> facet_range = {}, bool is_range_q = false)
-        :field_name(field_name){
-            facet_range_map = facet_range;
-            is_range_query = is_range_q;
+    explicit facet(const std::string& field_name, std::map<int64_t, std::string> facet_range = {},
+                   bool is_range_q = false) :field_name(field_name), facet_range_map(facet_range),
+                   is_range_query(is_range_q) {
     }
 };
 
 struct facet_info_t {
     // facet hash => resolved tokens
     std::unordered_map<uint64_t, std::vector<std::string>> hashes;
+    std::vector<std::string> fvalue_searched_tokens;
     bool use_facet_query = false;
     bool should_compute_stats = false;
+    bool use_value_index = false;
     field facet_field{"", "", false};
 };
 
@@ -825,11 +656,10 @@ struct facet_value_t {
 
 struct facet_hash_values_t {
     uint32_t length = 0;
-    uint64_t* hashes = nullptr;
+    std::vector<uint32_t> hashes;
 
     facet_hash_values_t() {
         length = 0;
-        hashes = nullptr;
     }
 
     facet_hash_values_t(facet_hash_values_t&& hash_values) noexcept {
@@ -837,17 +667,17 @@ struct facet_hash_values_t {
         hashes = hash_values.hashes;
 
         hash_values.length = 0;
-        hash_values.hashes = nullptr;
+        hash_values.hashes.clear();
     }
 
     facet_hash_values_t& operator=(facet_hash_values_t&& other) noexcept {
         if (this != &other) {
-            delete[] hashes;
+            hashes.clear();
 
             hashes = other.hashes;
             length = other.length;
 
-            other.hashes = nullptr;
+            other.hashes.clear();
             other.length = 0;
         }
 
@@ -855,8 +685,7 @@ struct facet_hash_values_t {
     }
 
     ~facet_hash_values_t() {
-        delete [] hashes;
-        hashes = nullptr;
+        hashes.clear();
     }
 
     uint64_t size() const {
@@ -864,6 +693,6 @@ struct facet_hash_values_t {
     }
 
     uint64_t back() const {
-        return hashes[length - 1];
+        return hashes.back();
     }
 };

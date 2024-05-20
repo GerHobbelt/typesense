@@ -6,21 +6,6 @@
 #include "tsl/htrie_map.h"
 #include "field.h"
 
-enum index_operation_t {
-    CREATE,
-    UPSERT,
-    UPDATE,
-    EMPLACE,
-    DELETE
-};
-
-enum class DIRTY_VALUES {
-    REJECT = 1,
-    DROP = 2,
-    COERCE_OR_REJECT = 3,
-    COERCE_OR_DROP = 4,
-};
-
 class validator_t {
 public:
 
@@ -71,6 +56,6 @@ public:
     static Option<bool> validate_embed_fields(const nlohmann::json& document, 
                                         const tsl::htrie_map<char, field>& embedding_fields, 
                                         const tsl::htrie_map<char, field> & search_schema,
-                                        const bool& error_if_field_not_found);
+                                        const bool& is_update);
 
 };
