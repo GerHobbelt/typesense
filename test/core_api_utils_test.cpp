@@ -621,7 +621,6 @@ TEST_F(CoreAPIUtilsTest, PresetSingleSearch) {
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
-    Collection* coll1 = op.get();
 
     auto preset_value = R"(
         {"collection":"preset_coll", "per_page": "12"}
@@ -932,7 +931,7 @@ TEST_F(CoreAPIUtilsTest, ExportIncludeExcludeFields) {
 
     // exclude fields
 
-    delete dynamic_cast<deletion_state_t*>(req->data);
+    delete dynamic_cast<export_state_t*>(req->data);
     req->data = nullptr;
     res->body.clear();
     req->params.erase("include_fields");
@@ -993,7 +992,7 @@ TEST_F(CoreAPIUtilsTest, ExportIncludeExcludeFieldsWithFilter) {
 
     // exclude fields
 
-    delete dynamic_cast<deletion_state_t*>(req->data);
+    delete dynamic_cast<export_state_t*>(req->data);
     req->data = nullptr;
     res->body.clear();
     req->params.erase("include_fields");
@@ -1137,4 +1136,27 @@ TEST_F(CoreAPIUtilsTest, TestProxyInvalid) {
 
     ASSERT_EQ(400, resp->status_code);
     ASSERT_EQ("Headers must be a JSON object.", nlohmann::json::parse(resp->body)["message"]);
+}
+
+
+
+TEST_F(CoreAPIUtilsTest, TestProxyTimeout) {
+    nlohmann::json body;
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    // test with url as empty string
+    body["url"] = "https://typesense.org/docs/";
+    body["method"] = "GET";
+    body["headers"] = nlohmann::json::object();
+    body["headers"]["timeout_ms"] = "1";
+    body["headers"]["num_retry"] = "1";
+
+    req->body = body.dump();
+
+    post_proxy(req, resp);
+
+    ASSERT_EQ(408, resp->status_code);
+    ASSERT_EQ("Server error on remote server. Please try again later.", nlohmann::json::parse(resp->body)["message"]);
 }

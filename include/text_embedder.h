@@ -16,13 +16,13 @@ class TextEmbedder {
         // Constructor for remote models
         TextEmbedder(const nlohmann::json& model_config);
         ~TextEmbedder();
-        embedding_res_t Embed(const std::string& text);
-        std::vector<embedding_res_t> batch_embed(const std::vector<std::string>& inputs);
+        embedding_res_t Embed(const std::string& text, const size_t remote_embedder_timeout_ms = 30000, const size_t remote_embedding_num_try = 2);
+        std::vector<embedding_res_t> batch_embed(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size = 200);
         const std::string& get_vocab_file_name() const;
         bool is_remote() {
             return remote_embedder_ != nullptr;
         }
-        static Option<bool> is_model_valid(const nlohmann::json& model_config,  unsigned int& num_dims);
+        Option<bool> validate(size_t& num_dims);
     private:
         std::unique_ptr<Ort::Session> session_;
         Ort::Env env_;
@@ -33,7 +33,5 @@ class TextEmbedder {
         std::string vocab_file_name;
         static std::vector<float> mean_pooling(const std::vector<std::vector<float>>& input);
         std::string output_tensor_name;
-        static Option<bool> validate_remote_model(const nlohmann::json& model_config, unsigned int& num_dims);
-        static Option<bool> validate_local_or_public_model(const nlohmann::json& model_config, unsigned int& num_dims);
         std::mutex mutex_;
 };

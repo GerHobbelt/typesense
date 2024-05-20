@@ -261,6 +261,9 @@ nlohmann::json Collection::get_summary_json() const {
             field_json[fields::reference] = coll_field.reference;
         }
 
+        if(!coll_field.embed.empty()) {
+            field_json[fields::embed] = coll_field.embed;
+        }
 
         fields_arr.push_back(field_json);
     }
@@ -295,7 +298,8 @@ Option<nlohmann::json> Collection::add(const std::string & json_str,
 
 nlohmann::json Collection::add_many(std::vector<std::string>& json_lines, nlohmann::json& document,
                                     const index_operation_t& operation, const std::string& id,
-                                    const DIRTY_VALUES& dirty_values, const bool& return_doc, const bool& return_id) {
+                                    const DIRTY_VALUES& dirty_values, const bool& return_doc, const bool& return_id,
+                                    const size_t remote_embedding_batch_size) {
     //LOG(INFO) << "Memory ratio. Max = " << max_memory_ratio << ", Used = " << SystemMetrics::used_memory_ratio();
     std::vector<index_record> index_records;
 
@@ -385,7 +389,7 @@ nlohmann::json Collection::add_many(std::vector<std::string>& json_lines, nlohma
 
 
         if((i+1) % index_batch_size == 0 || i == json_lines.size()-1 || repeated_doc) {
-            batch_index(index_records, json_lines, num_indexed, return_doc, return_id);
+            batch_index(index_records, json_lines, num_indexed, return_doc, return_id, remote_embedding_batch_size);
 
             // to return the document for the single doc add cases
             if(index_records.size() == 1) {
@@ -502,9 +506,9 @@ bool Collection::is_exceeding_memory_threshold() const {
 }
 
 void Collection::batch_index(std::vector<index_record>& index_records, std::vector<std::string>& json_out,
-                             size_t &num_indexed, const bool& return_doc, const bool& return_id) {
+                             size_t &num_indexed, const bool& return_doc, const bool& return_id, const size_t remote_embedding_batch_size) {
 
-    batch_index_in_memory(index_records);
+    batch_index_in_memory(index_records, remote_embedding_batch_size, true);
 
     // store only documents that were indexed in-memory successfully
     for(auto& index_record: index_records) {
@@ -608,11 +612,11 @@ Option<uint32_t> Collection::index_in_memory(nlohmann::json &document, uint32_t 
     return Option<>(200);
 }
 
-size_t Collection::batch_index_in_memory(std::vector<index_record>& index_records, const bool generate_embeddings) {
+size_t Collection::batch_index_in_memory(std::vector<index_record>& index_records, const size_t remote_embedding_batch_size, const bool generate_embeddings) {
     std::unique_lock lock(mutex);
     size_t num_indexed = Index::batch_memory_index(index, index_records, default_sorting_field,
                                                    search_schema, embedding_fields, fallback_field_type,
-                                                   token_separators, symbols_to_index, true, generate_embeddings);
+                                                   token_separators, symbols_to_index, true, remote_embedding_batch_size, generate_embeddings);
     num_documents += num_indexed;
     return num_indexed;
 }
@@ -642,10 +646,18 @@ void Collection::curate_results(string& actual_query, const string& filter_query
         }
     }
 
-    std::string query = actual_query;
 
     if(enable_overrides && !overrides.empty()) {
-        StringUtils::tolowercase(query);
+        std::string query;
+
+        if(actual_query == "*") {
+            query = "*";
+        } else {
+            std::vector<std::string> tokens;
+            Tokenizer tokenizer(actual_query, true, false, "", symbols_to_index, token_separators);
+            tokenizer.tokenize(tokens);
+            query = StringUtils::join(tokens, " ");
+        }
 
         for(const auto& override_kv: overrides) {
             const auto& override = override_kv.second;
@@ -1107,7 +1119,8 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                                   const size_t facet_sample_percent,
                                   const size_t facet_sample_threshold,
                                   const size_t page_offset,
-                                  const size_t vector_query_hits) const {
+                                  const size_t remote_embedding_timeout_ms,
+                                  const size_t remote_embedding_num_try) const {
 
     std::shared_lock lock(mutex);
 
@@ -1165,7 +1178,10 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
 
     vector_query_t vector_query;
     if(!vector_query_str.empty()) {
-        auto parse_vector_op = VectorQueryOps::parse_vector_query_str(vector_query_str, vector_query, this);
+        bool is_wildcard_query = (raw_query == "*" || raw_query.empty());
+
+        auto parse_vector_op = VectorQueryOps::parse_vector_query_str(vector_query_str, vector_query,
+                                                                      is_wildcard_query, this);
         if(!parse_vector_op.ok()) {
             return Option<nlohmann::json>(400, parse_vector_op.error());
         }
@@ -1175,18 +1191,17 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
             return Option<nlohmann::json>(400, "Field `" + vector_query.field_name + "` does not have a vector query index.");
         }
 
-        if(vector_field_it.value().num_dim != vector_query.values.size()) {
+        if(is_wildcard_query && vector_field_it.value().num_dim != vector_query.values.size()) {
             return Option<nlohmann::json>(400, "Query field `" + vector_query.field_name + "` must have " +
                                                std::to_string(vector_field_it.value().num_dim) + " dimensions.");
         }
     }
 
-
-
     // validate search fields
     std::vector<std::string> processed_search_fields;
     std::vector<uint32_t> query_by_weights;
-    bool has_embedding_query = false;
+    size_t num_embed_fields = 0;
+
     for(size_t i = 0; i < raw_search_fields.size(); i++) {
         const std::string& field_name = raw_search_fields[i];
         if(field_name == "id") {
@@ -1205,7 +1220,10 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
             auto search_field = search_schema.at(expanded_search_field);
 
             if(search_field.num_dim > 0) {
-                if(!vector_query.field_name.empty()) {
+                num_embed_fields++;
+
+                if(num_embed_fields > 1 ||
+                    (!vector_query.field_name.empty() && search_field.name != vector_query.field_name)) {
                     std::string error = "Only one embedding field is allowed in the query.";
                     return Option<nlohmann::json>(400, error);
                 }
@@ -1225,6 +1243,14 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                 if(!embedder_op.ok()) {
                     return Option<nlohmann::json>(400, embedder_op.error());
                 }
+
+                auto remote_embedding_timeout_us = remote_embedding_timeout_ms * 1000;
+                if((std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count() - search_begin_us) > remote_embedding_timeout_us) {
+                    std::string error = "Request timed out.";
+                    return Option<nlohmann::json>(500, error);
+                }
+
                 auto embedder = embedder_op.get();
 
                 if(embedder->is_remote()) {
@@ -1233,10 +1259,15 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                         std::string error = "Prefix search is not supported for remote embedders. Please set `prefix=false` as an additional search parameter to disable prefix searching.";
                         return Option<nlohmann::json>(400, error);
                     }
+
+                    if(remote_embedding_num_try == 0) {
+                        std::string error = "`remote-embedding-num-try` must be greater than 0.";
+                        return Option<nlohmann::json>(400, error);
+                    }
                 }
 
                 std::string embed_query = embedder_manager.get_query_prefix(search_field.embed[fields::model_config]) + raw_query;
-                auto embedding_op = embedder->Embed(embed_query);
+                auto embedding_op = embedder->Embed(embed_query, remote_embedding_timeout_ms, remote_embedding_num_try);
                 if(!embedding_op.success) {
                     if(!embedding_op.error["error"].get<std::string>().empty()) {
                         return Option<nlohmann::json>(400, embedding_op.error["error"].get<std::string>());
@@ -1245,10 +1276,9 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                     }
                 }
                 std::vector<float> embedding = embedding_op.embedding;
-                vector_query._reset();
+                // params could have been set for an embed field, so we take a backup and restore
                 vector_query.values = embedding;
                 vector_query.field_name = field_name;
-                vector_query.k = vector_query_hits;
                 continue;
             }
 
@@ -1259,9 +1289,9 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
         }
     }
 
-    std::string real_raw_query = raw_query;
-    if(!vector_query.field_name.empty() && processed_search_fields.size() == 0) {
-        raw_query = "*";
+    if(!vector_query.field_name.empty() && vector_query.values.empty() && num_embed_fields == 0) {
+        std::string error = "Vector query could not find any embedded fields.";
+        return Option<nlohmann::json>(400, error);
     }
 
     if(!query_by_weights.empty() && processed_search_fields.size() != query_by_weights.size()) {
@@ -1954,7 +1984,7 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
                 wrapper_doc["geo_distance_meters"] = geo_distances;
             }
 
-            if(!vector_query.field_name.empty() && query == "*") {
+            if(!vector_query.field_name.empty()) {
                 wrapper_doc["vector_distance"] = field_order_kv->vector_distance;
             }
 
@@ -2144,7 +2174,7 @@ Option<nlohmann::json> Collection::search(std::string  raw_query,
     result["request_params"] = nlohmann::json::object();
     result["request_params"]["collection_name"] = name;
     result["request_params"]["per_page"] = per_page;
-    result["request_params"]["q"] = real_raw_query;
+    result["request_params"]["q"] = raw_query;
 
     //long long int timeMillis = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - begin).count();
     //!LOG(INFO) << "Time taken for result calc: " << timeMillis << "us";
@@ -3817,7 +3847,7 @@ Option<bool> Collection::batch_alter_data(const std::vector<field>& alter_fields
             }
             
             Index::batch_memory_index(index, iter_batch, default_sorting_field, schema_additions, embedding_fields,
-                                      fallback_field_type, token_separators, symbols_to_index, true, false);
+                                      fallback_field_type, token_separators, symbols_to_index, true, 200, false);
 
             iter_batch.clear();
         }
@@ -4145,8 +4175,11 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
     }
 
     std::unordered_map<std::string, field> new_dynamic_fields;
+    std::vector<std::pair<size_t, size_t>> embed_json_field_indices;
+    int json_array_index = -1;
 
     for(const auto& kv: schema_changes["fields"].items()) {
+        json_array_index++;
         const std::string& field_name = kv.value()["name"].get<std::string>();
         const auto& field_it = search_schema.find(field_name);
         auto found_field = (field_it != search_schema.end());
@@ -4272,6 +4305,10 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
                     }
                 }
 
+                if(!f.embed.empty() && !diff_fields.empty()) {
+                    embed_json_field_indices.emplace_back(json_array_index, diff_fields.size()-1);
+                }
+
             } else {
                 // partial update is not supported for now
                 return Option<bool>(400, "Field `" + field_name + "` is already part of the schema: To "
@@ -4280,63 +4317,10 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
         }
     }
 
-    for(const auto& kv: schema_changes["fields"].items()) {
-        // validate embedding fields externally
-        auto& field_json = kv.value();
-        if(field_json.count(fields::embed) != 0 && !field_json[fields::embed].empty()) {
-            if(!field_json[fields::embed].is_object()) {
-                return Option<bool>(400, "Property `" + fields::embed + "` must be an object.");
-            }
-
-            if(field_json[fields::embed].count(fields::from) == 0) {
-                return Option<bool>(400, "Property `" + fields::embed + "` must contain a `" + fields::from + "` property.");
-            }
-
-            if(!field_json[fields::embed][fields::from].is_array()) {
-                return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must be an array.");
-            }
-
-            if(field_json[fields::embed][fields::from].empty()) {
-                return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must have at least one element.");
-            }
-
-            for(auto& embed_from_field : field_json[fields::embed][fields::from]) {
-                if(!embed_from_field.is_string()) {
-                    return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must contain only field names as strings.");
-                }
-            }
-
-            if(field_json[fields::type] != field_types::FLOAT_ARRAY) {
-                return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` is only allowed on a float array field.");
-            }
-
-            for(auto& embed_from_field : field_json[fields::embed][fields::from]) {
-                bool flag = false;
-                for(const auto& field : search_schema) {
-                    if(field.name == embed_from_field) {
-                        if(field.type != field_types::STRING && field.type != field_types::STRING_ARRAY) {
-                            return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` can only refer to string or string array fields.");
-                        }
-                        flag = true;
-                        break;
-                    }
-                }
-                if(!flag) {
-                    for(const auto& other_kv: schema_changes["fields"].items()) {
-                        if(other_kv.value()["name"] == embed_from_field) {
-                            if(other_kv.value()[fields::type] != field_types::STRING && other_kv.value()[fields::type] != field_types::STRING_ARRAY) {
-                                return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` can only refer to string or string array fields.");
-                            }
-                            flag = true;
-                            break;
-                        }
-                    }
-                }
-                if(!flag) {
-                    return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` can only refer to string or string array fields.");
-                }
-            } 
-        }
+    auto validation_op = field::validate_and_init_embed_fields(embed_json_field_indices, search_schema,
+                                                               schema_changes["fields"], diff_fields);
+    if(!validation_op.ok()) {
+        return validation_op;
     }
 
     if(num_auto_detect_fields > 1) {
@@ -4565,6 +4549,15 @@ Option<bool> Collection::detect_new_fields(nlohmann::json& document,
                     new_field = dynamic_field;
                     new_field.name = fname;
                     found_dynamic_field = true;
+
+                    if(kv->is_object() && dynamic_field.name.find(".*") == kv.key().size()) {
+                        // e.g. { name => price.*, type: float } to match price.USD, price.UK etc.
+                        // top-level price field should be treated as type `object` and NOT `float`.
+                        new_field.nested = true;
+                        new_field.type = field_types::OBJECT;
+                        new_field.sort = false;
+                    }
+
                     break;
                 }
             }

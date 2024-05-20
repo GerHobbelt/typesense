@@ -416,7 +416,7 @@ void Index::validate_and_preprocess(Index *index, std::vector<index_record>& ite
                                     const std::string& fallback_field_type,
                                     const std::vector<char>& token_separators,
                                     const std::vector<char>& symbols_to_index,
-                                    const bool do_validation, const bool generate_embeddings) {
+                                    const bool do_validation, const size_t remote_embedding_batch_size, const bool generate_embeddings) {
 
     // runs in a partitioned thread
     std::vector<index_record*> records_to_embed;
@@ -505,7 +505,7 @@ void Index::validate_and_preprocess(Index *index, std::vector<index_record>& ite
         }
     }
     if(generate_embeddings) {
-        batch_embed_fields(records_to_embed, embedding_fields, search_schema);
+        batch_embed_fields(records_to_embed, embedding_fields, search_schema, remote_embedding_batch_size);
     }
 }
 
@@ -516,7 +516,7 @@ size_t Index::batch_memory_index(Index *index, std::vector<index_record>& iter_b
                                  const std::string& fallback_field_type,
                                  const std::vector<char>& token_separators,
                                  const std::vector<char>& symbols_to_index,
-                                 const bool do_validation, const bool generate_embeddings) {
+                                 const bool do_validation, const size_t remote_embedding_batch_size, const bool generate_embeddings) {
 
     const size_t concurrency = 4;
     const size_t num_threads = std::min(concurrency, iter_batch.size());
@@ -546,7 +546,7 @@ size_t Index::batch_memory_index(Index *index, std::vector<index_record>& iter_b
         index->thread_pool->enqueue([&, batch_index, batch_len]() {
             write_log_index = local_write_log_index;
             validate_and_preprocess(index, iter_batch, batch_index, batch_len, default_sorting_field, search_schema,
-                                    embedding_fields, fallback_field_type, token_separators, symbols_to_index, do_validation, generate_embeddings);
+                                    embedding_fields, fallback_field_type, token_separators, symbols_to_index, do_validation, remote_embedding_batch_size, generate_embeddings);
 
             std::unique_lock<std::mutex> lock(m_process);
             num_processed++;
@@ -1862,6 +1862,9 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
             std::vector<std::string> str_tokens;
 
             while (tokenizer.next(str_token, token_index)) {
+                if (str_token.size() > 100) {
+                    str_token.erase(100);
+                }
                 str_tokens.push_back(str_token);
 
                 art_leaf* leaf = (art_leaf *) art_search(t, (const unsigned char*) str_token.c_str(),
@@ -2854,7 +2857,8 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         collate_included_ids({}, included_ids_map, curated_topster, searched_queries);
 
         if (!vector_query.field_name.empty()) {
-            auto k = std::max<size_t>(vector_query.k, fetch_size);
+            auto k = vector_query.k == 0 ? std::max<size_t>(vector_query.k, fetch_size) : vector_query.k;
+
             if(vector_query.query_doc_given) {
                 // since we will omit the query doc from results
                 k++;
@@ -3144,7 +3148,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 std::vector<std::pair<float, size_t>> dist_labels;
                 // use k as 100 by default for ensuring results stability in pagination
                 size_t default_k = 100;
-                auto k = std::max<size_t>(vector_query.k, default_k);
+                auto k = vector_query.k == 0 ? std::max<size_t>(fetch_size, default_k) : vector_query.k;
 
                 if(field_vector_index->distance_type == cosine) {
                     std::vector<float> normalized_q(vector_query.values.size());
@@ -3200,19 +3204,18 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                         auto result = result_it->second;
                         // old_score + (1 / rank_of_document) * WEIGHT)
                         result->vector_distance = vec_result.second;
-                        result->scores[result->match_score_index] = float_to_int64_t(
+                        int64_t match_score = float_to_int64_t(
                                 (int64_t_to_float(result->scores[result->match_score_index])) +
                                 ((1.0 / (res_index + 1)) * VECTOR_SEARCH_WEIGHT));
+                        int64_t match_score_index = -1;
+                        int64_t scores[3] = {0};
+                        
+                        compute_sort_scores(sort_fields_std, sort_order, field_values, geopoint_indices, doc_id, 0, match_score, scores, match_score_index, vec_result.second);
 
-                        for(size_t i = 0;i < 3; i++) {
-                            if(field_values[i] == &vector_distance_sentinel_value) {
-                                result->scores[i] = float_to_int64_t(vec_result.second);
-                            }
-
-                            if(sort_order[i] == -1) {
-                                result->scores[i] = -result->scores[i];
-                            }
+                        for(int i = 0; i < 3; i++) {
+                            result->scores[i] = scores[i];
                         }
+                        result->match_score_index = match_score_index;
 
                     } else {
                         // Result has been found only in vector search: we have to add it to both KV and result_ids
@@ -6133,7 +6136,7 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
             if(!del_field.is_single_geopoint()) {
                 spp::sparse_hash_map<uint32_t, int64_t*>* geo_array_map = geo_array_index[del_field.name];
                 for(auto& kv: *geo_array_map) {
-                    delete kv.second;
+                    delete [] kv.second;
                 }
                 delete geo_array_map;
                 geo_array_index.erase(del_field.name);
@@ -6470,7 +6473,7 @@ bool Index::common_results_exist(std::vector<art_leaf*>& leaves, bool must_match
 
 void Index::batch_embed_fields(std::vector<index_record*>& records, 
                                        const tsl::htrie_map<char, field>& embedding_fields,
-                                       const tsl::htrie_map<char, field> & search_schema) {
+                                       const tsl::htrie_map<char, field> & search_schema, const size_t remote_embedding_batch_size) {
     for(const auto& field : embedding_fields) {
         std::vector<std::pair<index_record*, std::string>> texts_to_embed;
         auto indexing_prefix = TextEmbedderManager::get_instance().get_indexing_prefix(field.embed[fields::model_config]);
@@ -6489,9 +6492,13 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                 continue;
             }
             std::string text = indexing_prefix;
-            auto embed_from = field.embed[fields::from].get<std::vector<std::string>>();
+            const auto& embed_from = field.embed[fields::from].get<std::vector<std::string>>();
             for(const auto& field_name : embed_from) {
                 auto field_it = search_schema.find(field_name);
+                auto doc_field_it = document->find(field_name);
+                if(doc_field_it == document->end()) {
+                        continue;
+                }
                 if(field_it.value().type == field_types::STRING) {
                     text += (*document)[field_name].get<std::string>() + " ";
                 } else if(field_it.value().type == field_types::STRING_ARRAY) {
@@ -6508,7 +6515,7 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
         if(texts_to_embed.empty()) {
             continue;
         }
-        
+
         TextEmbedderManager& embedder_manager = TextEmbedderManager::get_instance();
         auto embedder_op = embedder_manager.get_text_embedder(field.embed[fields::model_config]);
 
@@ -6531,7 +6538,7 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
             texts.push_back(text_to_embed.second);
         }
 
-        auto embeddings = embedder_op.get()->batch_embed(texts);
+        auto embeddings = embedder_op.get()->batch_embed(texts, remote_embedding_batch_size);
 
         for(size_t i = 0; i < embeddings.size(); i++) {
             auto& embedding_res = embeddings[i];

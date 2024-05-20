@@ -745,9 +745,14 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
     const char *DIRTY_VALUES = "dirty_values";
     const char *RETURN_DOC = "return_doc";
     const char *RETURN_ID = "return_id";
+    const char *REMOTE_EMBEDDING_BATCH_SIZE = "remote_embedding_batch_size";
 
     if(req->params.count(BATCH_SIZE) == 0) {
         req->params[BATCH_SIZE] = "40";
+    }
+
+    if(req->params.count(REMOTE_EMBEDDING_BATCH_SIZE) == 0) {
+        req->params[REMOTE_EMBEDDING_BATCH_SIZE] = "200";
     }
 
     if(req->params.count(ACTION) == 0) {
@@ -796,10 +801,18 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
     }
 
     const size_t IMPORT_BATCH_SIZE = std::stoi(req->params[BATCH_SIZE]);
+    const size_t REMOTE_EMBEDDING_BATCH_SIZE_VAL = std::stoi(req->params[REMOTE_EMBEDDING_BATCH_SIZE]);
 
     if(IMPORT_BATCH_SIZE == 0) {
         res->final = true;
         res->set_400("Parameter `" + std::string(BATCH_SIZE) + "` must be a positive integer.");
+        stream_response(req, res);
+        return false;
+    }
+
+    if(REMOTE_EMBEDDING_BATCH_SIZE_VAL == 0) {
+        res->final = true;
+        res->set_400("Parameter `" + std::string(REMOTE_EMBEDDING_BATCH_SIZE) + "` must be a positive integer.");
         stream_response(req, res);
         return false;
     }
@@ -873,7 +886,7 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
         const bool& return_doc = req->params[RETURN_DOC] == "true";
         const bool& return_id = req->params[RETURN_ID] == "true";
         nlohmann::json json_res = collection->add_many(json_lines, document, operation, "",
-                                                       dirty_values, return_doc, return_id);
+                                                       dirty_values, return_doc, return_id, REMOTE_EMBEDDING_BATCH_SIZE_VAL);
         //const std::string& import_summary_json = json_res->dump();
         //response_stream << import_summary_json << "\n";
 
@@ -930,7 +943,8 @@ bool post_add_document(const std::shared_ptr<http_req>& req, const std::shared_p
 
     nlohmann::json document;
     std::vector<std::string> json_lines = {req->body};
-    const nlohmann::json& inserted_doc_op = collection->add_many(json_lines, document, operation, "", dirty_values, false, false);
+    const nlohmann::json& inserted_doc_op = collection->add_many(json_lines, document, operation, "", dirty_values,
+                                                                 false, false);
 
     if(!inserted_doc_op["success"].get<bool>()) {
         nlohmann::json res_doc;
@@ -1385,7 +1399,9 @@ bool put_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     }
     
     override_t override;
-    Option<bool> parse_op = override_t::parse(req_json, override_id, override);
+    Option<bool> parse_op = override_t::parse(req_json, override_id, override, "",
+                                              collection->get_symbols_to_index(),
+                                              collection->get_token_separators());
     if(!parse_op.ok()) {
         res->set(parse_op.code(), parse_op.error());
         return false;
@@ -1800,7 +1816,7 @@ bool get_presets(const std::shared_ptr<http_req>& req, const std::shared_ptr<htt
 }
 
 bool get_preset(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
-    const std::string & preset_name = req->params["preset_name"];
+    const std::string & preset_name = req->params["name"];
     CollectionManager & collectionManager = CollectionManager::get_instance();
 
     nlohmann::json preset;
@@ -2078,13 +2094,25 @@ bool post_create_event(const std::shared_ptr<http_req>& req, const std::shared_p
 bool get_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     auto rules_op = AnalyticsManager::get_instance().list_rules();
 
-    if(rules_op.ok()) {
-        res->set_200(rules_op.get().dump());
-        return true;
+    if(!rules_op.ok()) {
+        res->set(rules_op.code(), rules_op.error());
+        return false;
     }
 
-    res->set(rules_op.code(), rules_op.error());
-    return false;
+    res->set_200(rules_op.get().dump());
+    return true;
+}
+
+bool get_analytics_rule(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    auto rules_op = AnalyticsManager::get_instance().get_rule(req->params["name"]);
+
+    if(!rules_op.ok()) {
+        res->set(rules_op.code(), rules_op.error());
+        return false;
+    }
+
+    res->set_200(rules_op.get().dump());
+    return true;
 }
 
 bool post_create_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
@@ -2098,7 +2126,7 @@ bool post_create_analytics_rules(const std::shared_ptr<http_req>& req, const std
         return false;
     }
 
-    auto op = AnalyticsManager::get_instance().create_rule(req_json);
+    auto op = AnalyticsManager::get_instance().create_rule(req_json, false, true);
 
     if(!op.ok()) {
         res->set(op.code(), op.error());
@@ -2109,6 +2137,29 @@ bool post_create_analytics_rules(const std::shared_ptr<http_req>& req, const std
     return true;
 }
 
+bool put_upsert_analytics_rules(const std::shared_ptr<http_req> &req, const std::shared_ptr<http_res> &res) {
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const std::exception& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    req_json["name"] = req->params["name"];
+    auto op = AnalyticsManager::get_instance().create_rule(req_json, true, true);
+
+    if(!op.ok()) {
+        res->set(op.code(), op.error());
+        return false;
+    }
+
+    res->set_200(req_json.dump());
+    return true;
+}
+
 bool del_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     auto op = AnalyticsManager::get_instance().remove_rule(req->params["name"]);
     if(!op.ok()) {
@@ -2116,10 +2167,12 @@ bool del_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared
         return false;
     }
 
-    res->set_200(R"({"ok": true)");
+    nlohmann::json res_json;
+    res_json["name"] = req->params["name"];
+
+    res->set_200(res_json.dump());
     return true;
 }
-
 
 bool post_proxy(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     HttpProxy& proxy = HttpProxy::get_instance();
