@@ -15,6 +15,12 @@ struct vector_query_t {
 
     uint32_t seq_id = 0;
     bool query_doc_given = false;
+    float alpha = 0.3;
+
+    uint32_t ef = 10;
+
+    std::vector<std::string> queries;
+    std::vector<float> query_weights;
 
     void _reset() {
         // used for testing only
@@ -31,5 +37,6 @@ class VectorQueryOps {
 public:
     static Option<bool> parse_vector_query_str(const std::string& vector_query_str, vector_query_t& vector_query,
                                                const bool is_wildcard_query,
-                                               const Collection* coll);
+                                               const Collection* coll,
+                                               const bool allow_empty_query);
 };

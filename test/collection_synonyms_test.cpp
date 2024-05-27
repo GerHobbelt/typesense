@@ -700,11 +700,12 @@ TEST_F(CollectionSynonymsTest, DeleteAndUpsertDuplicationOfSynonms) {
     coll_mul_fields->add_synonym(R"({"id": "ipod-synonyms", "root": "ipod", "synonyms": ["i pod", "ipod"]})"_json);
     coll_mul_fields->add_synonym(R"({"id": "samsung-synonyms", "root": "s3", "synonyms": ["s3 phone", "samsung"]})"_json);
 
-    ASSERT_EQ(2, coll_mul_fields->get_synonyms().size());
+    ASSERT_EQ(2, coll_mul_fields->get_synonyms().get().size());
     coll_mul_fields->remove_synonym("ipod-synonyms");
 
-    ASSERT_EQ(1, coll_mul_fields->get_synonyms().size());
-    ASSERT_STREQ("samsung-synonyms", coll_mul_fields->get_synonyms()["samsung-synonyms"].id.c_str());
+    auto synonyms = coll_mul_fields->get_synonyms().get();
+    ASSERT_EQ(1, synonyms.size());
+    ASSERT_EQ("samsung-synonyms", synonyms.begin()->second->id);
 
     // try to upsert synonym with same ID
 
@@ -712,7 +713,7 @@ TEST_F(CollectionSynonymsTest, DeleteAndUpsertDuplicationOfSynonms) {
                                                     "synonyms": ["s3 phone", "samsung"]})"_json);
     ASSERT_TRUE(upsert_op.ok());
 
-    ASSERT_EQ(1, coll_mul_fields->get_synonyms().size());
+    ASSERT_EQ(1, coll_mul_fields->get_synonyms().get().size());
 
     synonym_t synonym2_updated;
     coll_mul_fields->get_synonym("samsung-synonyms", synonym2_updated);
@@ -721,7 +722,7 @@ TEST_F(CollectionSynonymsTest, DeleteAndUpsertDuplicationOfSynonms) {
     ASSERT_EQ("smartphone", synonym2_updated.root[1]);
 
     coll_mul_fields->remove_synonym("samsung-synonyms");
-    ASSERT_EQ(0, coll_mul_fields->get_synonyms().size());
+    ASSERT_EQ(0, coll_mul_fields->get_synonyms().get().size());
 }
 
 TEST_F(CollectionSynonymsTest, SynonymJsonSerialization) {
@@ -1007,4 +1008,437 @@ TEST_F(CollectionSynonymsTest, SynonymForKorean) {
 
     res = coll1->search("구울", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {true}, 0).get();
     ASSERT_EQ(3, res["hits"].size());
+}
+
+TEST_F(CollectionSynonymsTest, MultipleSynonymSubstitution) {
+    nlohmann::json schema = R"({
+        "name": "coll2",
+        "fields": [
+          {"name": "title", "type": "string"},
+          {"name": "gender", "type": "string"}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll2 = op.get();
+
+    std::vector<std::vector<std::string>> records = {
+            {"Beautiful Blazer", "Male"},
+    };
+
+    for(size_t i=0; i<records.size(); i++) {
+        nlohmann::json doc;
+
+        doc["id"] = std::to_string(i);
+        doc["title"] = records[i][0];
+        doc["gender"] = records[i][1];
+
+        auto add_op = coll2->add(doc.dump());
+        ASSERT_TRUE(add_op.ok());
+    }
+
+    nlohmann::json synonym1 = R"({
+        "id": "foobar",
+        "synonyms": ["blazer", "suit"]
+    })"_json;
+
+    nlohmann::json synonym2 = R"({
+        "id": "foobar2",
+        "synonyms": ["male", "man"]
+    })"_json;
+
+
+    ASSERT_TRUE(coll2->add_synonym(synonym1).ok());
+    ASSERT_TRUE(coll2->add_synonym(synonym2).ok());
+
+    auto res = coll2->search("blazer male", {"title", "gender"}, "", {},
+                             {}, {0}, 10, 1, FREQUENCY, {true},0).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    res = coll2->search("blazer man", {"title", "gender"}, "", {},
+                             {}, {0}, 10, 1, FREQUENCY, {true}, 0).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    res = coll2->search("suit male", {"title", "gender"}, "", {},
+                             {}, {0}, 10, 1, FREQUENCY, {true}, 0).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    res = coll2->search("suit man", {"title", "gender"}, "", {},
+                             {}, {0}, 10, 1, FREQUENCY, {true}, 0).get();
+    ASSERT_EQ(1, res["hits"].size());
+}
+
+TEST_F(CollectionSynonymsTest, EnableSynonymFlag) {
+    nlohmann::json schema = R"({
+        "name": "coll2",
+        "fields": [
+          {"name": "title", "type": "string"},
+          {"name": "gender", "type": "string"}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll2 = op.get();
+
+    std::vector<std::vector<std::string>> records = {
+            {"Beautiful Blazer", "Male"},
+    };
+
+    for(size_t i=0; i<records.size(); i++) {
+        nlohmann::json doc;
+
+        doc["id"] = std::to_string(i);
+        doc["title"] = records[i][0];
+        doc["gender"] = records[i][1];
+
+        auto add_op = coll2->add(doc.dump());
+        ASSERT_TRUE(add_op.ok());
+    }
+
+    nlohmann::json synonym1 = R"({
+        "id": "foobar",
+        "synonyms": ["blazer", "suit"]
+    })"_json;
+
+    nlohmann::json synonym2 = R"({
+        "id": "foobar2",
+        "synonyms": ["male", "man"]
+    })"_json;
+
+
+    ASSERT_TRUE(coll2->add_synonym(synonym1).ok());
+    ASSERT_TRUE(coll2->add_synonym(synonym2).ok());
+    bool enable_synonyms = true;
+
+    auto res = coll2->search("suit man", {"title", "gender"}, "", {},
+                           {}, {2}, 10, 1,FREQUENCY, {true},
+                           Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                           spp::sparse_hash_set<std::string>(), 10, "",
+                           30, 4, "", 40,
+                           {}, {}, {}, 0,"<mark>",
+                           "</mark>", {}, 1000,true,
+                           false, true, "", false,
+                           6000*1000, 4, 7, fallback, 4,
+                           {off}, INT16_MAX, INT16_MAX,2,
+                           2, false, "", true,
+                           0, max_score, 100, 0, 0,
+                           HASH, 30000, 2, "",
+                           {},{}, "right_to_left", true,
+                           true, false, "", "", "",
+                           "", false, enable_synonyms).get();
+
+    ASSERT_EQ(1, res["hits"].size());
+
+    enable_synonyms = false;
+    res = coll2->search("suit man", {"title", "gender"}, "", {},
+                        {}, {2}, 10, 1,FREQUENCY, {true},
+                        Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                        spp::sparse_hash_set<std::string>(), 10, "",
+                        30, 4, "", 40,
+                        {}, {}, {}, 0,"<mark>",
+                        "</mark>", {}, 1000,true,
+                        false, true, "", false,
+                        6000*1000, 4, 7, fallback, 4,
+                        {off}, INT16_MAX, INT16_MAX,2,
+                        2, false, "", true,
+                        0, max_score, 100, 0, 0,
+                        HASH, 30000, 2, "",
+                        {},{}, "right_to_left", true,
+                        true, false, "", "", "",
+                        "", false, enable_synonyms).get();
+
+    ASSERT_EQ(0, res["hits"].size());
+}
+
+TEST_F(CollectionSynonymsTest, SynonymTypos) {
+    nlohmann::json schema = R"({
+        "name": "coll3",
+        "fields": [
+          {"name": "title", "type": "string"}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection *coll3 = op.get();
+
+    nlohmann::json doc;
+    doc["id"] = "0";
+    doc["title"] = "Cool Trousers";
+
+    auto add_op = coll3->add(doc.dump());
+    ASSERT_TRUE(add_op.ok());
+
+    nlohmann::json synonym1 = R"({
+        "id": "foobar",
+        "synonyms": ["trousers", "pants"]
+    })"_json;
+
+    ASSERT_TRUE(coll3->add_synonym(synonym1).ok());
+
+    auto res = coll3->search("trousers", {"title"}, "", {},
+                             {}, {0}, 10, 1, FREQUENCY, {true},0).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    res = coll3->search("pants", {"title"}, "", {},
+                        {}, {0}, 10, 1, FREQUENCY, {true}, 0).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    //try with typos
+    uint32_t synonym_num_typos = 0;
+    res = coll3->search("patns", {"title"}, "", {},
+                        {}, {2}, 10, 1,FREQUENCY, {true},
+                        Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                        spp::sparse_hash_set<std::string>(), 10, "",
+                        30, 4, "", 40,
+                        {}, {}, {}, 0,"<mark>",
+                        "</mark>", {}, 1000,true,
+                        false, true, "", false,
+                        6000*1000, 4, 7, fallback, 4,
+                        {off}, INT16_MAX, INT16_MAX,2,
+                        2, false, "", true,
+                        0, max_score, 100, 0, 0,
+                        HASH, 30000, 2, "",
+                        {},{}, "right_to_left", true,
+                        true, false, "", "", "",
+                        "", false, true, false, synonym_num_typos).get();
+    ASSERT_EQ(0, res["hits"].size());
+
+    synonym_num_typos = 2;
+
+    res = coll3->search("patns", {"title"}, "", {},
+                        {}, {2}, 10, 1,FREQUENCY, {true},
+                        Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                        spp::sparse_hash_set<std::string>(), 10, "",
+                        30, 4, "", 40,
+                        {}, {}, {}, 0,"<mark>",
+                        "</mark>", {}, 1000,true,
+                        false, true, "", false,
+                        6000*1000, 4, 7, fallback, 4,
+                        {off}, INT16_MAX, INT16_MAX,2,
+                        2, false, "", true,
+                        0, max_score, 100, 0, 0,
+                        HASH, 30000, 2, "",
+                        {},{}, "right_to_left", true,
+                        true, false, "", "", "",
+                        "", false, true, false, synonym_num_typos).get();
+    ASSERT_EQ(1, res["hits"].size());
+
+    //max 2 typos supported
+    synonym_num_typos = 3;
+    auto search_op = coll3->search("trosuers", {"title"}, "", {},
+                        {}, {2}, 10, 1,FREQUENCY, {true},
+                        Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                        spp::sparse_hash_set<std::string>(), 10, "",
+                        30, 4, "", 40,
+                        {}, {}, {}, 0,"<mark>",
+                        "</mark>", {}, 1000,true,
+                        false, true, "", false,
+                        6000*1000, 4, 7, fallback, 4,
+                        {off}, INT16_MAX, INT16_MAX,2,
+                        2, false, "", true,
+                        0, max_score, 100, 0, 0,
+                        HASH, 30000, 2, "",
+                        {},{}, "right_to_left", true,
+                        true, false, "", "", "",
+                        "", false, true, false, synonym_num_typos);
+
+    ASSERT_FALSE(search_op.ok());
+    ASSERT_EQ("Value of `synonym_num_typos` must not be greater than 2.",search_op.error());
+}
+
+TEST_F(CollectionSynonymsTest, SynonymPrefix) {
+    nlohmann::json schema = R"({
+        "name": "coll3",
+        "fields": [
+          {"name": "title", "type": "string"}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection *coll3 = op.get();
+
+    nlohmann::json doc;
+    doc["id"] = "0";
+    doc["title"] = "Cool Trousers";
+    auto add_op = coll3->add(doc.dump());
+    ASSERT_TRUE(add_op.ok());
+
+    doc["id"] = "1";
+    doc["title"] = "Cool Pants";
+    add_op = coll3->add(doc.dump());
+    ASSERT_TRUE(add_op.ok());
+
+    nlohmann::json synonym1 = R"({
+        "id": "foobar",
+        "synonyms": ["trousers", "pants"]
+    })"_json;
+
+    ASSERT_TRUE(coll3->add_synonym(synonym1).ok());
+
+    bool synonym_prefix = false;
+
+    auto res = coll3->search("pan", {"title"}, "", {},
+                                   {}, {2}, 10, 1,FREQUENCY, {false},
+                                   Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                                   spp::sparse_hash_set<std::string>(), 10, "",
+                                   30, 4, "", 40,
+                                   {}, {}, {}, 0,"<mark>",
+                                   "</mark>", {}, 1000,true,
+                                   false, true, "", false,
+                                   6000*1000, 4, 7, fallback, 4,
+                                   {off}, INT16_MAX, INT16_MAX,2,
+                                   2, false, "", true,
+                                   0, max_score, 100, 0, 0,
+                                   HASH, 30000, 2, "",
+                                   {},{}, "right_to_left", true,
+                                   true, false, "", "", "",
+                                   "", false, true, synonym_prefix).get();
+
+    ASSERT_EQ(0, res["hits"].size());
+
+    synonym_prefix = true;
+
+    res = coll3->search("pan", {"title"}, "", {},
+                             {}, {2}, 10, 1,FREQUENCY, {false},
+                             Index::DROP_TOKENS_THRESHOLD, spp::sparse_hash_set<std::string>(),
+                             spp::sparse_hash_set<std::string>(), 10, "",
+                             30, 4, "", 40,
+                             {}, {}, {}, 0,"<mark>",
+                             "</mark>", {}, 1000,true,
+                             false, true, "", false,
+                             6000*1000, 4, 7, fallback, 4,
+                             {off}, INT16_MAX, INT16_MAX,2,
+                             2, false, "", true,
+                             0, max_score, 100, 0, 0,
+                             HASH, 30000, 2, "",
+                             {},{}, "right_to_left", true,
+                             true, false, "", "", "",
+                             "", false, true, synonym_prefix).get();
+
+    ASSERT_EQ(2, res["hits"].size());
+}
+
+TEST_F(CollectionSynonymsTest, SynonymsPagination) {
+    Collection *coll3;
+
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll3 = collectionManager.get_collection("coll3").get();
+    if (coll3 == nullptr) {
+        coll3 = collectionManager.create_collection("coll3", 1, fields, "points").get();
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        nlohmann::json synonym_json = R"(
+                {
+                    "id": "foobar",
+                    "synonyms": ["blazer", "suit"]
+                })"_json;
+
+        synonym_json["id"] = synonym_json["id"].get<std::string>() + std::to_string(i + 1);
+
+        coll3->add_synonym(synonym_json);
+    }
+
+    uint32_t limit = 0, offset = 0;
+
+    //limit collections by 2
+    limit = 2;
+    auto synonym_op = coll3->get_synonyms(limit);
+    auto synonym_map = synonym_op.get();
+    auto it = synonym_map.begin();
+    ASSERT_EQ(2, synonym_map.size());
+    ASSERT_EQ("foobar1", it->second->id); it++;
+    ASSERT_EQ("foobar2", it->second->id);
+
+    //get 2 collection from offset 3
+    offset = 3;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    synonym_map = synonym_op.get();
+    it = synonym_map.begin();
+    ASSERT_EQ(2, synonym_map.size());
+    ASSERT_EQ("foobar4", it->second->id); it++;
+    ASSERT_EQ("foobar5", it->second->id);
+
+    //get all collection except first
+    offset = 1;
+    limit = 0;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    synonym_map = synonym_op.get();
+    it = synonym_map.begin();
+    ASSERT_EQ(4, synonym_map.size());
+    ASSERT_EQ("foobar2", it->second->id); it++;
+    ASSERT_EQ("foobar3", it->second->id); it++;
+    ASSERT_EQ("foobar4", it->second->id); it++;
+    ASSERT_EQ("foobar5", it->second->id); it++;
+
+    //get last collection
+    offset = 4, limit = 1;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    synonym_map = synonym_op.get();
+    it = synonym_map.begin();
+    ASSERT_EQ(1, synonym_map.size());
+    ASSERT_EQ("foobar5", it->second->id);
+
+    //if limit is greater than number of collection then return all from offset
+    offset = 0;
+    limit = 8;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    synonym_map = synonym_op.get();
+    it = synonym_map.begin();
+    ASSERT_EQ(5, synonym_map.size());
+    ASSERT_EQ("foobar1", it->second->id); it++;
+    ASSERT_EQ("foobar2", it->second->id); it++;
+    ASSERT_EQ("foobar3", it->second->id); it++;
+    ASSERT_EQ("foobar4", it->second->id); it++;
+    ASSERT_EQ("foobar5", it->second->id); it++;
+
+    offset = 3;
+    limit = 4;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    synonym_map = synonym_op.get();
+    it = synonym_map.begin();
+    ASSERT_EQ(2, synonym_map.size());
+    ASSERT_EQ("foobar4", it->second->id); it++;
+    ASSERT_EQ("foobar5", it->second->id);
+
+    //invalid offset
+    offset = 6;
+    limit = 0;
+    synonym_op = coll3->get_synonyms(limit, offset);
+    ASSERT_FALSE(synonym_op.ok());
+    ASSERT_EQ("Invalid offset param.", synonym_op.error());
+}
+
+TEST_F(CollectionSynonymsTest, SynonymWithStemming) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "fields": [
+            {"name": "name", "type": "string", "stem": true}
+        ]
+    })"_json;
+
+    auto coll1 = collectionManager.create_collection(schema).get();
+    std::vector<std::string> records  = {"k8s", "kubernetes"};
+
+    for(size_t i = 0; i < records.size(); i++) {
+        nlohmann::json doc;
+        doc["id"] = std::to_string(i);
+        doc["name"] = records[i];
+        ASSERT_TRUE(coll1->add(doc.dump()).ok());
+    }
+
+    coll1->add_synonym(R"({"id": "syn-1", "synonyms": ["k8s", "kubernetes"]})"_json);
+
+    auto res = coll1->search("k8s", {"name"}, "", {}, {}, {2}, 10, 1, FREQUENCY, {true}, 0).get();
+
+    ASSERT_EQ(2, res["hits"].size());
+    ASSERT_EQ(2, res["found"].get<uint32_t>());
+
+    collectionManager.drop_collection("coll1");
 }

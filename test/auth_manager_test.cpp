@@ -4,6 +4,7 @@
 #include <http_data.h>
 #include "auth_manager.h"
 #include "core_api.h"
+#include <collection_manager.h>
 
 static const size_t FUTURE_TS = 64723363199;
 
@@ -11,6 +12,8 @@ class AuthManagerTest : public ::testing::Test {
 protected:
     Store *store;
     AuthManager auth_manager;
+    CollectionManager& collectionManager = CollectionManager::get_instance();
+    std::atomic<bool> quit = false;
 
     void setupCollection() {
         std::string state_dir_path = "/tmp/typesense_test/auth_manager_test_db";
@@ -18,6 +21,8 @@ protected:
 
         store = new Store(state_dir_path);
         auth_manager.init(store, "bootstrap-key");
+        collectionManager.init(store, 1.0, "auth_key", quit);
+        collectionManager.load(8, 1000);
     }
 
     virtual void SetUp() {
@@ -266,20 +271,34 @@ TEST_F(AuthManagerTest, GenerationOfAPIAction) {
     route_path rpath_coll_create = route_path("POST", {"collections"}, nullptr, false, false);
     route_path rpath_coll_get = route_path("GET", {"collections", ":collection"}, nullptr, false, false);
     route_path rpath_coll_list = route_path("GET", {"collections"}, nullptr, false, false);
+    route_path rpath_coll_import = route_path("POST", {"collections", ":collection", "documents", "import"}, nullptr, false, false);
+    route_path rpath_coll_export = route_path("GET", {"collections", ":collection", "documents", "export"}, nullptr, false, false);
     route_path rpath_keys_post = route_path("POST", {"keys"}, nullptr, false, false);
     route_path rpath_doc_delete = route_path("DELETE", {"collections", ":collection", "documents", ":id"}, nullptr, false, false);
     route_path rpath_override_upsert = route_path("PUT", {"collections", ":collection", "overrides", ":id"}, nullptr, false, false);
     route_path rpath_doc_patch = route_path("PATCH", {"collections", ":collection", "documents", ":id"}, nullptr, false, false);
+    route_path rpath_analytics_rules_list = route_path("GET", {"analytics", "rules"}, nullptr, false, false);
+    route_path rpath_analytics_rules_get = route_path("GET", {"analytics", "rules", ":id"}, nullptr, false, false);
+    route_path rpath_analytics_rules_put = route_path("PUT", {"analytics", "rules", ":id"}, nullptr, false, false);
+    route_path rpath_ops_cache_clear_post = route_path("POST", {"operations", "cache", "clear"}, nullptr, false, false);
+    route_path rpath_conv_models_list = route_path("GET", {"conversations", "models"}, nullptr, false, false);
 
     ASSERT_STREQ("documents:search", rpath_search._get_action().c_str());
     ASSERT_STREQ("documents:search", rpath_multi_search._get_action().c_str());
     ASSERT_STREQ("collections:create", rpath_coll_create._get_action().c_str());
     ASSERT_STREQ("collections:get", rpath_coll_get._get_action().c_str());
+    ASSERT_STREQ("documents:import", rpath_coll_import._get_action().c_str());
+    ASSERT_STREQ("documents:export", rpath_coll_export._get_action().c_str());
     ASSERT_STREQ("collections:list", rpath_coll_list._get_action().c_str());
     ASSERT_STREQ("keys:create", rpath_keys_post._get_action().c_str());
     ASSERT_STREQ("documents:delete", rpath_doc_delete._get_action().c_str());
     ASSERT_STREQ("overrides:upsert", rpath_override_upsert._get_action().c_str());
     ASSERT_STREQ("documents:update", rpath_doc_patch._get_action().c_str());
+    ASSERT_STREQ("analytics/rules:list", rpath_analytics_rules_list._get_action().c_str());
+    ASSERT_STREQ("analytics/rules:get", rpath_analytics_rules_get._get_action().c_str());
+    ASSERT_STREQ("analytics/rules:upsert", rpath_analytics_rules_put._get_action().c_str());
+    ASSERT_STREQ("operations/cache/clear:create", rpath_ops_cache_clear_post._get_action().c_str());
+    ASSERT_STREQ("conversations/models:list", rpath_conv_models_list._get_action().c_str());
 }
 
 TEST_F(AuthManagerTest, ScopedAPIKeys) {
@@ -464,4 +483,126 @@ TEST_F(AuthManagerTest, ValidateBadKeyProperties) {
     validate_op = api_key_t::validate(key_obj4);
     ASSERT_FALSE(validate_op.ok());
     ASSERT_STREQ("Key description must be a string.", validate_op.error().c_str());
+}
+
+TEST_F(AuthManagerTest, AutoDeleteKeysOnExpiry) {
+    auto list_op = auth_manager.list_keys();
+    ASSERT_TRUE(list_op.ok());
+    ASSERT_EQ(0, list_op.get().size());
+
+    //regular key(future ts)
+    api_key_t api_key1("abcd", "test key 1", {"read", "write"}, {"collection1", "collection2"}, FUTURE_TS);
+
+    //key is expired (past ts)
+    uint64_t PAST_TS = uint64_t(std::time(0)) - 100;
+    api_key_t api_key2("wxyz", "test key 2", {"admin"}, {"*"}, PAST_TS, true);
+
+    auto insert_op = auth_manager.create_key(api_key1);
+    ASSERT_TRUE(insert_op.ok());
+    ASSERT_EQ(4, insert_op.get().value.size());
+
+    insert_op = auth_manager.create_key(api_key2);
+    ASSERT_TRUE(insert_op.ok());
+    ASSERT_EQ(4, insert_op.get().value.size());
+
+    list_op = auth_manager.list_keys();
+    ASSERT_TRUE(list_op.ok());
+    auto keys = list_op.get();
+    ASSERT_EQ(2, keys.size());
+    ASSERT_EQ("abcd", keys[0].value);
+    ASSERT_EQ("wxyz", keys[1].value);
+
+    auth_manager.do_housekeeping();
+
+    list_op = auth_manager.list_keys();
+    ASSERT_TRUE(list_op.ok());
+    keys = list_op.get();
+    ASSERT_EQ(1, keys.size());
+    ASSERT_EQ("abcd", keys[0].value);
+}
+
+TEST_F(AuthManagerTest, CollectionsByScope) {
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    auto scoped_key_json = R"({
+        "description": "Write key",
+        "actions": [ "collections:*", "documents:*", "synonyms:*" ],
+        "collections": [ "collection_.*" ],
+        "value": "3859c47b98"
+    })"_json;
+
+    req->body =scoped_key_json.dump();
+    ASSERT_TRUE(post_create_key(req, res));
+
+    auto schema1 = R"({
+        "name": "collection_1",
+        "fields": [
+            {"name": "title", "type": "string", "locale": "en"},
+            {"name": "points", "type": "int32"}
+        ]
+    })"_json;
+
+    collectionManager.create_collection(schema1);
+
+    auto schema2 = R"({
+        "name": "collection2",
+        "fields": [
+            {"name": "title", "type": "string", "locale": "en"},
+            {"name": "points", "type": "int32"}
+        ]
+    })"_json;
+
+    collectionManager.create_collection(schema2);
+
+
+    req->api_auth_key = "3859c47b98";
+    get_collections(req, res);
+    auto result_json = nlohmann::json::parse(res->body);
+
+    ASSERT_EQ(1, result_json.size());
+    ASSERT_EQ("collection_1", result_json[0]["name"]);
+
+    req->api_auth_key.clear();
+    get_collections(req, res);
+    result_json = nlohmann::json::parse(res->body);
+
+    ASSERT_EQ(2, result_json.size());
+    ASSERT_EQ("collection2", result_json[0]["name"]);
+    ASSERT_EQ("collection_1", result_json[1]["name"]);
+
+    scoped_key_json = R"({
+        "description": "Write key",
+        "actions": [ "collections:*", "documents:*", "synonyms:*" ],
+        "collections": [ "collection2" ],
+        "value": "b78a573a1a"
+    })"_json;
+
+    req->body =scoped_key_json.dump();
+    ASSERT_TRUE(post_create_key(req, res));
+
+    req->api_auth_key = "b78a573a1a";
+    get_collections(req, res);
+    result_json = nlohmann::json::parse(res->body);
+
+    ASSERT_EQ(1, result_json.size());
+    ASSERT_EQ("collection2", result_json[0]["name"]);
+
+    scoped_key_json = R"({
+        "description": "Write key",
+        "actions": [ "collections:*", "documents:*", "synonyms:*" ],
+        "collections": [ "*" ],
+        "value": "00071e2108"
+    })"_json;
+
+    req->body =scoped_key_json.dump();
+    ASSERT_TRUE(post_create_key(req, res));
+
+    req->api_auth_key = "00071e2108";
+    get_collections(req, res);
+    result_json = nlohmann::json::parse(res->body);
+
+    ASSERT_EQ(2, result_json.size());
+    ASSERT_EQ("collection2", result_json[0]["name"]);
+    ASSERT_EQ("collection_1", result_json[1]["name"]);
 }

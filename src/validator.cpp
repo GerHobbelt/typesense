@@ -10,10 +10,13 @@ Option<uint32_t> validator_t::coerce_element(const field& a_field, nlohmann::jso
     bool array_ele_erased = false;
     nlohmann::json::iterator dummy_iter;
 
-    if(a_field.type == field_types::STRING && !doc_ele.is_string()) {
-        Option<uint32_t> coerce_op = coerce_string(dirty_values, fallback_field_type, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-        if(!coerce_op.ok()) {
-            return coerce_op;
+    if(a_field.type == field_types::STRING) {
+        if(!doc_ele.is_string()) {
+            Option<uint32_t> coerce_op = coerce_string(dirty_values, fallback_field_type, a_field, document,
+                                                       field_name, dummy_iter, false, array_ele_erased);
+            if(!coerce_op.ok()) {
+                return coerce_op;
+            }
         }
     } else if(a_field.type == field_types::INT32) {
         if(!doc_ele.is_number_integer()) {
@@ -22,21 +25,27 @@ Option<uint32_t> validator_t::coerce_element(const field& a_field, nlohmann::jso
                 return coerce_op;
             }
         }
-    } else if(a_field.type == field_types::INT64 && !doc_ele.is_number_integer()) {
-        Option<uint32_t> coerce_op = coerce_int64_t(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-        if(!coerce_op.ok()) {
-            return coerce_op;
+    } else if(a_field.type == field_types::INT64) {
+        if(!doc_ele.is_number_integer()) {
+            Option<uint32_t> coerce_op = coerce_int64_t(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
+            if(!coerce_op.ok()) {
+                return coerce_op;
+            }
         }
-    } else if(a_field.type == field_types::FLOAT && !doc_ele.is_number()) {
-        // using `is_number` allows integer to be passed to a float field
-        Option<uint32_t> coerce_op = coerce_float(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-        if(!coerce_op.ok()) {
-            return coerce_op;
+    } else if(a_field.type == field_types::FLOAT) {
+        if(!doc_ele.is_number()) {
+            // using `is_number` allows integer to be passed to a float field
+            Option<uint32_t> coerce_op = coerce_float(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
+            if(!coerce_op.ok()) {
+                return coerce_op;
+            }
         }
-    } else if(a_field.type == field_types::BOOL && !doc_ele.is_boolean()) {
-        Option<uint32_t> coerce_op = coerce_bool(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
-        if(!coerce_op.ok()) {
-            return coerce_op;
+    } else if(a_field.type == field_types::BOOL) {
+        if(!doc_ele.is_boolean()) {
+            Option<uint32_t> coerce_op = coerce_bool(dirty_values, a_field, document, field_name, dummy_iter, false, array_ele_erased);
+            if(!coerce_op.ok()) {
+                return coerce_op;
+            }
         }
     } else if(a_field.type == field_types::GEOPOINT) {
         if(!doc_ele.is_array() || doc_ele.size() != 2) {
@@ -54,8 +63,9 @@ Option<uint32_t> validator_t::coerce_element(const field& a_field, nlohmann::jso
         }
     } else if(a_field.is_array()) {
         if(!doc_ele.is_array()) {
-            if(a_field.optional && (dirty_values == DIRTY_VALUES::DROP ||
-                                    dirty_values == DIRTY_VALUES::COERCE_OR_DROP)) {
+            bool is_auto_embedding = a_field.type == field_types::FLOAT_ARRAY && a_field.embed.count(fields::from) > 0;
+            if((a_field.optional && (dirty_values == DIRTY_VALUES::DROP ||
+                                    dirty_values == DIRTY_VALUES::COERCE_OR_DROP)) || is_auto_embedding) {
                 document.erase(field_name);
                 return Option<uint32_t>(200);
             } else {
@@ -317,6 +327,16 @@ Option<uint32_t> validator_t::coerce_int64_t(const DIRTY_VALUES& dirty_values, c
                                        nlohmann::json::iterator& array_iter, bool is_array, bool& array_ele_erased) {
     std::string suffix = is_array ? "an array of" : "an";
     auto& item = is_array ? array_iter.value() : document[field_name];
+
+    // Object array reference helper field. It's not provided by the user.
+    if(is_array && a_field.nested && a_field.is_reference_helper) {
+        // It's an array of two uint32_t values indicating the object index and referenced doc id respectively.
+        if(item.size() != 2 || !item.at(0).is_number_unsigned() || !item.at(1).is_number_unsigned()) {
+            return Option<>(400, "`" + field_name + "` object array reference helper field has wrong value `"
+                                 + item.dump() + "`.");
+        }
+        return Option<uint32_t>(200);
+    }
 
     if(dirty_values == DIRTY_VALUES::REJECT) {
         if(a_field.nested && item.is_array()) {
@@ -631,7 +651,9 @@ Option<uint32_t> validator_t::validate_index_in_memory(nlohmann::json& document,
             continue;
         }
 
-        if(document.count(field_name) == 0) {
+        bool is_auto_embedding = a_field.type == field_types::FLOAT_ARRAY && a_field.embed.count(fields::from) > 0;
+
+        if(document.count(field_name) == 0 && !is_auto_embedding) {
             return Option<>(400, "Field `" + field_name  + "` has been declared in the schema, "
                                                            "but is not found in the document.");
         }

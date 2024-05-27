@@ -53,7 +53,7 @@ class CollectionManager {
 private:
     mutable std::shared_mutex mutex;
 
-    mutable std::mutex coll_create_mutex;
+    mutable std::shared_mutex noop_coll_mutex;
 
     Store *store;
     ThreadPool* thread_pool;
@@ -78,8 +78,6 @@ private:
 
     std::atomic<bool>* quit;
 
-    BatchedIndexer* batch_indexer;
-
     // All the references to a particular collection are stored until it is created.
     std::map<std::string, std::set<reference_pair>> referenced_in_backlog;
 
@@ -103,7 +101,8 @@ public:
     static constexpr const char* NEXT_COLLECTION_ID_KEY = "$CI";
     static constexpr const char* SYMLINK_PREFIX = "$SL";
     static constexpr const char* PRESET_PREFIX = "$PS";
-    static constexpr const char* BATCHED_INDEXER_STATE_KEY = "$BI";
+
+    uint16_t filter_by_max_ops;
 
     static CollectionManager & get_instance() {
         static CollectionManager instance;
@@ -113,31 +112,47 @@ public:
     CollectionManager(CollectionManager const&) = delete;
     void operator=(CollectionManager const&) = delete;
 
+    struct ref_include_collection_names_t {
+        std::set<std::string> collection_names;
+        ref_include_collection_names_t* nested_include = nullptr;
+
+        ~ref_include_collection_names_t() {
+            delete nested_include;
+        }
+    };
+
     static Collection* init_collection(const nlohmann::json & collection_meta,
                                        const uint32_t collection_next_seq_id,
                                        Store* store,
-                                       float max_memory_ratio);
+                                       float max_memory_ratio,
+                                       spp::sparse_hash_map<std::string, std::string>& referenced_in);
 
     static Option<bool> load_collection(const nlohmann::json& collection_meta,
                                         const size_t batch_size,
                                         const StoreStatus& next_coll_id_status,
-                                        const std::atomic<bool>& quit);
+                                        const std::atomic<bool>& quit,
+                                        spp::sparse_hash_map<std::string, std::string>& referenced_in);
 
     Option<Collection*> clone_collection(const std::string& existing_name, const nlohmann::json& req_json);
 
     void add_to_collections(Collection* collection);
 
-    std::vector<Collection*> get_collections() const;
+    Option<std::vector<Collection*>> get_collections(uint32_t limit = 0, uint32_t offset = 0,
+                                                     const std::vector<std::string>& api_key_collections = {}) const;
+
+    std::vector<std::string> get_collection_names() const;
 
     Collection* get_collection_unsafe(const std::string & collection_name) const;
 
     // PUBLICLY EXPOSED API
 
     void init(Store *store, ThreadPool* thread_pool, const float max_memory_ratio,
-              const std::string & auth_key, std::atomic<bool>& quit, BatchedIndexer* batch_indexer);
+              const std::string & auth_key, std::atomic<bool>& quit,
+              const uint16_t& filter_by_max_operations = Config::FILTER_BY_DEFAULT_OPERATIONS);
 
     // only for tests!
-    void init(Store *store, const float max_memory_ratio, const std::string & auth_key, std::atomic<bool>& exit);
+    void init(Store *store, const float max_memory_ratio, const std::string & auth_key, std::atomic<bool>& exit,
+              const uint16_t& filter_by_max_operations = Config::FILTER_BY_DEFAULT_OPERATIONS);
 
     Option<bool> load(const size_t collection_batch_size, const size_t document_batch_size);
 
@@ -158,15 +173,19 @@ public:
                                           const std::string& fallback_field_type = "",
                                           const std::vector<std::string>& symbols_to_index = {},
                                           const std::vector<std::string>& token_separators = {},
-                                          const bool enable_nested_fields = false);
+                                          const bool enable_nested_fields = false, std::shared_ptr<VQModel> model = nullptr,
+                                          const nlohmann::json& metadata = {});
 
     locked_resource_view_t<Collection> get_collection(const std::string & collection_name) const;
 
     locked_resource_view_t<Collection> get_collection_with_id(uint32_t collection_id) const;
 
-    nlohmann::json get_collection_summaries() const;
+    Option<nlohmann::json> get_collection_summaries(uint32_t limit = 0 , uint32_t offset = 0,
+                                                    const std::vector<std::string>& api_key_collections = {}) const;
 
-    Option<nlohmann::json> drop_collection(const std::string& collection_name, const bool remove_from_store = true);
+    Option<nlohmann::json> drop_collection(const std::string& collection_name,
+                                           const bool remove_from_store = true,
+                                           const bool compact_store = true);
 
     uint32_t get_next_collection_id() const;
 
@@ -206,9 +225,24 @@ public:
     Option<bool> delete_preset(const std::string & preset_name);
 
     static void _get_reference_collection_names(const std::string& filter_query,
-                                                std::set<std::string>& reference_collection_names);
+                                                ref_include_collection_names_t*& reference_collection_names);
+
+    // Separate out the reference includes and excludes into `ref_include_exclude_fields_vec`.
+    static Option<bool> _initialize_ref_include_exclude_fields_vec(const std::string& filter_query,
+                                                                   std::vector<std::string>& include_fields_vec,
+                                                                   std::vector<std::string>& exclude_fields_vec,
+                                                                   std::vector<ref_include_exclude_fields>& ref_include_exclude_fields_vec);
 
     void add_referenced_in_backlog(const std::string& collection_name, reference_pair&& pair);
 
     std::map<std::string, std::set<reference_pair>> _get_referenced_in_backlog() const;
+
+    void process_embedding_field_delete(const std::string& model_name);
+
+    static void _populate_referenced_ins(const std::string& collection_meta_json,
+                                         std::map<std::string, spp::sparse_hash_map<std::string, std::string>>& referenced_ins);
+
+    std::unordered_set<std::string> get_collection_references(const std::string& coll_name);
+
+    bool is_valid_api_key_collection(const std::vector<std::string>& api_key_collections, Collection* coll) const;
 };

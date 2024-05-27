@@ -3,8 +3,11 @@
 #include <vector>
 #include <collection_manager.h>
 #include <core_api.h>
+#include <analytics_manager.h>
 #include "core_api_utils.h"
 #include "raft_server.h"
+#include "conversation_model_manager.h"
+#include "conversation_manager.h"
 
 class CoreAPIUtilsTest : public ::testing::Test {
 protected:
@@ -15,6 +18,7 @@ protected:
     std::vector<std::string> query_fields;
     std::vector<sort_by> sort_fields;
 
+
     void setupCollection() {
         std::string state_dir_path = "/tmp/typesense_test/core_api_utils";
         LOG(INFO) << "Truncating and creating: " << state_dir_path;
@@ -23,6 +27,9 @@ protected:
         store = new Store(state_dir_path);
         collectionManager.init(store, 1.0, "auth_key", quit);
         collectionManager.load(8, 1000);
+
+        ConversationModelManager::init(store);
+        ConversationManager::get_instance().init(store);
     }
 
     virtual void SetUp() {
@@ -1045,8 +1052,6 @@ TEST_F(CoreAPIUtilsTest, ExportIncludeExcludeFieldsWithFilter) {
     collectionManager.drop_collection("coll1");
 }
 
-
-
 TEST_F(CoreAPIUtilsTest, TestProxy) {
     std::string res;
     std::unordered_map<std::string, std::string> headers;
@@ -1125,7 +1130,7 @@ TEST_F(CoreAPIUtilsTest, TestProxyInvalid) {
     post_proxy(req, resp);
 
     ASSERT_EQ(400, resp->status_code);
-    ASSERT_EQ("Parameter `method` must be one of GET, POST, PUT, DELETE.", nlohmann::json::parse(resp->body)["message"]);
+    ASSERT_EQ("Parameter `method` must be one of GET, POST, POST_STREAM, PUT, DELETE.", nlohmann::json::parse(resp->body)["message"]);
 
     // test with method as integer
     body["method"] = 123;
@@ -1193,6 +1198,139 @@ TEST_F(CoreAPIUtilsTest, TestProxyTimeout) {
     ASSERT_EQ("Server error on remote server. Please try again later.", nlohmann::json::parse(resp->body)["message"]);
 }
 
+TEST_F(CoreAPIUtilsTest, TestGetConversations) {
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->params["id"] = "0";
+
+    get_conversations(req, resp);
+
+    ASSERT_EQ(200, resp->status_code);
+
+    nlohmann::json res_json = nlohmann::json::parse(resp->body);
+    ASSERT_TRUE(res_json.is_array());
+    ASSERT_EQ(0, res_json.size());
+
+    get_conversation(req, resp);
+
+    ASSERT_EQ(404, resp->status_code);
+
+    auto schema_json =
+        R"({
+        "name": "Products",
+        "fields": [
+            {"name": "product_name", "type": "string", "infix": true},
+            {"name": "category", "type": "string"},
+            {"name": "embedding", "type":"float[]", "embed":{"from": ["product_name", "category"], "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+
+    if (std::getenv("api_key") == nullptr) {
+        LOG(INFO) << "Skipping test as api_key is not set.";
+        return;
+    }
+
+    auto api_key = std::string(std::getenv("api_key"));
+
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+
+    ASSERT_TRUE(collection_create_op.ok());
+
+    auto coll = collection_create_op.get();
+
+    auto add_op = coll->add(R"({
+        "product_name": "moisturizer",
+        "category": "beauty"
+    })"_json.dump());
+
+    ASSERT_TRUE(add_op.ok());
+
+    add_op = coll->add(R"({
+        "product_name": "shampoo",
+        "category": "beauty"
+    })"_json.dump());
+
+    ASSERT_TRUE(add_op.ok());
+
+    add_op = coll->add(R"({
+        "product_name": "shirt",
+        "category": "clothing"
+    })"_json.dump());
+
+    ASSERT_TRUE(add_op.ok());
+
+    add_op = coll->add(R"({
+        "product_name": "pants",
+        "category": "clothing"
+    })"_json.dump());
+
+    ASSERT_TRUE(add_op.ok());
+
+    nlohmann::json model_config = R"({
+        "model_name": "openai/gpt-3.5-turbo"
+    })"_json;
+
+    model_config["api_key"] = api_key;
+
+    auto add_model_op = ConversationModelManager::add_model(model_config);
+
+    ASSERT_TRUE(add_model_op.ok());
+
+    LOG(INFO) << "Model id: " << add_model_op.get();
+
+    auto model_id = add_model_op.get()["id"].get<std::string>();
+
+    auto results_op = coll->search("how many products are there for clothing category?", {"embedding"},
+                                 "", {}, {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 0, spp::sparse_hash_set<std::string>(), {},
+                                 10, "", 30, 4, "", 1, "", "", {}, 3, "<mark>", "</mark>", {}, 4294967295UL, true, false,
+                                 true, "", false, 6000000UL, 4, 7, fallback, 4, {off}, 32767UL, 32767UL, 2, 2, false, "",
+                                 true, 0, max_score, 100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, true, true, model_id);
+    
+    ASSERT_TRUE(results_op.ok());
+
+    get_conversations(req, resp);
+
+    ASSERT_EQ(200, resp->status_code);
+
+    res_json = nlohmann::json::parse(resp->body);
+
+    ASSERT_TRUE(res_json.is_array());
+    ASSERT_EQ(1, res_json.size());
+
+    ASSERT_TRUE(res_json[0]["conversation"].is_array());
+    ASSERT_EQ(2, res_json[0]["conversation"].size());
+    ASSERT_EQ("how many products are there for clothing category?", res_json[0]["conversation"][0]["user"].get<std::string>());
+
+    req->params["id"] = res_json[0]["id"].get<std::string>();
+    get_conversation(req, resp);
+
+    ASSERT_EQ(200, resp->status_code);
+
+    res_json = nlohmann::json::parse(resp->body);
+
+    ASSERT_TRUE(res_json.is_object());
+    ASSERT_TRUE(res_json["conversation"].is_array());
+    ASSERT_EQ(2, res_json["conversation"].size());
+    ASSERT_EQ("how many products are there for clothing category?", res_json["conversation"][0]["user"].get<std::string>());
+
+    del_conversation(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+
+    get_conversations(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+
+    res_json = nlohmann::json::parse(resp->body);
+    ASSERT_TRUE(res_json.is_array());
+    ASSERT_EQ(0, res_json.size());
+
+    auto del_res = ConversationModelManager::delete_model(model_id);
+}
+
 TEST_F(CoreAPIUtilsTest, SampleGzipIndexTest) {
     Collection *coll_hnstories;
 
@@ -1246,4 +1384,378 @@ TEST_F(CoreAPIUtilsTest, SampleGzipIndexTest) {
     ASSERT_EQ("{\"points\":1,\"title\":\"Telemba Turns Your Old Roomba and Tablet Into a Telepresence Robot\"}", doc_lines[13]);
 
     infile.close();
+}
+
+TEST_F(CoreAPIUtilsTest, TestConversationModels) {
+    nlohmann::json model_config = R"({
+        "model_name": "openai/gpt-3.5-turbo",
+        "max_bytes": 10000
+    })"_json;
+
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+
+    if (std::getenv("api_key") == nullptr) {
+        LOG(INFO) << "Skipping test as api_key is not set.";
+        return;
+    }
+
+    model_config["api_key"] = std::string(std::getenv("api_key"));
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->body = model_config.dump();
+    post_conversation_model(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+
+    auto id = nlohmann::json::parse(resp->body)["id"].get<std::string>();
+    req->params["id"] = id;
+    get_conversation_model(req, resp);
+
+    ASSERT_EQ(200, resp->status_code);
+    ASSERT_EQ(id, nlohmann::json::parse(resp->body)["id"].get<std::string>());
+
+    get_conversation_models(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+    ASSERT_EQ(1, nlohmann::json::parse(resp->body).size());
+
+    del_conversation_model(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+
+    get_conversation_models(req, resp);
+    ASSERT_EQ(200, resp->status_code);
+    ASSERT_EQ(0, nlohmann::json::parse(resp->body).size());
+}
+
+TEST_F(CoreAPIUtilsTest, TestInvalidConversationModels) {
+    // test with no model_name
+    nlohmann::json model_config = R"({
+    })"_json;
+
+    if (std::getenv("api_key") == nullptr) {
+        LOG(INFO) << "Skipping test as api_key is not set.";
+        return;
+    }
+
+    model_config["api_key"] = std::string(std::getenv("api_key"));
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->body = model_config.dump();
+
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `model_name` is not provided or not a string.", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with invalid model_name
+    model_config["model_name"] = "invalid_model_name";
+
+    req->body = model_config.dump();
+
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Model namespace `` is not supported.", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with no api_key
+    model_config["model_name"] = "openai/gpt-3.5-turbo";
+    model_config.erase("api_key");
+
+    req->body = model_config.dump();
+
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("API key is not provided", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with api_key as integer
+    model_config["api_key"] = 123;
+
+    req->body = model_config.dump();
+
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("API key is not a string", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with model_name as integer
+
+    model_config["api_key"] = std::string(std::getenv("api_key"));
+    model_config["model_name"] = 123;
+
+    req->body = model_config.dump();
+
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `model_name` is not provided or not a string.", nlohmann::json::parse(resp->body)["message"]);
+
+    model_config["model_name"] = "openai/gpt-3.5-turbo";
+
+    // test without max_bytes
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `max_bytes` is not provided or not a number.", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with max_bytes as string
+    model_config["max_bytes"] = "10000";
+
+    req->body = model_config.dump();
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `max_bytes` is not provided or not a number.", nlohmann::json::parse(resp->body)["message"]);
+
+    // test with max_bytes as negative number
+    model_config["max_bytes"] = -10000;
+
+    req->body = model_config.dump();
+    post_conversation_model(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("Property `max_bytes` must be a positive number.", nlohmann::json::parse(resp->body)["message"]);
+}
+
+TEST_F(CoreAPIUtilsTest, DeleteNonExistingDoc) {
+    Collection *coll1;
+
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("points", field_types::INT32, false),};
+
+    coll1 = collectionManager.get_collection("coll1").get();
+    if(coll1 == nullptr) {
+        coll1 = collectionManager.create_collection("coll1", 2, fields, "points").get();
+    }
+
+    for(size_t i=0; i<10; i++) {
+        nlohmann::json doc;
+
+        doc["id"] = std::to_string(i);
+        doc["title"] = "Title " + std::to_string(i);
+        doc["points"] = i;
+
+        coll1->add(doc.dump());
+    }
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "coll1";
+    req->params["id"] = "9";
+    del_remove_document(req, res);
+    ASSERT_EQ(200, res->status_code);
+
+    req->params["id"] = "10";
+    del_remove_document(req, res);
+    ASSERT_EQ(404, res->status_code);
+
+    req->params["ignore_not_found"] = "true";
+    del_remove_document(req, res);
+    ASSERT_EQ(200, res->status_code);
+}
+
+TEST_F(CoreAPIUtilsTest, CollectionsPagination) {
+    //remove all collections first
+    auto collections = collectionManager.get_collections().get();
+    for(auto collection : collections) {
+        collectionManager.drop_collection(collection->get_name());
+    }
+
+    //create few collections
+    for(size_t i = 0; i < 5; i++) {
+        nlohmann::json coll_json = R"({
+                "name": "cp",
+                "fields": [
+                    {"name": "title", "type": "string"}
+                ]
+            })"_json;
+        coll_json["name"] = coll_json["name"].get<std::string>() + std::to_string(i + 1);
+        auto coll_op = collectionManager.create_collection(coll_json);
+        ASSERT_TRUE(coll_op.ok());
+    }
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->params["offset"] = "0";
+    req->params["limit"] = "1";
+
+    nlohmann::json expected_meta_json = R"(
+        {
+          "created_at":1663234047,
+          "default_sorting_field":"",
+          "enable_nested_fields":false,
+          "fields":[
+            {
+              "facet":false,
+              "index":true,
+              "infix":false,
+              "locale":"",
+              "name":"title",
+              "optional":false,
+              "sort":false,
+              "stem":false,
+              "type":"string"
+            }
+          ],
+          "name":"cp2",
+          "num_documents":0,
+          "symbols_to_index":[],
+          "token_separators":[]
+        }
+    )"_json;
+
+    get_collections(req, resp);
+
+    auto actual_json = nlohmann::json::parse(resp->body);
+    expected_meta_json["created_at"] = actual_json[0]["created_at"];
+
+    ASSERT_EQ(expected_meta_json.dump(), actual_json[0].dump());
+
+    //invalid offset string
+    req->params["offset"] = "0a";
+    get_collections(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Offset param should be unsigned integer.\"}", resp->body);
+
+    //invalid limit string
+    req->params["offset"] = "0";
+    req->params["limit"] = "-1";
+    get_collections(req, resp);
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Limit param should be unsigned integer.\"}", resp->body);
+}
+
+TEST_F(CoreAPIUtilsTest, OverridesPagination) {
+    Collection *coll2;
+
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll2 = collectionManager.get_collection("coll2").get();
+    if(coll2 == nullptr) {
+        coll2 = collectionManager.create_collection("coll2", 1, fields, "points").get();
+    }
+
+    for(int i = 0; i < 5; ++i) {
+        nlohmann::json override_json = {
+                {"id",       "override"},
+                {
+                 "rule",     {
+                                     {"query", "not-found"},
+                                     {"match", override_t::MATCH_EXACT}
+                             }
+                },
+                {"metadata", {       {"foo",   "bar"}}},
+        };
+
+        override_json["id"] = override_json["id"].get<std::string>() + std::to_string(i + 1);
+        override_t override;
+        override_t::parse(override_json, "", override);
+
+        coll2->add_override(override);
+    }
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "coll2";
+    req->params["offset"] = "0";
+    req->params["limit"] = "1";
+
+    get_overrides(req, resp);
+    nlohmann::json expected_json = R"({
+        "overrides":[
+                    {
+                        "excludes":[],
+                        "filter_curated_hits":false,
+                        "id":"override1",
+                        "includes":[],
+                        "metadata":{"foo":"bar"},
+                        "remove_matched_tokens":false,
+                        "rule":{
+                                "match":"exact",
+                                "query":"not-found"
+                        },
+                        "stop_processing":true
+                    }]
+    })"_json;
+
+    ASSERT_EQ(expected_json.dump(), resp->body);
+
+    //invalid offset string
+    req->params["offset"] = "0a";
+    get_collections(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Offset param should be unsigned integer.\"}", resp->body);
+
+    //invalid limit string
+    req->params["offset"] = "0";
+    req->params["limit"] = "-1";
+    get_collections(req, resp);
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Limit param should be unsigned integer.\"}", resp->body);
+}
+
+TEST_F(CoreAPIUtilsTest, SynonymsPagination) {
+    Collection *coll3;
+
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("points", field_types::INT32, false)};
+
+    coll3 = collectionManager.get_collection("coll3").get();
+    if (coll3 == nullptr) {
+        coll3 = collectionManager.create_collection("coll3", 1, fields, "points").get();
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        nlohmann::json synonym_json = R"(
+                {
+                    "id": "foobar",
+                    "synonyms": ["blazer", "suit"]
+                })"_json;
+
+        synonym_json["id"] = synonym_json["id"].get<std::string>() + std::to_string(i + 1);
+
+        coll3->add_synonym(synonym_json);
+    }
+
+    auto req = std::make_shared<http_req>();
+    auto resp = std::make_shared<http_res>(nullptr);
+
+    req->params["collection"] = "coll3";
+    req->params["offset"] = "0";
+    req->params["limit"] = "1";
+
+    get_synonyms(req, resp);
+
+    nlohmann::json expected_json = R"({
+        "synonyms":[
+                    {
+                        "id":"foobar1",
+                        "root":"",
+                        "synonyms":["blazer","suit"]
+                    }]
+    })"_json;
+
+    ASSERT_EQ(expected_json.dump(), resp->body);
+
+    //invalid offset string
+    req->params["offset"] = "0a";
+    get_collections(req, resp);
+
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Offset param should be unsigned integer.\"}", resp->body);
+
+    //invalid limit string
+    req->params["offset"] = "0";
+    req->params["limit"] = "-1";
+    get_collections(req, resp);
+    ASSERT_EQ(400, resp->status_code);
+    ASSERT_EQ("{\"message\": \"Limit param should be unsigned integer.\"}", resp->body);
 }

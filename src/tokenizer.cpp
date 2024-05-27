@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <string_utils.h>
 #include "tokenizer.h"
+#include <unicode/uchar.h>
 
 Tokenizer::Tokenizer(const std::string& input, bool normalize, bool no_op, const std::string& locale,
                      const std::vector<char>& symbols_to_index,
@@ -87,12 +88,24 @@ void Tokenizer::init(const std::string& input) {
         }
 
         unicode_text = icu::UnicodeString::fromUTF8(text);
+
+        if(locale == "fa") {
+            icu::UnicodeString target_str;
+            target_str.setTo(0x200C);  // U+200C (ZERO WIDTH NON-JOINER)
+            unicode_text.findAndReplace(target_str, " ");
+        }
+
         bi->setText(unicode_text);
 
         start_pos = bi->first();
         end_pos = bi->next();
         utf8_start_index = 0;
     }
+}
+
+bool Tokenizer::belongs_to_general_punctuation_unicode_block(UChar c) {
+    UBlockCode blockCode = ublock_getCode(c);
+    return blockCode == UBLOCK_GENERAL_PUNCTUATION;
 }
 
 bool Tokenizer::next(std::string &token, size_t& token_index, size_t& start_index, size_t& end_index) {
@@ -128,13 +141,21 @@ bool Tokenizer::next(std::string &token, size_t& token_index, size_t& start_inde
                 auto raw_text = unicode_text.tempSubStringBetween(start_pos, end_pos);
                 transliterator->transliterate(raw_text);
                 raw_text.toUTF8String(word);
+                StringUtils::replace_all(word, "\"", "");
             } else if(normalize && locale == "th") {
                 UErrorCode errcode = U_ZERO_ERROR;
                 icu::UnicodeString src = unicode_text.tempSubStringBetween(start_pos, end_pos);
                 icu::UnicodeString dst;
                 nfkc->normalize(src, dst, errcode);
                 if(!U_FAILURE(errcode)) {
-                    dst.toUTF8String(word);
+                    icu::UnicodeString transformedString;
+                    for (int32_t t = 0; t < dst.length(); t++) {
+                        if (!belongs_to_general_punctuation_unicode_block(dst[t])) {
+                            transformedString += dst[t];
+                        }
+                    }
+
+                    transformedString.toUTF8String(word);
                 } else {
                     LOG(ERROR) << "Unicode error during parsing: " << errcode;
                 }
@@ -145,44 +166,35 @@ bool Tokenizer::next(std::string &token, size_t& token_index, size_t& start_inde
                 word.assign(normalized_word, strlen(normalized_word));
                 free(normalized_word);
             } else {
-                unicode_text.tempSubStringBetween(start_pos, end_pos).toUTF8String(word);
+                unicode_text.tempSubStringBetween(start_pos, end_pos).foldCase().toUTF8String(word);
             }
 
             bool emit_token = false;
+            size_t orig_word_size = word.size();
 
-            // `word` can be either a multi-byte unicode sequence or an ASCII character
-            // ASCII character can be either a special character or English alphabet
-
-            if(is_ascii_char(word[0])) {
-
-                if(std::isalnum(word[0])) {
-                    // normalize an ascii string and emit word as token
-                    std::transform(word.begin(), word.end(), word.begin(),
-                                   [](unsigned char c){ return std::tolower(c); });
-                    out += word;
-                    emit_token = true;
-                }
-
-                else {
-                    // special character:
-                    // a) present in `index_symbols` -> append word to out and continue iteration
-                    // b) present in `separator_symbols` -> skip word
-                    // c) not present in either -> skip word
-                    if(index_symbols[uint8_t(word[0])] == 1) {
-                        out += word;
-                        emit_token = true;
-                    }
-                }
-
-
+            if(locale == "zh" && (word == "，" || word == "─" || word == "。")) {
+                emit_token = false;
+            } else if(locale == "ko" && word == "·") {
+                emit_token = false;
             } else {
-                if(locale == "zh" && (word == "，" || word == "─" || word == "。")) {
-                    emit_token = false;
-                } else if(locale == "ko" && word == "·") {
-                    emit_token = false;
-                } else {
-                    emit_token = true;
+                // Some special characters like punctuations arrive as independent units, while others like
+                // underscore and quotes are present within the string. We will have to handle both cases.
+                size_t read_index = 0, write_index = 0;
+
+                while (read_index < word.size()) {
+                    size_t this_stream_mode = get_stream_mode(word[read_index]);
+                    if (!is_ascii_char(word[read_index]) || this_stream_mode == INDEX) {
+                        word[write_index++] = std::tolower(word[read_index]);
+                    }
+
+                    read_index++;
+                }
+
+                // resize to fit new length
+                word.resize(write_index);
+                if(!word.empty()) {
                     out += word;
+                    emit_token = true;
                 }
             }
 
@@ -193,7 +205,7 @@ bool Tokenizer::next(std::string &token, size_t& token_index, size_t& start_inde
             }
 
             start_index = utf8_start_index;
-            end_index = utf8_start_index + word.size() - 1;
+            end_index = utf8_start_index + orig_word_size - 1;
             utf8_start_index = end_index + 1;
 
             start_pos = end_pos;
@@ -361,4 +373,9 @@ std::string Tokenizer::normalize_ascii_no_spaces(const std::string& text) {
     }
 
     return analytics_query;
+}
+
+bool Tokenizer::has_word_tokenizer(const std::string& locale) {
+    bool use_word_tokenizer = locale == "th" || locale == "ja" || Tokenizer::is_cyrillic(locale);
+    return use_word_tokenizer;
 }

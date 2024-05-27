@@ -1,5 +1,6 @@
 #include "index.h"
 
+#include <memory>
 #include <numeric>
 #include <chrono>
 #include <set>
@@ -43,12 +44,13 @@
                 }
 #define FACET_INDEX_THRESHOLD 1000000000
 
-spp::sparse_hash_map<uint32_t, int64_t> Index::text_match_sentinel_value;
-spp::sparse_hash_map<uint32_t, int64_t> Index::seq_id_sentinel_value;
-spp::sparse_hash_map<uint32_t, int64_t> Index::eval_sentinel_value;
-spp::sparse_hash_map<uint32_t, int64_t> Index::geo_sentinel_value;
-spp::sparse_hash_map<uint32_t, int64_t> Index::str_sentinel_value;
-spp::sparse_hash_map<uint32_t, int64_t> Index::vector_distance_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::text_match_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::seq_id_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::eval_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::geo_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::str_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::vector_distance_sentinel_value;
+spp::sparse_hash_map<uint32_t, int64_t, Hasher32> Index::vector_query_sentinel_value;
 
 Index::Index(const std::string& name, const uint32_t collection_id, const Store* store,
              SynonymIndex* synonym_index, ThreadPool* thread_pool,
@@ -66,7 +68,7 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
         }
 
         if(a_field.num_dim > 0) {
-            auto hnsw_index = new hnsw_index_t(a_field.num_dim, 1024, a_field.vec_dist);
+            auto hnsw_index = new hnsw_index_t(a_field.num_dim, 1024, a_field.vec_dist, a_field.hnsw_params["M"].get<uint32_t>(), a_field.hnsw_params["ef_construction"].get<uint32_t>());
             vector_index.emplace(a_field.name, hnsw_index);
             continue;
         }
@@ -98,7 +100,7 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
                 adi_tree_t* tree = new adi_tree_t();
                 str_sort_index.emplace(a_field.name, tree);
             } else if(a_field.type != field_types::GEOPOINT_ARRAY) {
-                spp::sparse_hash_map<uint32_t, int64_t> * doc_to_score = new spp::sparse_hash_map<uint32_t, int64_t>();
+                auto doc_to_score = new spp::sparse_hash_map<uint32_t, int64_t, Hasher32>();
                 sort_index.emplace(a_field.name, doc_to_score);
             }
         }
@@ -122,6 +124,22 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
             }
 
             infix_index.emplace(a_field.name, infix_sets);
+        }
+
+        if (a_field.is_reference_helper && a_field.is_array()) {
+            auto num_tree = new num_tree_t;
+            reference_index.emplace(a_field.name, num_tree);
+
+            if (a_field.nested) {
+                std::vector<std::string> keys;
+                StringUtils::split(a_field.name, keys, ".");
+
+                // `object_array_reference_index` only includes the reference fields that are part of an object array.
+                if (search_schema.count(keys[0]) != 0 && search_schema.at(keys[0]).is_array()) {
+                    auto index = new spp::sparse_hash_map<std::pair<uint32_t, uint32_t>, uint32_t, pair_hash>();
+                    object_array_reference_index.emplace(a_field.name, index);
+                }
+            }
         }
     }
 
@@ -201,6 +219,20 @@ Index::~Index() {
     for(auto& vec_index_kv: vector_index) {
         delete vec_index_kv.second;
     }
+
+    for(auto & name_tree: reference_index) {
+        delete name_tree.second;
+        name_tree.second = nullptr;
+    }
+
+    reference_index.clear();
+
+    for(auto & name_tree: object_array_reference_index) {
+        delete name_tree.second;
+        name_tree.second = nullptr;
+    }
+
+    object_array_reference_index.clear();
 }
 
 int64_t Index::get_points_from_doc(const nlohmann::json &document, const std::string & default_sorting_field) {
@@ -418,7 +450,8 @@ void Index::validate_and_preprocess(Index *index,
                                     const std::string& fallback_field_type,
                                     const std::vector<char>& token_separators,
                                     const std::vector<char>& symbols_to_index,
-                                    const bool do_validation, const size_t remote_embedding_batch_size, const bool generate_embeddings) {
+                                    const bool do_validation, const size_t remote_embedding_batch_size,
+                                    const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries, const bool generate_embeddings) {
 
     // runs in a partitioned thread
     std::vector<index_record*> records_to_embed;
@@ -458,6 +491,13 @@ void Index::validate_and_preprocess(Index *index,
                 // scrub string fields to reduce delete ops
                 get_doc_changes(index_rec.operation, embedding_fields, index_rec.doc, index_rec.old_doc,
                                 index_rec.new_doc, index_rec.del_doc);
+
+                /*if(index_rec.seq_id == 0) {
+                    LOG(INFO) << "index_rec.doc: " << index_rec.doc;
+                    LOG(INFO) << "index_rec.old_doc: " << index_rec.old_doc;
+                    LOG(INFO) << "index_rec.new_doc: " << index_rec.new_doc;
+                    LOG(INFO) << "index_rec.del_doc: " << index_rec.del_doc;
+                }*/
 
                 if(generate_embeddings) {
                     for(auto& field: index_rec.doc.items()) {
@@ -509,24 +549,28 @@ void Index::validate_and_preprocess(Index *index,
     }
 
     if(generate_embeddings) {
-        batch_embed_fields(records_to_embed, embedding_fields, search_schema, remote_embedding_batch_size);
+        batch_embed_fields(records_to_embed, embedding_fields, search_schema, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries);
     }
 }
 
-size_t Index::batch_memory_index(Index *index,
+size_t Index::
+batch_memory_index(Index *index,
                                  std::vector<index_record>& iter_batch,
                                  const std::string & default_sorting_field,
-                                 const tsl::htrie_map<char, field> & search_schema,
+                                 const tsl::htrie_map<char, field> & actual_search_schema,
                                  const tsl::htrie_map<char, field> & embedding_fields,
                                  const std::string& fallback_field_type,
                                  const std::vector<char>& token_separators,
                                  const std::vector<char>& symbols_to_index,
-                                 const bool do_validation, const size_t remote_embedding_batch_size, const bool generate_embeddings) {
-
+                                 const bool do_validation, const size_t remote_embedding_batch_size,
+                                 const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries, const bool generate_embeddings, 
+                                 const bool use_addition_fields, const tsl::htrie_map<char, field>& addition_fields) {
     const size_t concurrency = 4;
     const size_t num_threads = std::min(concurrency, iter_batch.size());
     const size_t window_size = (num_threads == 0) ? 0 :
                                (iter_batch.size() + num_threads - 1) / num_threads;  // rounds up
+    const auto& indexable_schema = use_addition_fields ? addition_fields : actual_search_schema;
+    
 
     size_t num_indexed = 0;
     size_t num_processed = 0;
@@ -550,8 +594,8 @@ size_t Index::batch_memory_index(Index *index,
 
         index->thread_pool->enqueue([&, batch_index, batch_len]() {
             write_log_index = local_write_log_index;
-            validate_and_preprocess(index, iter_batch, batch_index, batch_len, default_sorting_field, search_schema,
-                                    embedding_fields, fallback_field_type, token_separators, symbols_to_index, do_validation, remote_embedding_batch_size, generate_embeddings);
+            validate_and_preprocess(index, iter_batch, batch_index, batch_len, default_sorting_field, actual_search_schema,
+                                    embedding_fields, fallback_field_type, token_separators, symbols_to_index, do_validation, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries, generate_embeddings);
 
             std::unique_lock<std::mutex> lock(m_process);
             num_processed++;
@@ -589,10 +633,11 @@ size_t Index::batch_memory_index(Index *index,
     }
 
     num_queued = num_processed = 0;
+    std::unique_lock ulock(index->mutex);
 
     for(const auto& field_name: found_fields) {
         //LOG(INFO) << "field name: " << field_name;
-        if(field_name != "id" && search_schema.count(field_name) == 0) {
+        if(field_name != "id" && indexable_schema.count(field_name) == 0) {
             continue;
         }
 
@@ -602,7 +647,7 @@ size_t Index::batch_memory_index(Index *index,
             write_log_index = local_write_log_index;
 
             const field& f = (field_name == "id") ?
-                             field("id", field_types::STRING, false) : search_schema.at(field_name);
+                             field("id", field_types::STRING, false) : indexable_schema.at(field_name);
             try {
                 index->index_field_in_memory(f, iter_batch);
             } catch(std::exception& e) {
@@ -662,16 +707,10 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
         std::unordered_map<facet_value_id_t, std::vector<uint32_t>, facet_value_id_t::Hash> fvalue_to_seq_ids;
         std::unordered_map<uint32_t, std::vector<facet_value_id_t>> seq_id_to_fvalues;
 
-        auto facet_count = facet_index_v4->get_facet_count(afield.name);
-
-#ifdef TEST_BUILD
-        facet_count = FACET_INDEX_THRESHOLD + 1;
-#endif
-
-        /*if(afield.facet) {
-            size_t total_num_docs = seq_ids->num_ids();
-            facet_index_v4->handle_index_change(afield.name, total_num_docs, FACET_INDEX_THRESHOLD, facet_count);
-        }*/
+        size_t total_num_docs = seq_ids->num_ids();
+        if(afield.facet && total_num_docs > 10*1000 && search_schema.size() > 100) {
+            facet_index_v4->check_for_high_cardinality(afield.name, total_num_docs);
+        }
 
         for(const auto& record: iter_batch) {
             if(!record.indexed.ok()) {
@@ -748,8 +787,10 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
                     }
                     else if(afield.type == field_types::FLOAT) {
                         float raw_val = document[afield.name].get<float>();
-                        auto fhash = reinterpret_cast<uint32_t&>(raw_val);
-                        facet_value_id_t facet_value_id(StringUtils::float_to_str(raw_val), fhash);
+                        const std::string& float_str_val = StringUtils::float_to_str(raw_val);
+                        float normalized_raw_val = std::stof(float_str_val);
+                        auto fhash = reinterpret_cast<uint32_t&>(normalized_raw_val);
+                        facet_value_id_t facet_value_id(float_str_val, fhash);
                         fvalue_to_seq_ids[facet_value_id].push_back(seq_id);
                         seq_id_to_fvalues[seq_id].push_back(facet_value_id);
                     }
@@ -779,7 +820,7 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
             }
         }
 
-        facet_index_v4->insert(afield.name, fvalue_to_seq_ids, seq_id_to_fvalues);
+        facet_index_v4->insert(afield.name, fvalue_to_seq_ids, seq_id_to_fvalues, afield.is_string());
 
         auto tree_it = search_index.find(afield.faceted_name());
         if(tree_it == search_index.end()) {
@@ -987,7 +1028,10 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
             // all other numerical arrays
             auto num_tree = afield.range_index ? nullptr : numerical_index.at(afield.name);
             auto trie = afield.range_index ? range_index.at(afield.name) : nullptr;
-            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie]
+            auto reference = reference_index.count(afield.name) != 0 ? reference_index.at(afield.name) : nullptr;
+            auto object_array_reference = object_array_reference_index.count(afield.name) != 0 ?
+                                                                object_array_reference_index.at(afield.name) : nullptr;
+            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie, reference, object_array_reference]
                     (const index_record& record, uint32_t seq_id) {
                 for(size_t arr_i = 0; arr_i < record.doc[afield.name].size(); arr_i++) {
                     const auto& arr_value = record.doc[afield.name][arr_i];
@@ -1002,11 +1046,23 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
                     }
 
                     else if(afield.type == field_types::INT64_ARRAY) {
-                        const int64_t value = arr_value;
+                        int64_t value;
+                        if (object_array_reference != nullptr) { // arr_value is an array [object_index, value]
+                            value = arr_value.at(1);
+                        } else {
+                            value = arr_value;
+                        }
+
                         if (afield.range_index) {
                             trie->insert(value, seq_id);
                         } else {
                             num_tree->insert(value, seq_id);
+                        }
+                        if (reference != nullptr) {
+                            reference->insert(seq_id, value);
+                        }
+                        if (object_array_reference != nullptr) {
+                            (*object_array_reference)[std::make_pair(seq_id, arr_value.at(0))] = value;
                         }
                     }
 
@@ -1034,7 +1090,7 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
 
         // add numerical values automatically into sort index if sorting is enabled
         if(afield.is_num_sortable() && afield.type != field_types::GEOPOINT_ARRAY) {
-            spp::sparse_hash_map<uint32_t, int64_t> *doc_to_score = sort_index.at(afield.name);
+            auto doc_to_score = sort_index.at(afield.name);
 
             bool is_integer = afield.is_integer();
             bool is_float = afield.is_float();
@@ -1111,6 +1167,15 @@ void Index::tokenize_string(const std::string& text, const field& a_field,
         if(token.size() > 100) {
             token.erase(100);
         }
+        
+        if(a_field.is_stem()) {
+            auto stemmer = a_field.get_stemmer();
+            if(stemmer) {
+                token = stemmer->stem(token);
+            } else {
+                LOG(INFO) << "Stemmer couldn't be initialized for field: " << a_field.name;
+            }
+        }
 
         token_to_offsets[token].push_back(token_index + 1);
         last_token = token;
@@ -1146,6 +1211,15 @@ void Index::tokenize_string_array(const std::vector<std::string>& strings,
                 token.erase(100);
             }
 
+            if(a_field.is_stem()) {
+                auto stemmer = a_field.get_stemmer();
+                if(stemmer) {
+                    token = stemmer->stem(token);
+                } else {
+                    LOG(INFO) << "Stemmer couldn't be initialized for field: " << a_field.name;
+                }
+            }
+
             token_to_offsets[token].push_back(token_index + 1);
             token_set.insert(token);
             last_token = token;
@@ -1172,7 +1246,8 @@ void Index::initialize_facet_indexes(const field& facet_field) {
     facet_index_v4->initialize(facet_field.name);
 }
 
-void Index::compute_facet_stats(facet &a_facet, const std::string& raw_value, const std::string & field_type) {
+void Index::compute_facet_stats(facet &a_facet, const std::string& raw_value, const std::string & field_type,
+                                const size_t count) {
     if(field_type == field_types::INT32 || field_type == field_types::INT32_ARRAY) {
         int32_t val = std::stoi(raw_value);
         if (val < a_facet.stats.fvmin) {
@@ -1181,8 +1256,8 @@ void Index::compute_facet_stats(facet &a_facet, const std::string& raw_value, co
         if (val > a_facet.stats.fvmax) {
             a_facet.stats.fvmax = val;
         }
-        a_facet.stats.fvsum += val;
-        a_facet.stats.fvcount++;
+        a_facet.stats.fvsum += (count * val);
+        a_facet.stats.fvcount += count;
     } else if(field_type == field_types::INT64 || field_type == field_types::INT64_ARRAY) {
         int64_t val = std::stoll(raw_value);
         if(val < a_facet.stats.fvmin) {
@@ -1191,8 +1266,8 @@ void Index::compute_facet_stats(facet &a_facet, const std::string& raw_value, co
         if(val > a_facet.stats.fvmax) {
             a_facet.stats.fvmax = val;
         }
-        a_facet.stats.fvsum += val;
-        a_facet.stats.fvcount++;
+        a_facet.stats.fvsum += (count * val);
+        a_facet.stats.fvcount += count;
     } else if(field_type == field_types::FLOAT || field_type == field_types::FLOAT_ARRAY) {
         float val = std::stof(raw_value);
         if(val < a_facet.stats.fvmin) {
@@ -1201,8 +1276,8 @@ void Index::compute_facet_stats(facet &a_facet, const std::string& raw_value, co
         if(val > a_facet.stats.fvmax) {
             a_facet.stats.fvmax = val;
         }
-        a_facet.stats.fvsum += val;
-        a_facet.stats.fvcount++;
+        a_facet.stats.fvsum += (count * val);
+        a_facet.stats.fvcount += count;
     }
 }
 
@@ -1254,23 +1329,42 @@ int64_t Index::get_doc_val_from_sort_index(sort_index_iterator sort_index_it, ui
     return INT64_MAX;
 }
 
+std::vector<group_by_field_it_t> Index::get_group_by_field_iterators(const std::vector<std::string>& group_by_fields,
+                                                                     bool is_reverse) const {
+    std::vector<group_by_field_it_t> group_by_field_it_vec;
+    for (const auto &field_name: group_by_fields) {
+        if (!facet_index_v4->has_hash_index(field_name)) {
+            continue;
+        }
+        auto facet_index = facet_index_v4->get_facet_hash_index(field_name);
+        auto facet_index_it = is_reverse ? facet_index->new_rev_iterator() : facet_index->new_iterator();
+
+        group_by_field_it_t group_by_field_it_struct {field_name, std::move(facet_index_it),
+                                                      search_schema.at(field_name).is_array()};
+        group_by_field_it_vec.emplace_back(std::move(group_by_field_it_struct));
+    }
+    return group_by_field_it_vec;
+}
+
 void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                       bool estimate_facets, size_t facet_sample_percent,
                       const std::vector<facet_info_t>& facet_infos,
                       const size_t group_limit, const std::vector<std::string>& group_by_fields,
+                      const bool group_missing_values,
                       const uint32_t* result_ids, size_t results_size, 
-                      int max_facet_count, bool is_wildcard_query, bool no_filters_provided,
+                      int max_facet_count, bool is_wildcard_no_filter_query,
                       facet_index_type_t facet_index_type) const {
 
     if(results_size == 0) {
         return ;
     }
 
-    size_t total_docs = seq_ids->num_ids();
+    std::vector<group_by_field_it_t> group_by_field_it_vec;
 
+    size_t total_docs = seq_ids->num_ids();
     // assumed that facet fields have already been validated upstream
-    for(size_t findex=0; findex < facets.size(); findex++) {
-        auto& a_facet = facets[findex];
+    for(auto& a_facet : facets) {
+        auto findex = a_facet.orig_index;
         const auto& facet_field = facet_infos[findex].facet_field;
         const bool use_facet_query = facet_infos[findex].use_facet_query;
         const auto& fquery_hashes = facet_infos[findex].hashes;
@@ -1278,15 +1372,19 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
         const bool use_value_index = facet_infos[findex].use_value_index;
 
         auto sort_index_it = sort_index.find(a_facet.field_name);
+        auto facet_sort_index_it = sort_index.find(a_facet.sort_field);
 
-        size_t mod_value = 100 / facet_sample_percent;
+        if(facet_sample_percent == 0) {
+            facet_sample_percent = 1;
+        }
+
+        size_t facet_sample_mod_value = 100 / facet_sample_percent;
 
         auto num_facet_values = facet_index_v4->get_facet_count(facet_field.name);
         if(num_facet_values == 0) {
             continue;
         }
 
-        bool is_wildcard_no_filter_query = is_wildcard_query && no_filters_provided;
         bool facet_value_index_exists = facet_index_v4->has_value_index(facet_field.name);
 
 #ifdef TEST_BUILD
@@ -1297,35 +1395,57 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
             // LOG(INFO) << "Using intersection to find facets";
             a_facet.is_intersected = true;
 
-            std::map<std::string, uint32_t> facet_results;
+            std::map<std::string, docid_count_t> facet_results;
             std::string sort_order = a_facet.is_sort_by_alpha ? a_facet.sort_order : "";
 
-            facet_index_v4->intersect(a_facet, use_facet_query,
-                                      facet_infos[findex].fvalue_searched_tokens, result_ids,
-                                      results_size, max_facet_count, facet_results,
+            facet_index_v4->intersect(a_facet, facet_field,use_facet_query,
+                                      estimate_facets, facet_sample_mod_value,
+                                      facet_infos[findex].fvalue_searched_tokens,
+                                      symbols_to_index, token_separators,
+                                      result_ids, results_size, max_facet_count, facet_results,
                                       is_wildcard_no_filter_query, sort_order);
 
             for(const auto& kv : facet_results) {
                 //range facet processing
                 if(a_facet.is_range_query) {
-                    const auto doc_val = kv.first;
+                    int64_t doc_val = std::stoll(kv.first);
                     std::pair<int64_t , std::string> range_pair {};
-                    if(a_facet.get_range(std::stoll(doc_val), range_pair)) {
+
+                    if(facet_field.is_float()) {
+                        float val = std::stof(kv.first);
+                        doc_val = Index::float_to_int64_t(val);
+                    }
+
+                    if(a_facet.get_range(doc_val, range_pair)) {
                         const auto& range_id = range_pair.first;
                         facet_count_t& facet_count = a_facet.result_map[range_id];
-                        facet_count.count = kv.second;
+                        facet_count.count += kv.second.count;
                     }
                 } else { 
                     facet_count_t& facet_count = a_facet.value_result_map[kv.first];
-                    facet_count.count = kv.second;
+                    facet_count.count = kv.second.count;
+                    facet_count.doc_id = kv.second.doc_id;
                 }
 
                 if(should_compute_stats) {
-                    //LOG(INFO) << "Computing facet stas for facet " << a_facet.field_name;
-                    for(size_t i = 0; i < kv.second; ++i) {
-                        compute_facet_stats(a_facet, kv.first, facet_field.type);
+                    //LOG(INFO) << "Computing facet stats for facet value" << kv.first;
+                    compute_facet_stats(a_facet, kv.first, facet_field.type, kv.second.count);
+                }
+            }
+
+            if(should_compute_stats) {
+                auto numerical_index_it = numerical_index.find(a_facet.field_name);
+                if(numerical_index_it != numerical_index.end()) {
+                    auto min_max_pair = numerical_index_it->second->get_min_max(result_ids,
+                                                                                results_size);
+                    if(facet_field.is_float()) {
+                        a_facet.stats.fvmin = int64_t_to_float(min_max_pair.first);
+                        a_facet.stats.fvmax = int64_t_to_float(min_max_pair.second);
+                    } else {
+                        a_facet.stats.fvmin = min_max_pair.first;
+                        a_facet.stats.fvmax = min_max_pair.second;
                     }
-                } 
+                }
             }
         } else {
             //LOG(INFO) << "Using hashing to find facets";
@@ -1334,16 +1454,23 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                 continue;
             }
 
+            const auto& fhash_int64_map = facet_index_v4->get_fhash_int64_map(a_facet.field_name);
+
             const auto facet_field_is_array = facet_field.is_array();
+            const auto facet_field_is_int64 = facet_field.is_int64();
 
             const auto& facet_index = facet_index_v4->get_facet_hash_index(facet_field.name);
             posting_list_t::iterator_t facet_index_it = facet_index->new_iterator();
-            std::vector<uint32_t> facet_hashes;
+            std::vector<uint32_t> facet_hashes(1);
+
+            if (group_limit != 0) {
+                group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+            }
 
             for(size_t i = 0; i < results_size; i++) {
                 // if sampling is enabled, we will skip a portion of the results to speed up things
                 if(estimate_facets) {
-                    if(i % mod_value != 0) {
+                    if(i % facet_sample_mod_value != 0) {
                         continue;
                     }
                 }
@@ -1360,9 +1487,19 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                 }
 
                 facet_hashes.clear();
-                posting_list_t::get_offsets(facet_index_it, facet_hashes);
+                if(facet_field_is_array) {
+                    posting_list_t::get_offsets(facet_index_it, facet_hashes);
+                } else {
+                    facet_hashes.push_back(facet_index_it.offset());
+                }
 
-                const uint64_t distinct_id = group_limit ? get_distinct_id(group_by_fields, doc_seq_id) : 0;
+                uint64_t distinct_id = 0;
+                if(group_limit) {
+                    distinct_id = 1;
+                    for(auto& kv : group_by_field_it_vec) {
+                        get_distinct_id(kv.it, doc_seq_id, kv.is_array, group_missing_values, distinct_id, false);
+                    }
+                }
                 //LOG(INFO) << "facet_hash_count " << facet_hash_count;
                 if(((i + 1) % 16384) == 0) {
                     RETURN_CIRCUIT_BREAKER
@@ -1371,17 +1508,28 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                 std::set<uint32_t> unique_facet_hashes;
 
                 for(size_t j = 0; j < facet_hashes.size(); j++) {
-
                     const auto& fhash = facet_hashes[j];
 
-                    if(unique_facet_hashes.count(fhash) == 0) {
-                        unique_facet_hashes.insert(fhash);
-                    } else {
-                        continue;
+                    // explicitly check for value of facet_hashes to avoid set lookup/insert for non-array faceting
+                    if(facet_hashes.size() > 1) {
+                        if(unique_facet_hashes.count(fhash) != 0) {
+                            continue;
+                        } else {
+                            unique_facet_hashes.insert(fhash);
+                        }
                     }
 
                     if(should_compute_stats) {
-                        compute_facet_stats(a_facet, fhash, facet_field.type);
+                        int64_t val = fhash;
+                        if(facet_field_is_int64) {
+                            if(fhash_int64_map.find(fhash) != fhash_int64_map.end()) {
+                                val = fhash_int64_map.at(fhash);
+                            } else {
+                                val = INT64_MAX;
+                            }
+                        }
+
+                        compute_facet_stats(a_facet, val, facet_field.type);
                     }
 
                     if(a_facet.is_range_query) {
@@ -1392,6 +1540,10 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                             const auto& range_id = range_pair.first;
                             facet_count_t& facet_count = a_facet.result_map[range_id];
                             facet_count.count += 1;
+
+                            if(group_limit) {
+                                a_facet.hash_groups[range_id].emplace(distinct_id);
+                            }
                         }
                     } else if(!use_facet_query || fquery_hashes.find(fhash) != fquery_hashes.end()) {
                         facet_count_t& facet_count = a_facet.result_map[fhash];
@@ -1408,8 +1560,7 @@ void Index::do_facets(std::vector<facet> & facets, facet_query_t & facet_query,
                             a_facet.hash_tokens[fhash] = fquery_hashes.at(fhash);
                         }
                         if(!a_facet.sort_field.empty()) {
-                            sort_index_it = sort_index.find(a_facet.sort_field);
-                            facet_count.sort_field_val = get_doc_val_from_sort_index(sort_index_it, doc_seq_id);
+                            facet_count.sort_field_val = get_doc_val_from_sort_index(facet_sort_index_it, doc_seq_id);
                             //LOG(INFO) << "found sort_field val " << facet_count.sort_field;
                         }
                     }
@@ -1451,16 +1602,18 @@ Option<bool> Index::search_all_candidates(const size_t num_search_fields,
                                           const size_t typo_tokens_threshold,
                                           const size_t group_limit,
                                           const std::vector<std::string>& group_by_fields,
+                                          const bool group_missing_values,
                                           const std::vector<token_t>& query_tokens,
                                           const std::vector<uint32_t>& num_typos,
                                           const std::vector<bool>& prefixes,
                                           bool prioritize_exact_match,
                                           const bool prioritize_token_position,
+                                          const bool prioritize_num_matching_fields,
                                           const bool exhaustive_search,
                                           const size_t max_candidates,
                                           int syn_orig_num_tokens,
                                           const int* sort_order,
-                                          std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values,
+                                          std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                           const std::vector<size_t>& geopoint_indices,
                                           std::set<uint64>& query_hashes,
                                           std::vector<uint32_t>& id_buff, const std::string& collection_name) const {
@@ -1506,8 +1659,9 @@ Option<bool> Index::search_all_candidates(const size_t num_search_fields,
                                                              num_search_fields, match_type,
                                                              sort_fields, topster,groups_processed,
                                                              searched_queries, qtoken_set, dropped_tokens,
-                                                             group_limit, group_by_fields,
+                                                             group_limit, group_by_fields, group_missing_values,
                                                              prioritize_exact_match, prioritize_token_position,
+                                                             prioritize_num_matching_fields,
                                                              filter_result_iterator,
                                                              total_cost, syn_orig_num_tokens,
                                                              exclude_token_ids, exclude_token_ids_size, excluded_group_ids,
@@ -1520,140 +1674,10 @@ Option<bool> Index::search_all_candidates(const size_t num_search_fields,
 
         query_hashes.insert(qhash);
         filter_result_iterator->reset();
+        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
     }
 
     return Option<bool>(true);
-}
-
-void Index::search_candidates(const uint8_t & field_id, bool field_is_array,
-                              const uint32_t* filter_ids, size_t filter_ids_length,
-                              const uint32_t* exclude_token_ids, size_t exclude_token_ids_size,
-                              const std::vector<uint32_t>& curated_ids,
-                              std::vector<sort_by> & sort_fields,
-                              std::vector<token_candidates> & token_candidates_vec,
-                              std::vector<std::vector<art_leaf*>> & searched_queries,
-                              Topster* topster,
-                              spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
-                              uint32_t** all_result_ids, size_t & all_result_ids_len,
-                              size_t& field_num_results,
-                              const size_t typo_tokens_threshold,
-                              const size_t group_limit,
-                              const std::vector<std::string>& group_by_fields,
-                              const std::vector<token_t>& query_tokens,
-                              bool prioritize_exact_match,
-                              const bool exhaustive_search,
-                              int syn_orig_num_tokens,
-                              const size_t concurrency,
-                              std::set<uint64>& query_hashes,
-                              std::vector<uint32_t>& id_buff) const {
-
-    auto product = []( long long a, token_candidates & b ) { return a*b.candidates.size(); };
-    long long int N = std::accumulate(token_candidates_vec.begin(), token_candidates_vec.end(), 1LL, product);
-
-    int sort_order[3]; // 1 or -1 based on DESC or ASC respectively
-    std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values;
-    std::vector<size_t> geopoint_indices;
-
-    populate_sort_mapping(sort_order, geopoint_indices, sort_fields, field_values);
-
-    // escape hatch to prevent too much looping
-    size_t combination_limit = exhaustive_search ? Index::COMBINATION_MAX_LIMIT : Index::COMBINATION_MIN_LIMIT;
-
-    for (long long n = 0; n < N && n < combination_limit; ++n) {
-        RETURN_CIRCUIT_BREAKER
-
-        // every element in `query_suggestion` contains a token and its associated hits
-        std::vector<art_leaf*> query_suggestion(token_candidates_vec.size());
-
-        // actual query suggestion preserves original order of tokens in query
-        std::vector<art_leaf*> actual_query_suggestion(token_candidates_vec.size());
-        uint64 qhash;
-
-        uint32_t token_bits = 0;
-        uint32_t total_cost = next_suggestion(token_candidates_vec, n, actual_query_suggestion,
-                                              query_suggestion, syn_orig_num_tokens, token_bits, qhash);
-
-        if(query_hashes.find(qhash) != query_hashes.end()) {
-            // skip this query since it has already been processed before
-            continue;
-        }
-
-        query_hashes.insert(qhash);
-
-        //LOG(INFO) << "field_num_results: " << field_num_results << ", typo_tokens_threshold: " << typo_tokens_threshold;
-        //LOG(INFO) << "n: " << n;
-
-        /*std::stringstream fullq;
-        for(const auto& qleaf : actual_query_suggestion) {
-            std::string qtok(reinterpret_cast<char*>(qleaf->key),qleaf->key_len - 1);
-            fullq << qtok << " ";
-        }
-        LOG(INFO) << "field: " << size_t(field_id) << ", query: " << fullq.str() << ", total_cost: " << total_cost;*/
-
-        // Prepare excluded document IDs that we can later remove from the result set
-        uint32_t* excluded_result_ids = nullptr;
-        size_t excluded_result_ids_size = ArrayUtils::or_scalar(exclude_token_ids, exclude_token_ids_size,
-                                                                &curated_ids[0], curated_ids.size(), &excluded_result_ids);
-
-        std::vector<void*> posting_lists;
-
-        for(auto& query_leaf : query_suggestion) {
-            posting_lists.push_back(query_leaf->values);
-        }
-
-        result_iter_state_t iter_state(
-                excluded_result_ids, excluded_result_ids_size, filter_ids, filter_ids_length
-        );
-
-        // We fetch offset positions only for multi token query
-        bool single_exact_query_token = false;
-
-        if(total_cost == 0 && query_suggestion.size() == query_tokens.size() == 1) {
-            // does this candidate suggestion token match query token exactly?
-            single_exact_query_token = true;
-        }
-
-        if(topster == nullptr) {
-            posting_t::block_intersector_t(posting_lists, iter_state)
-            .intersect([&](uint32_t seq_id, std::vector<posting_list_t::iterator_t>& its) {
-                id_buff.push_back(seq_id);
-            });
-        } else {
-            posting_t::block_intersector_t(posting_lists, iter_state)
-            .intersect([&](uint32_t seq_id, std::vector<posting_list_t::iterator_t>& its) {
-                score_results(sort_fields, searched_queries.size(), field_id, field_is_array,
-                              total_cost, topster, query_suggestion, groups_processed,
-                              seq_id, sort_order, field_values, geopoint_indices,
-                              group_limit, group_by_fields, token_bits,
-                              prioritize_exact_match, single_exact_query_token, syn_orig_num_tokens, its);
-
-                id_buff.push_back(seq_id);
-            });
-        }
-
-        delete [] excluded_result_ids;
-        const size_t num_result_ids = id_buff.size();
-
-        if(id_buff.size() > 100000) {
-            // prevents too many ORs during exhaustive searching
-            std::sort(id_buff.begin(), id_buff.end());
-            id_buff.erase(std::unique( id_buff.begin(), id_buff.end() ), id_buff.end());
-
-            uint32_t* new_all_result_ids = nullptr;
-            all_result_ids_len = ArrayUtils::or_scalar(*all_result_ids, all_result_ids_len, &id_buff[0],
-                                                       id_buff.size(), &new_all_result_ids);
-            delete[] *all_result_ids;
-            *all_result_ids = new_all_result_ids;
-            id_buff.clear();
-        }
-
-        if(num_result_ids == 0) {
-            continue;
-        }
-
-        field_num_results += num_result_ids;
-        searched_queries.push_back(actual_query_suggestion);
-    }
 }
 
 bool Index::field_is_indexed(const std::string& field_name) const {
@@ -1668,63 +1692,535 @@ Option<bool> Index::do_filtering_with_lock(filter_node_t* const filter_tree_root
                                            const std::string& collection_name) const {
     std::shared_lock lock(mutex);
 
-    auto filter_result_iterator = filter_result_iterator_t(collection_name, this, filter_tree_root);
+    auto filter_result_iterator = filter_result_iterator_t(collection_name, this, filter_tree_root,
+                                                           search_begin_us, search_stop_us);
     auto filter_init_op = filter_result_iterator.init_status();
     if (!filter_init_op.ok()) {
         return filter_init_op;
     }
 
-    filter_result.count = filter_result_iterator.to_filter_id_array(filter_result.docs);
+    filter_result_iterator.compute_iterators();
+    if (filter_result_iterator.approx_filter_ids_length == 0) {
+        return Option(true);
+    }
 
+    if (filter_result_iterator.reference.empty()) {
+        filter_result.count = filter_result_iterator.to_filter_id_array(filter_result.docs);
+        return Option(true);
+    }
+
+    uint32_t count = filter_result_iterator.approx_filter_ids_length, dummy;
+    auto ref_filter_result = new filter_result_t();
+    std::unique_ptr<filter_result_t> ref_filter_result_guard(ref_filter_result);
+    filter_result_iterator.get_n_ids(count, dummy, nullptr, 0, ref_filter_result);
+
+    if (filter_result_iterator.validity == filter_result_iterator_t::timed_out) {
+        return Option<bool>(true);
+    }
+
+    filter_result = std::move(*ref_filter_result);
     return Option(true);
+}
+
+void aggregate_nested_references(single_filter_result_t *const reference_result,
+                                 reference_filter_result_t& ref_filter_result) {
+    // Add reference doc id in result.
+    auto temp_docs = new uint32_t[ref_filter_result.count + 1];
+    std::copy(ref_filter_result.docs, ref_filter_result.docs + ref_filter_result.count, temp_docs);
+    temp_docs[ref_filter_result.count] = reference_result->seq_id;
+
+    delete[] ref_filter_result.docs;
+    ref_filter_result.docs = temp_docs;
+    ref_filter_result.count++;
+    ref_filter_result.is_reference_array_field = false;
+
+    // Add references of the reference doc id in result.
+    auto& references = ref_filter_result.coll_to_references;
+    auto temp_references = new std::map<std::string, reference_filter_result_t>[ref_filter_result.count] {};
+    for (uint32_t i = 0; i < ref_filter_result.count - 1; i++) {
+        temp_references[i] = std::move(references[i]);
+    }
+    temp_references[ref_filter_result.count - 1] = std::move(reference_result->reference_filter_results);
+
+    delete[] references;
+    references = temp_references;
 }
 
 Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter_tree_root,
                                                      filter_result_t& filter_result,
-                                                     const std::string& collection_name,
+                                                     const std::string& ref_collection_name,
                                                      const std::string& reference_helper_field_name) const {
     std::shared_lock lock(mutex);
 
-    auto filter_result_iterator = filter_result_iterator_t(collection_name, this, filter_tree_root);
-    auto filter_init_op = filter_result_iterator.init_status();
+    auto ref_filter_result_iterator = filter_result_iterator_t(ref_collection_name, this, filter_tree_root,
+                                                               search_begin_us, search_stop_us);
+    auto filter_init_op = ref_filter_result_iterator.init_status();
     if (!filter_init_op.ok()) {
         return filter_init_op;
     }
 
-    uint32_t* reference_docs = nullptr;
-    uint32_t count = filter_result_iterator.to_filter_id_array(reference_docs);
-    std::unique_ptr<uint32_t[]> docs_guard(reference_docs);
-
-    // doc id -> reference doc ids
-    std::map<uint32_t, std::vector<uint32_t>> reference_map;
-    for (uint32_t i = 0; i < count; i++) {
-        auto reference_doc_id = reference_docs[i];
-        auto doc_id = sort_index.at(reference_helper_field_name)->at(reference_doc_id);
-
-        reference_map[doc_id].push_back(reference_doc_id);
+    ref_filter_result_iterator.compute_iterators();
+    if (ref_filter_result_iterator.approx_filter_ids_length == 0) {
+        return Option(true);
     }
 
-    filter_result.count = reference_map.size();
-    filter_result.docs = new uint32_t[reference_map.size()];
-    filter_result.reference_filter_results[collection_name] = new reference_filter_result_t[reference_map.size()];
+    uint32_t count = ref_filter_result_iterator.approx_filter_ids_length, dummy;
+    auto ref_filter_result = new filter_result_t();
+    std::unique_ptr<filter_result_t> ref_filter_result_guard(ref_filter_result);
+    ref_filter_result_iterator.get_n_ids(count, dummy, nullptr, 0, ref_filter_result);
 
-    size_t doc_index = 0;
-    for (auto &item: reference_map) {
-        filter_result.docs[doc_index] = item.first;
+    if (ref_filter_result_iterator.validity == filter_result_iterator_t::timed_out) {
+        return Option<bool>(true);
+    }
 
-        auto& reference_result = filter_result.reference_filter_results[collection_name][doc_index];
-        reference_result.count = item.second.size();
-        reference_result.docs = new uint32_t[item.second.size()];
-        std::copy(item.second.begin(), item.second.end(), reference_result.docs);
+    uint32_t* reference_docs = ref_filter_result->docs;
+    ref_filter_result->docs = nullptr;
+    std::unique_ptr<uint32_t[]> docs_guard(reference_docs);
 
-        doc_index++;
+    auto const is_nested_join = !ref_filter_result_iterator.reference.empty();
+    if (search_schema.at(reference_helper_field_name).is_singular()) { // Only one reference per doc.
+        if (sort_index.count(reference_helper_field_name) == 0) {
+            return Option<bool>(400, "`" + reference_helper_field_name + "` is not present in sort index.");
+        }
+        auto const& ref_index = *sort_index.at(reference_helper_field_name);
+
+        if (is_nested_join) {
+            // In case of nested join, we need to collect all the doc ids from the reference ids along with their references.
+            std::vector<std::pair<uint32_t, single_filter_result_t*>> id_pairs;
+            std::unordered_set<uint32_t> unique_doc_ids;
+
+            for (uint32_t i = 0; i < count; i++) {
+                auto& reference_doc_id = reference_docs[i];
+                auto reference_doc_references = std::move(ref_filter_result->coll_to_references[i]);
+                if (ref_index.count(reference_doc_id) == 0) { // Reference field might be optional.
+                    continue;
+                }
+                auto doc_id = ref_index.at(reference_doc_id);
+
+                id_pairs.emplace_back(std::make_pair(doc_id, new single_filter_result_t(reference_doc_id,
+                                                                                        std::move(reference_doc_references),
+                                                                                        false)));
+                unique_doc_ids.insert(doc_id);
+            }
+
+            if (id_pairs.empty()) {
+                return Option(true);
+            }
+
+            std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+                return left.first < right.first;
+            });
+
+            filter_result.count = unique_doc_ids.size();
+            filter_result.docs = new uint32_t[unique_doc_ids.size()];
+            filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+            reference_filter_result_t previous_doc_references;
+            for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+                auto const& current_doc = id_pairs[i].first;
+                auto& reference_result = id_pairs[i].second;
+
+                if (current_doc != previous_doc) {
+                    filter_result.docs[result_index] = current_doc;
+                    if (result_index > 0) {
+                        std::map<std::string, reference_filter_result_t> references;
+                        references[ref_collection_name] = std::move(previous_doc_references);
+                        filter_result.coll_to_references[result_index - 1] = std::move(references);
+                    }
+
+                    result_index++;
+                    previous_doc = current_doc;
+                    aggregate_nested_references(reference_result, previous_doc_references);
+                } else {
+                    aggregate_nested_references(reference_result, previous_doc_references);
+                }
+            }
+
+            if (previous_doc_references.count != 0) {
+                std::map<std::string, reference_filter_result_t> references;
+                references[ref_collection_name] = std::move(previous_doc_references);
+                filter_result.coll_to_references[filter_result.count - 1] = std::move(references);
+            }
+
+            for (auto &item: id_pairs) {
+                delete item.second;
+            }
+
+            return Option(true);
+        }
+
+        // Collect all the doc ids from the reference ids.
+        std::vector<std::pair<uint32_t, uint32_t>> id_pairs;
+        std::unordered_set<uint32_t> unique_doc_ids;
+
+        for (uint32_t i = 0; i < count; i++) {
+            auto& reference_doc_id = reference_docs[i];
+            if (ref_index.count(reference_doc_id) == 0) { // Reference field might be optional.
+                continue;
+            }
+            auto doc_id = ref_index.at(reference_doc_id);
+
+            id_pairs.emplace_back(std::make_pair(doc_id, reference_doc_id));
+            unique_doc_ids.insert(doc_id);
+        }
+
+        if (id_pairs.empty()) {
+            return Option(true);
+        }
+
+        std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+            return left.first < right.first;
+        });
+
+        filter_result.count = unique_doc_ids.size();
+        filter_result.docs = new uint32_t[unique_doc_ids.size()];
+        filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+        std::vector<uint32_t> previous_doc_references;
+        for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+            auto const& current_doc = id_pairs[i].first;
+            auto const& reference_doc_id = id_pairs[i].second;
+
+            if (current_doc != previous_doc) {
+                filter_result.docs[result_index] = current_doc;
+                if (result_index > 0) {
+                    auto& reference_result = filter_result.coll_to_references[result_index - 1];
+
+                    auto r = reference_filter_result_t(previous_doc_references.size(),
+                                                       new uint32_t[previous_doc_references.size()],
+                                                       false);
+                    std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+                    reference_result[ref_collection_name] = std::move(r);
+
+                    previous_doc_references.clear();
+                }
+
+                result_index++;
+                previous_doc = current_doc;
+                previous_doc_references.push_back(reference_doc_id);
+            } else {
+                previous_doc_references.push_back(reference_doc_id);
+            }
+        }
+
+        if (!previous_doc_references.empty()) {
+            auto& reference_result = filter_result.coll_to_references[filter_result.count - 1];
+
+            auto r = reference_filter_result_t(previous_doc_references.size(),
+                                               new uint32_t[previous_doc_references.size()],
+                                               false);
+            std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+            reference_result[ref_collection_name] = std::move(r);
+        }
+
+        return Option(true);
+    }
+
+    // Multiple references per doc.
+    if (reference_index.count(reference_helper_field_name) == 0) {
+        return Option<bool>(400, "`" + reference_helper_field_name + "` is not present in reference index.");
+    }
+    auto& ref_index = *reference_index.at(reference_helper_field_name);
+
+    if (is_nested_join) {
+        // In case of nested join, we need to collect all the doc ids from the reference ids along with their references.
+        std::vector<std::pair<uint32_t, single_filter_result_t*>> id_pairs;
+        std::unordered_set<uint32_t> unique_doc_ids;
+
+        for (uint32_t i = 0; i < count; i++) {
+            auto& reference_doc_id = reference_docs[i];
+            auto reference_doc_references = std::move(ref_filter_result->coll_to_references[i]);
+            size_t doc_ids_len = 0;
+            uint32_t* doc_ids = nullptr;
+
+            ref_index.search(EQUALS, reference_doc_id, &doc_ids, doc_ids_len);
+
+            for (size_t j = 0; j < doc_ids_len; j++) {
+                auto doc_id = doc_ids[j];
+                auto reference_doc_references_copy = reference_doc_references;
+                id_pairs.emplace_back(std::make_pair(doc_id, new single_filter_result_t(reference_doc_id,
+                                                                                        std::move(reference_doc_references_copy),
+                                                                                        false)));
+                unique_doc_ids.insert(doc_id);
+            }
+            delete[] doc_ids;
+        }
+
+        if (id_pairs.empty()) {
+            return Option(true);
+        }
+
+        std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+            return left.first < right.first;
+        });
+
+        filter_result.count = unique_doc_ids.size();
+        filter_result.docs = new uint32_t[unique_doc_ids.size()];
+        filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+        reference_filter_result_t previous_doc_references;
+        for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+            auto const& current_doc = id_pairs[i].first;
+            auto& reference_result = id_pairs[i].second;
+
+            if (current_doc != previous_doc) {
+                filter_result.docs[result_index] = current_doc;
+                if (result_index > 0) {
+                    std::map<std::string, reference_filter_result_t> references;
+                    references[ref_collection_name] = std::move(previous_doc_references);
+                    filter_result.coll_to_references[result_index - 1] = std::move(references);
+                }
+
+                result_index++;
+                previous_doc = current_doc;
+                aggregate_nested_references(reference_result, previous_doc_references);
+            } else {
+                aggregate_nested_references(reference_result, previous_doc_references);
+            }
+        }
+
+        if (previous_doc_references.count != 0) {
+            std::map<std::string, reference_filter_result_t> references;
+            references[ref_collection_name] = std::move(previous_doc_references);
+            filter_result.coll_to_references[filter_result.count - 1] = std::move(references);
+        }
+
+        for (auto &item: id_pairs) {
+            delete item.second;
+        }
+
+        return Option<bool>(true);
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> id_pairs;
+    std::unordered_set<uint32_t> unique_doc_ids;
+
+    for (uint32_t i = 0; i < count; i++) {
+        auto& reference_doc_id = reference_docs[i];
+        size_t doc_ids_len = 0;
+        uint32_t* doc_ids = nullptr;
+
+        ref_index.search(EQUALS, reference_doc_id, &doc_ids, doc_ids_len);
+
+        for (size_t j = 0; j < doc_ids_len; j++) {
+            auto doc_id = doc_ids[j];
+            id_pairs.emplace_back(std::make_pair(doc_id, reference_doc_id));
+            unique_doc_ids.insert(doc_id);
+        }
+        delete[] doc_ids;
+    }
+
+    if (id_pairs.empty()) {
+        return Option(true);
+    }
+
+    std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+        return left.first < right.first;
+    });
+
+    filter_result.count = unique_doc_ids.size();
+    filter_result.docs = new uint32_t[unique_doc_ids.size()];
+    filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+    std::vector<uint32_t> previous_doc_references;
+    for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+        auto const& current_doc = id_pairs[i].first;
+        auto const& reference_doc_id = id_pairs[i].second;
+
+        if (current_doc != previous_doc) {
+            filter_result.docs[result_index] = current_doc;
+            if (result_index > 0) {
+                auto& reference_result = filter_result.coll_to_references[result_index - 1];
+
+                auto r = reference_filter_result_t(previous_doc_references.size(), new uint32_t[previous_doc_references.size()]);
+                std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+                reference_result[ref_collection_name] = std::move(r);
+
+                previous_doc_references.clear();
+            }
+
+            result_index++;
+            previous_doc = current_doc;
+            previous_doc_references.push_back(reference_doc_id);
+        } else {
+            previous_doc_references.push_back(reference_doc_id);
+        }
+    }
+
+    if (!previous_doc_references.empty()) {
+        auto& reference_result = filter_result.coll_to_references[filter_result.count - 1];
+
+        auto r = reference_filter_result_t(previous_doc_references.size(), new uint32_t[previous_doc_references.size()]);
+        std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+        reference_result[ref_collection_name] = std::move(r);
     }
 
     return Option(true);
 }
 
+Option<filter_result_t> Index::do_filtering_with_reference_ids(const std::string& reference_helper_field_name,
+                                                               const std::string& ref_collection_name,
+                                                               filter_result_t&& ref_filter_result) const {
+    filter_result_t filter_result;
+    auto const& count = ref_filter_result.count;
+    auto const& reference_docs = ref_filter_result.docs;
+    auto const is_nested_join = ref_filter_result.coll_to_references != nullptr;
+
+    if (count == 0) {
+        return Option<filter_result_t>(filter_result);
+    }
+
+    if (numerical_index.count(reference_helper_field_name) == 0) {
+        return Option<filter_result_t>(400, "`" + reference_helper_field_name + "` is not present in index.");
+    }
+    auto num_tree = numerical_index.at(reference_helper_field_name);
+
+    if (is_nested_join) {
+        // In case of nested join, we need to collect all the doc ids from the reference ids along with their references.
+        std::vector<std::pair<uint32_t, single_filter_result_t*>> id_pairs;
+        std::unordered_set<uint32_t> unique_doc_ids;
+
+        for (uint32_t i = 0; i < count; i++) {
+            auto& reference_doc_id = reference_docs[i];
+            auto reference_doc_references = std::move(ref_filter_result.coll_to_references[i]);
+            size_t doc_ids_len = 0;
+            uint32_t* doc_ids = nullptr;
+
+            num_tree->search(NUM_COMPARATOR::EQUALS, reference_doc_id, &doc_ids, doc_ids_len);
+
+            for (size_t j = 0; j < doc_ids_len; j++) {
+                auto doc_id = doc_ids[j];
+                auto reference_doc_references_copy = reference_doc_references;
+                id_pairs.emplace_back(std::make_pair(doc_id, new single_filter_result_t(reference_doc_id,
+                                                                                        std::move(reference_doc_references_copy),
+                                                                                        false)));
+                unique_doc_ids.insert(doc_id);
+            }
+
+            delete[] doc_ids;
+        }
+
+        if (id_pairs.empty()) {
+            return Option(filter_result);
+        }
+
+        std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+            return left.first < right.first;
+        });
+
+        filter_result.count = unique_doc_ids.size();
+        filter_result.docs = new uint32_t[unique_doc_ids.size()];
+        filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+        reference_filter_result_t previous_doc_references;
+        for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+            auto const& current_doc = id_pairs[i].first;
+            auto& reference_result = id_pairs[i].second;
+
+            if (current_doc != previous_doc) {
+                filter_result.docs[result_index] = current_doc;
+                if (result_index > 0) {
+                    std::map<std::string, reference_filter_result_t> references;
+                    references[ref_collection_name] = std::move(previous_doc_references);
+                    filter_result.coll_to_references[result_index - 1] = std::move(references);
+                }
+
+                result_index++;
+                previous_doc = current_doc;
+                aggregate_nested_references(reference_result, previous_doc_references);
+            } else {
+                aggregate_nested_references(reference_result, previous_doc_references);
+            }
+        }
+
+        if (previous_doc_references.count != 0) {
+            std::map<std::string, reference_filter_result_t> references;
+            references[ref_collection_name] = std::move(previous_doc_references);
+            filter_result.coll_to_references[filter_result.count - 1] = std::move(references);
+        }
+
+        for (auto &item: id_pairs) {
+            delete item.second;
+        }
+
+        return Option<filter_result_t>(filter_result);
+    }
+
+    // Collect all the doc ids from the reference ids.
+    std::vector<std::pair<uint32_t, uint32_t>> id_pairs;
+    std::unordered_set<uint32_t> unique_doc_ids;
+
+    for (uint32_t i = 0; i < count; i++) {
+        auto& reference_doc_id = reference_docs[i];
+        size_t doc_ids_len = 0;
+        uint32_t* doc_ids = nullptr;
+
+        num_tree->search(NUM_COMPARATOR::EQUALS, reference_doc_id, &doc_ids, doc_ids_len);
+
+        for (size_t j = 0; j < doc_ids_len; j++) {
+            auto doc_id = doc_ids[j];
+            id_pairs.emplace_back(std::make_pair(doc_id, reference_doc_id));
+            unique_doc_ids.insert(doc_id);
+        }
+        delete[] doc_ids;
+    }
+
+    if (id_pairs.empty()) {
+        return Option(filter_result);
+    }
+
+    std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
+        return left.first < right.first;
+    });
+
+    filter_result.count = unique_doc_ids.size();
+    filter_result.docs = new uint32_t[unique_doc_ids.size()];
+    filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
+
+    std::vector<uint32_t> previous_doc_references;
+    for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
+        auto const& current_doc = id_pairs[i].first;
+        auto const& reference_doc_id = id_pairs[i].second;
+
+        if (current_doc != previous_doc) {
+            filter_result.docs[result_index] = current_doc;
+            if (result_index > 0) {
+                auto& reference_result = filter_result.coll_to_references[result_index - 1];
+
+                auto r = reference_filter_result_t(previous_doc_references.size(),
+                                                   new uint32_t[previous_doc_references.size()],
+                                                   false);
+                std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+                reference_result[ref_collection_name] = std::move(r);
+
+                previous_doc_references.clear();
+            }
+
+            result_index++;
+            previous_doc = current_doc;
+            previous_doc_references.push_back(reference_doc_id);
+        } else {
+            previous_doc_references.push_back(reference_doc_id);
+        }
+    }
+
+    if (!previous_doc_references.empty()) {
+        auto& reference_result = filter_result.coll_to_references[filter_result.count - 1];
+
+        auto r = reference_filter_result_t(previous_doc_references.size(),
+                                           new uint32_t[previous_doc_references.size()],
+                                           false);
+        std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
+        reference_result[ref_collection_name] = std::move(r);
+    }
+
+    return Option<filter_result_t>(filter_result);
+}
+
 Option<bool> Index::run_search(search_args* search_params, const std::string& collection_name,
-                               facet_index_type_t facet_index_type) {
+                               facet_index_type_t facet_index_type, bool enable_typos_for_numerical_tokens,
+                               bool enable_synonyms, bool synonym_prefix, uint32_t synonym_num_typos,
+                               bool enable_typos_for_alpha_numerical_tokens) {
     return search(search_params->field_query_tokens,
            search_params->search_fields,
            search_params->match_type,
@@ -1740,10 +2236,13 @@ Option<bool> Index::run_search(search_args* search_params, const std::string& co
            search_params->qtoken_set,
            search_params->raw_result_kvs, search_params->override_result_kvs,
            search_params->typo_tokens_threshold,
-           search_params->group_limit, search_params->group_by_fields,
+           search_params->group_limit,
+           search_params->group_by_fields,
+           search_params->group_missing_values,
            search_params->default_sorting_field,
            search_params->prioritize_exact_match,
            search_params->prioritize_token_position,
+           search_params->prioritize_num_matching_fields,
            search_params->exhaustive_search,
            search_params->concurrency,
            search_params->search_cutoff_ms,
@@ -1760,7 +2259,15 @@ Option<bool> Index::run_search(search_args* search_params, const std::string& co
            search_params->facet_sample_percent,
            search_params->facet_sample_threshold,
            collection_name,
-           facet_index_type);
+           search_params->drop_tokens_mode,
+           facet_index_type,
+           enable_typos_for_numerical_tokens,
+           enable_synonyms,
+           synonym_prefix,
+           synonym_num_typos,
+           search_params->enable_lazy_filter,
+           enable_typos_for_alpha_numerical_tokens
+           );
 }
 
 void Index::collate_included_ids(const std::vector<token_t>& q_included_tokens,
@@ -1789,7 +2296,7 @@ void Index::collate_included_ids(const std::vector<token_t>& q_included_tokens,
             scores[1] = int64_t(1);
             scores[2] = int64_t(1);
 
-            KV kv(searched_queries.size(), seq_id, distinct_id, 0, scores);
+            KV kv(0, seq_id, distinct_id, 0, scores);
             curated_topster->add(&kv);
         }
     }
@@ -1816,8 +2323,13 @@ bool Index::static_filter_query_eval(const override_t* override,
                                      std::vector<std::string>& tokens,
                                      filter_node_t*& filter_tree_root) const {
     std::string query = StringUtils::join(tokens, " ");
+    bool tag_matched = (!override->rule.tags.empty() && override->rule.filter_by.empty() &&
+                         override->rule.query.empty());
 
-    if ((override->rule.match == override_t::MATCH_EXACT && override->rule.normalized_query == query) ||
+    bool wildcard_tag_matched = (override->rule.tags.size() == 1 && *override->rule.tags.begin() == "*");
+
+    if (tag_matched || wildcard_tag_matched ||
+        (override->rule.match == override_t::MATCH_EXACT && override->rule.normalized_query == query) ||
         (override->rule.match == override_t::MATCH_CONTAINS &&
          StringUtils::contains_word(query, override->rule.normalized_query))) {
         filter_node_t* new_filter_tree_root = nullptr;
@@ -1843,7 +2355,8 @@ bool Index::static_filter_query_eval(const override_t* override,
 bool Index::resolve_override(const std::vector<std::string>& rule_tokens, const bool exact_rule_match,
                              const std::vector<std::string>& query_tokens,
                              token_ordering token_order, std::set<std::string>& absorbed_tokens,
-                             std::string& filter_by_clause) const {
+                             std::string& filter_by_clause, bool enable_typos_for_numerical_tokens,
+                             bool enable_typos_for_alpha_numerical_tokens) const {
 
     bool resolved_override = false;
     size_t i = 0, j = 0;
@@ -1886,7 +2399,8 @@ bool Index::resolve_override(const std::vector<std::string>& rule_tokens, const 
                 std::vector<std::string> field_absorbed_tokens;
                 resolved_override &= check_for_overrides(token_order, field_name, slide_window,
                                                          exact_rule_match, matched_tokens, absorbed_tokens,
-                                                         field_absorbed_tokens);
+                                                         field_absorbed_tokens, enable_typos_for_numerical_tokens,
+                                                         enable_typos_for_alpha_numerical_tokens);
 
                 if(!resolved_override) {
                     goto RETURN_EARLY;
@@ -1936,7 +2450,10 @@ void Index::process_filter_overrides(const std::vector<const override_t*>& filte
                                      std::vector<std::string>& query_tokens,
                                      token_ordering token_order,
                                      filter_node_t*& filter_tree_root,
-                                     std::vector<const override_t*>& matched_dynamic_overrides) const {
+                                     std::vector<const override_t*>& matched_dynamic_overrides,
+                                     nlohmann::json& override_metadata,
+                                     bool enable_typos_for_numerical_tokens,
+                                     bool enable_typos_for_alpha_numerical_tokens) const {
     std::shared_lock lock(mutex);
 
     for (auto& override : filter_overrides) {
@@ -1946,6 +2463,9 @@ void Index::process_filter_overrides(const std::vector<const override_t*>& filte
             bool resolved_override = static_filter_query_eval(override, query_tokens, filter_tree_root);
 
             if (resolved_override) {
+                if(override_metadata.empty()) {
+                    override_metadata = override->metadata;
+                }
                 if (override->remove_matched_tokens) {
                     std::vector<std::string> rule_tokens;
                     Tokenizer(override->rule.query, true).tokenize(rule_tokens);
@@ -1969,9 +2489,15 @@ void Index::process_filter_overrides(const std::vector<const override_t*>& filte
 
             std::set<std::string> absorbed_tokens;
             bool resolved_override = resolve_override(rule_parts, exact_rule_match, query_tokens,
-                                                      token_order, absorbed_tokens, filter_by_clause);
+                                                      token_order, absorbed_tokens, filter_by_clause,
+                                                      enable_typos_for_numerical_tokens,
+                                                      enable_typos_for_alpha_numerical_tokens);
 
             if (resolved_override) {
+                if(override_metadata.empty()) {
+                    override_metadata = override->metadata;
+                }
+
                 filter_node_t* new_filter_tree_root = nullptr;
                 Option<bool> filter_op = filter::parse_filter_query(filter_by_clause, search_schema,
                                                                     store, "", new_filter_tree_root);
@@ -2022,7 +2548,9 @@ void Index::remove_matched_tokens(std::vector<std::string>& tokens, const std::s
 bool Index::check_for_overrides(const token_ordering& token_order, const string& field_name, const bool slide_window,
                                 bool exact_rule_match, std::vector<std::string>& tokens,
                                 std::set<std::string>& absorbed_tokens,
-                                std::vector<std::string>& field_absorbed_tokens) const {
+                                std::vector<std::string>& field_absorbed_tokens,
+                                bool enable_typos_for_numerical_tokens,
+                                bool enable_typos_for_alpha_numerical_tokens) const {
 
     for(size_t window_len = tokens.size(); window_len > 0; window_len--) {
         for(size_t start_index = 0; start_index+window_len-1 < tokens.size(); start_index++) {
@@ -2052,13 +2580,28 @@ bool Index::check_for_overrides(const token_ordering& token_order, const string&
             }
 
             std::vector<sort_by> sort_fields;
-            search_field(0, window_tokens, nullptr, 0, num_toks_dropped, field_it.value(), field_name,
-                         nullptr, 0, {}, sort_fields, -1, 0, searched_queries, topster, groups_processed,
-                         &result_ids, result_ids_len, field_num_results, 0, group_by_fields,
-                         false, 4, query_hashes, token_order, false, 0, 0, false, -1, 3, 7, 4);
+            std::vector<search_field_t> fq_fields;
+            fq_fields.emplace_back(field_name, field_it.value().faceted_name(), 1, 0, false, enable_t::off);
+
+            uint32_t* filter_ids = nullptr;
+            filter_result_iterator_t filter_result_it(filter_ids, 0);
+            std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values{};
+            const std::vector<size_t> geopoint_indices;
+            tsl::htrie_map<char, token_leaf> qtoken_set;
+
+            auto fuzzy_search_fields_op = fuzzy_search_fields(
+                    fq_fields, window_tokens, {}, text_match_type_t::max_score, nullptr, 0,
+                    &filter_result_it, {}, {}, sort_fields, {0}, searched_queries,
+                    qtoken_set, topster, groups_processed, result_ids, result_ids_len,
+                    0, group_by_fields, false, true, false, false, query_hashes, MAX_SCORE, {false}, 1,
+                    false, 4, 3, 7, 0, nullptr, field_values, geopoint_indices, "", true);
+
+            if(!fuzzy_search_fields_op.ok()) {
+                continue;
+            }
 
             if(result_ids_len != 0) {
-                // we need to narraw onto the exact matches
+                // we need to narrow onto the exact matches
                 std::vector<void*> posting_lists;
                 art_tree* t = search_index.at(field_name);
 
@@ -2108,13 +2651,14 @@ bool Index::check_for_overrides(const token_ordering& token_order, const string&
     return false;
 }
 
-void Index::search_infix(const std::string& query, const std::string& field_name,
-                         std::vector<uint32_t>& ids, const size_t max_extra_prefix, const size_t max_extra_suffix) const {
+Option<bool> Index::search_infix(const std::string& query, const std::string& field_name, std::vector<uint32_t>& ids,
+                                 const size_t max_extra_prefix, const size_t max_extra_suffix) const {
 
     auto infix_maps_it = infix_index.find(field_name);
 
     if(infix_maps_it == infix_index.end()) {
-        return ;
+        return Option<bool>(400, "Could not find `" + field_name + "` in the infix index. Make sure to enable infix "
+                                                                   "search by specifying `\"infix\": true` in the schema.");
     }
 
     auto infix_sets = infix_maps_it->second;
@@ -2136,7 +2680,7 @@ void Index::search_infix(const std::string& query, const std::string& field_name
                                      &parent_search_begin, &parent_search_stop_ms, &parent_search_cutoff]() {
 
             search_begin_us = parent_search_begin;
-            search_cutoff = parent_search_cutoff;
+            search_cutoff = false;
             auto op_search_stop_ms = parent_search_stop_ms/2;
 
             std::vector<art_leaf*> this_leaves;
@@ -2183,6 +2727,8 @@ void Index::search_infix(const std::string& query, const std::string& field_name
     for(auto leaf: leaves) {
         posting_t::merge({leaf->values}, ids);
     }
+
+    return Option<bool>(true);
 }
 
 Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, const std::vector<search_field_t>& the_fields,
@@ -2201,18 +2747,27 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                    std::vector<std::vector<KV*>>& raw_result_kvs, std::vector<std::vector<KV*>>& override_result_kvs,
                    const size_t typo_tokens_threshold, const size_t group_limit,
                    const std::vector<std::string>& group_by_fields,
+                   const bool group_missing_values,
                    const string& default_sorting_field, bool prioritize_exact_match,
-                   const bool prioritize_token_position, bool exhaustive_search,
+                   const bool prioritize_token_position, const bool prioritize_num_matching_fields, bool exhaustive_search,
                    size_t concurrency, size_t search_cutoff_ms, size_t min_len_1typo, size_t min_len_2typo,
                    size_t max_candidates, const std::vector<enable_t>& infixes, const size_t max_extra_prefix,
                    const size_t max_extra_suffix, const size_t facet_query_num_typos,
                    const bool filter_curated_hits, const enable_t split_join_tokens,
                    const vector_query_t& vector_query,
                    size_t facet_sample_percent, size_t facet_sample_threshold,
-                   const std::string& collection_name, facet_index_type_t facet_index_type) const {
+                   const std::string& collection_name,
+                   const drop_tokens_param_t drop_tokens_mode,
+                   facet_index_type_t facet_index_type,
+                   bool enable_typos_for_numerical_tokens,
+                   bool enable_synonyms, bool synonym_prefix,
+                   uint32_t synonym_num_typos,
+                   bool enable_lazy_filter,
+                   bool enable_typos_for_alpha_numerical_tokens) const {
     std::shared_lock lock(mutex);
 
-    auto filter_result_iterator = new filter_result_iterator_t(collection_name, this, filter_tree_root);
+    auto filter_result_iterator = new filter_result_iterator_t(collection_name, this, filter_tree_root,
+                                                               search_begin_us, search_stop_us);
     std::unique_ptr<filter_result_iterator_t> filter_iterator_guard(filter_result_iterator);
 
     auto filter_init_op = filter_result_iterator->init_status();
@@ -2220,9 +2775,21 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         return filter_init_op;
     }
 
-    if (filter_tree_root != nullptr && !filter_result_iterator->is_valid) {
+    if (filter_tree_root != nullptr && filter_result_iterator->validity != filter_result_iterator_t::valid) {
         return Option(true);
     }
+
+#ifdef TEST_BUILD
+
+    if (filter_result_iterator->approx_filter_ids_length > 20) {
+        filter_result_iterator->compute_iterators();
+    }
+#else
+
+    if (!enable_lazy_filter || filter_result_iterator->approx_filter_ids_length < 25'000) {
+        filter_result_iterator->compute_iterators();
+    }
+#endif
 
     size_t fetch_size = offset + per_page;
 
@@ -2231,10 +2798,12 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
     std::vector<uint32_t> included_ids_vec;
     std::unordered_set<uint32_t> excluded_group_ids;
 
-    process_curated_ids(included_ids, excluded_ids, group_by_fields, group_limit, filter_curated_hits,
+    process_curated_ids(included_ids, excluded_ids, group_by_fields, group_limit, 
+                        group_missing_values, filter_curated_hits,
                         filter_result_iterator, curated_ids, included_ids_map,
                         included_ids_vec, excluded_group_ids);
     filter_result_iterator->reset();
+    search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
     std::vector<uint32_t> curated_ids_sorted(curated_ids.begin(), curated_ids.end());
     std::sort(curated_ids_sorted.begin(), curated_ids_sorted.end());
@@ -2251,7 +2820,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
     handle_exclusion(num_search_fields, field_query_tokens, the_fields, exclude_token_ids, exclude_token_ids_size);
 
     int sort_order[3];  // 1 or -1 based on DESC or ASC respectively
-    std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values;
+    std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values;
     std::vector<size_t> geopoint_indices;
     populate_sort_mapping(sort_order, geopoint_indices, sort_fields_std, field_values);
 
@@ -2263,14 +2832,17 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
     auto is_wildcard_query = !field_query_tokens.empty() && !field_query_tokens[0].q_include_tokens.empty() &&
                              field_query_tokens[0].q_include_tokens[0].value == "*";
+
+    // phrase queries are handled as a filtering query
+    bool is_wildcard_non_phrase_query = is_wildcard_query && field_query_tokens[0].q_phrases.empty();
     
-    bool no_filters_provided = (filter_tree_root == nullptr && !filter_result_iterator->is_valid);
-    
+    bool no_filters_provided = (filter_tree_root == nullptr && !filter_result_iterator->validity == filter_result_iterator_t::valid);
 
     // handle phrase searches
     if (!field_query_tokens[0].q_phrases.empty()) {
         auto do_phrase_search_op = do_phrase_search(num_search_fields, the_fields, field_query_tokens,
                                                     sort_fields_std, searched_queries, group_limit, group_by_fields,
+                                                    group_missing_values,
                                                     topster, sort_order, field_values, geopoint_indices, curated_ids_sorted,
                                                     filter_result_iterator, all_result_ids, all_result_ids_len,
                                                     groups_processed, curated_ids,
@@ -2282,6 +2854,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         filter_iterator_guard.reset(filter_result_iterator);
 
         if (!do_phrase_search_op.ok()) {
+            delete [] all_result_ids;
             return do_phrase_search_op;
         }
 
@@ -2290,19 +2863,27 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         }
     }
     // for phrase query, parser will set field_query_tokens to "*", need to handle that
-    if (is_wildcard_query && field_query_tokens[0].q_phrases.empty()) {
-
+    if (is_wildcard_non_phrase_query) {
         if(no_filters_provided && facets.empty() && curated_ids.empty() && vector_query.field_name.empty() &&
            sort_fields_std.size() == 1 && sort_fields_std[0].name == sort_field_const::seq_id &&
            sort_fields_std[0].order == sort_field_const::desc) {
             // optimize for this path specifically
             std::vector<uint32_t> result_ids;
             auto it = seq_ids->new_rev_iterator();
+
+            std::vector<group_by_field_it_t> group_by_field_it_vec;
+            if (group_limit != 0) {
+                group_by_field_it_vec = get_group_by_field_iterators(group_by_fields, true);
+            }
+
             while (it.valid()) {
                 uint32_t seq_id = it.id();
                 uint64_t distinct_id = seq_id;
                 if (group_limit != 0) {
-                    distinct_id = get_distinct_id(group_by_fields, seq_id);
+                    distinct_id = 1;
+                    for(auto& kv : group_by_field_it_vec) {
+                        get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id, true);
+                    }
                     if(excluded_group_ids.count(distinct_id) != 0) {
                        continue;
                    }
@@ -2341,43 +2922,47 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 k++;
             }
 
+            VectorFilterFunctor filterFunctor(filter_result_iterator, excluded_result_ids, excluded_result_ids_size);
             auto& field_vector_index = vector_index.at(vector_query.field_name);
 
             std::vector<std::pair<float, single_filter_result_t>> dist_results;
 
-            uint32_t filter_id_count = 0;
-            while (!no_filters_provided &&
-                    filter_id_count < vector_query.flat_search_cutoff && filter_result_iterator->is_valid) {
-                auto& seq_id = filter_result_iterator->seq_id;
-                auto filter_result = single_filter_result_t(seq_id, std::move(filter_result_iterator->reference));
-                filter_result_iterator->next();
-                std::vector<float> values;
+            filter_result_iterator->compute_iterators();
 
-                try {
-                    values = field_vector_index->vecdex->getDataByLabel<float>(seq_id);
-                } catch(...) {
-                    // likely not found
-                    continue;
+            uint32_t filter_id_count = filter_result_iterator->approx_filter_ids_length;
+            if (!no_filters_provided && filter_id_count < vector_query.flat_search_cutoff) {
+                while (filter_result_iterator->validity == filter_result_iterator_t::valid) {
+                    auto seq_id = filter_result_iterator->seq_id;
+                    auto filter_result = single_filter_result_t(seq_id, std::move(filter_result_iterator->reference));
+                    filter_result_iterator->next();
+                    std::vector<float> values;
+
+                    try {
+                        values = field_vector_index->vecdex->getDataByLabel<float>(seq_id);
+                    } catch (...) {
+                        // likely not found
+                        continue;
+                    }
+
+                    float dist;
+                    if (field_vector_index->distance_type == cosine) {
+                        std::vector<float> normalized_q(vector_query.values.size());
+                        hnsw_index_t::normalize_vector(vector_query.values, normalized_q);
+                        dist = field_vector_index->space->get_dist_func()(normalized_q.data(), values.data(),
+                                                                          &field_vector_index->num_dim);
+                    } else {
+                        dist = field_vector_index->space->get_dist_func()(vector_query.values.data(), values.data(),
+                                                                          &field_vector_index->num_dim);
+                    }
+
+                    dist_results.emplace_back(dist, filter_result);
                 }
-
-                float dist;
-                if(field_vector_index->distance_type == cosine) {
-                    std::vector<float> normalized_q(vector_query.values.size());
-                    hnsw_index_t::normalize_vector(vector_query.values, normalized_q);
-                    dist = field_vector_index->space->get_dist_func()(normalized_q.data(), values.data(),
-                                                                      &field_vector_index->num_dim);
-                } else {
-                    dist = field_vector_index->space->get_dist_func()(vector_query.values.data(), values.data(),
-                                                                      &field_vector_index->num_dim);
-                }
-
-                dist_results.emplace_back(dist, filter_result);
-                filter_id_count++;
             }
             filter_result_iterator->reset();
+            search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
             if(no_filters_provided ||
-                (filter_id_count >= vector_query.flat_search_cutoff && filter_result_iterator->is_valid)) {
+                (filter_id_count >= vector_query.flat_search_cutoff && filter_result_iterator->validity == filter_result_iterator_t::valid)) {
                 dist_results.clear();
 
                 VectorFilterFunctor filterFunctor(filter_result_iterator);
@@ -2386,21 +2971,34 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 if(field_vector_index->distance_type == cosine) {
                     std::vector<float> normalized_q(vector_query.values.size());
                     hnsw_index_t::normalize_vector(vector_query.values, normalized_q);
-                    pairs = field_vector_index->vecdex->searchKnnCloserFirst(normalized_q.data(), k, &filterFunctor);
+                    pairs = field_vector_index->vecdex->searchKnnCloserFirst(normalized_q.data(), k, vector_query.ef, &filterFunctor);
                 } else {
-                    pairs = field_vector_index->vecdex->searchKnnCloserFirst(vector_query.values.data(), k, &filterFunctor);
+                    pairs = field_vector_index->vecdex->searchKnnCloserFirst(vector_query.values.data(), k, vector_query.ef, &filterFunctor);
                 }
+
+                std::sort(pairs.begin(), pairs.end(), [](auto& x, auto& y) {
+                    return x.second < y.second;
+                });
+
                 filter_result_iterator->reset();
 
-                if (filter_result_iterator->is_valid && !filter_result_iterator->reference.empty()) {
+                if (!filter_result_iterator->reference.empty()) {
                     // We'll have to get the references of each document.
                     for (auto pair: pairs) {
-                        // The doc_id must be valid otherwise it would've been filtered out upstream.
-                        filter_result_iterator->skip_to(pair.second);
-                        auto filter_result = single_filter_result_t(pair.second,
+                        if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
+                            // Overriding timeout since we need to get the references of matched docs.
+                            filter_result_iterator->reset(true);
+                            search_cutoff = true;
+                        }
+
+                        auto const& seq_id = pair.second;
+                        if (filter_result_iterator->is_valid(seq_id, search_cutoff) != 1) {
+                            continue;
+                        }
+                        // The seq_id must be valid otherwise it would've been filtered out upstream.
+                        auto filter_result = single_filter_result_t(seq_id,
                                                                     std::move(filter_result_iterator->reference));
                         dist_results.emplace_back(pair.first, filter_result);
-                        filter_result_iterator->reset();
                     }
                 } else {
                     for (const auto &pair: pairs) {
@@ -2411,6 +3009,12 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
             }
 
             std::vector<uint32_t> nearest_ids;
+            std::vector<uint32_t> eval_filter_indexes;
+
+            std::vector<group_by_field_it_t> group_by_field_it_vec;
+            if (group_limit != 0) {
+                group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+            }
 
             for (auto& dist_result : dist_results) {
                 auto& seq_id = dist_result.second.seq_id;
@@ -2420,9 +3024,20 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                     continue;
                 }
 
+                if(vector_query.query_doc_given && nearest_ids.size() >= k-1) {
+                    // When id based vector query is made, we ask for K+1 results to account for the query
+                    // record itself being returned. However, when the filter clause does not match the
+                    // query record, we will end up returning 1 extra hit.
+                    break;
+                }
+
                 uint64_t distinct_id = seq_id;
                 if (group_limit != 0) {
-                    distinct_id = get_distinct_id(group_by_fields, seq_id);
+                    distinct_id = 1;
+                    for(auto &kv : group_by_field_it_vec) {
+                        get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+                    }
+
                     if(excluded_group_ids.count(distinct_id) != 0) {
                        continue;
                    }
@@ -2439,8 +3054,9 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 int64_t match_score_index = -1;
 
                 auto compute_sort_scores_op = compute_sort_scores(sort_fields_std, sort_order, field_values,
-                                                                  geopoint_indices, seq_id, references, 0, 0, scores,
-                                                                  match_score_index, vec_dist_score, collection_name);
+                                                                  geopoint_indices, seq_id, references, eval_filter_indexes,
+                                                                  0, scores, match_score_index, vec_dist_score,
+                                                                  collection_name);
                 if (!compute_sort_scores_op.ok()) {
                     return compute_sort_scores_op;
                 }
@@ -2452,6 +3068,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 if(group_limit != 0 && ret < 2) {
                     groups_processed[distinct_id]++;
                 }
+
                 nearest_ids.push_back(seq_id);
             }
 
@@ -2464,12 +3081,14 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         } else {
             // if filters were not provided, use the seq_ids index to generate the list of all document ids
             if (no_filters_provided) {
-                filter_result_iterator = new filter_result_iterator_t(seq_ids->uncompress(), seq_ids->num_ids());
+                filter_result_iterator = new filter_result_iterator_t(seq_ids->uncompress(), seq_ids->num_ids(),
+                                                                      search_begin_us, search_stop_us);
                 filter_iterator_guard.reset(filter_result_iterator);
             }
 
             auto search_wildcard_op = search_wildcard(filter_tree_root, included_ids_map, sort_fields_std, topster,
                                                       curated_topster, groups_processed, searched_queries, group_limit, group_by_fields,
+                                                      group_missing_values,
                                                       curated_ids, curated_ids_sorted,
                                                       excluded_result_ids, excluded_result_ids_size, excluded_group_ids,
                                                       all_result_ids, all_result_ids_len,
@@ -2478,7 +3097,6 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
             if (!search_wildcard_op.ok()) {
                 return search_wildcard_op;
             }
-            filter_result_iterator->reset();
         }
 
         uint32_t _all_result_ids_len = all_result_ids_len;
@@ -2498,11 +3116,26 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         std::vector<std::vector<token_t>> q_pos_synonyms;
         std::vector<std::string> q_include_tokens;
         int syn_orig_num_tokens = -1;
-
         for(size_t j = 0; j < field_query_tokens[0].q_include_tokens.size(); j++) {
             q_include_tokens.push_back(field_query_tokens[0].q_include_tokens[j].value);
         }
-        synonym_index->synonym_reduction(q_include_tokens, field_query_tokens[0].q_synonyms);
+
+        if(enable_synonyms) {
+            synonym_index->synonym_reduction(q_include_tokens, field_query_tokens[0].q_synonyms,
+                                             synonym_prefix, synonym_num_typos);
+        }
+
+        const bool& do_stemming = (search_schema.find(the_fields[0].name) != search_schema.end() && search_schema.at(the_fields[0].name).stem);
+        if (do_stemming) {
+            auto stemmer = search_schema.at(the_fields[0].name).get_stemmer();
+            for(auto& q_include_token: q_include_tokens) {
+                q_include_token = stemmer->stem(q_include_token);
+            }
+
+            for(auto& q_token: field_query_tokens[0].q_include_tokens) {
+                q_token.value = stemmer->stem(q_token.value);
+            }
+        }
 
         if(!field_query_tokens[0].q_synonyms.empty()) {
             syn_orig_num_tokens = field_query_tokens[0].q_include_tokens.size();
@@ -2512,7 +3145,12 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
             std::vector<token_t> q_pos_syn;
             for(size_t j=0; j < q_syn_vec.size(); j++) {
                 bool is_prefix = (j == q_syn_vec.size()-1);
-                q_pos_syn.emplace_back(j, q_syn_vec[j], is_prefix, q_syn_vec[j].size(), 0);
+                std::string token_val = q_syn_vec[j];
+                if (do_stemming) {
+                    auto stemmer = search_schema.at(the_fields[0].name).get_stemmer();
+                    token_val = stemmer->stem(q_syn_vec[j]);
+                }
+                q_pos_syn.emplace_back(j, token_val, is_prefix, token_val.size(), 0);
             }
 
             q_pos_synonyms.push_back(q_pos_syn);
@@ -2529,12 +3167,14 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                                                           excluded_group_ids, sort_fields_std, num_typos,
                                                           searched_queries, qtoken_set, topster, groups_processed,
                                                           all_result_ids, all_result_ids_len,
-                                                          group_limit, group_by_fields, prioritize_exact_match,
-                                                          prioritize_token_position, query_hashes, token_order, prefixes,
+                                                          group_limit, group_by_fields, group_missing_values, prioritize_exact_match,
+                                                          prioritize_token_position, prioritize_num_matching_fields,
+                                                          query_hashes, token_order, prefixes,
                                                           typo_tokens_threshold, exhaustive_search,
                                                           max_candidates, min_len_1typo, min_len_2typo,
                                                           syn_orig_num_tokens, sort_order, field_values, geopoint_indices,
-                                                          collection_name);
+                                                          collection_name, enable_typos_for_numerical_tokens,
+                                                          enable_typos_for_alpha_numerical_tokens);
         if (!fuzzy_search_fields_op.ok()) {
             return fuzzy_search_fields_op;
         }
@@ -2573,8 +3213,10 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                                                                   sort_fields_std, num_typos, searched_queries,
                                                                   qtoken_set, topster, groups_processed,
                                                                   all_result_ids, all_result_ids_len,
-                                                                  group_limit, group_by_fields, prioritize_exact_match,
-                                                                  prioritize_token_position, query_hashes, token_order,
+                                                                  group_limit, group_by_fields, group_missing_values, 
+                                                                  prioritize_exact_match, prioritize_token_position, 
+                                                                  prioritize_num_matching_fields, 
+                                                                  query_hashes, token_order,
                                                                   prefixes, typo_tokens_threshold, exhaustive_search,
                                                                   max_candidates, min_len_1typo, min_len_2typo,
                                                                   syn_orig_num_tokens, sort_order, field_values, geopoint_indices,
@@ -2588,8 +3230,8 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         // do synonym based searches
        auto do_synonym_search_op = do_synonym_search(the_fields, match_type, filter_tree_root, included_ids_map,
                                                      sort_fields_std, curated_topster, token_order, 0, group_limit,
-                                                     group_by_fields, prioritize_exact_match, prioritize_token_position,
-                                                     exhaustive_search, concurrency, prefixes,
+                                                     group_by_fields, group_missing_values, prioritize_exact_match, prioritize_token_position,
+                                                     prioritize_num_matching_fields, exhaustive_search, concurrency, prefixes,
                                                      min_len_1typo, min_len_2typo, max_candidates, curated_ids, curated_ids_sorted,
                                                      excluded_result_ids, excluded_result_ids_size, excluded_group_ids,
                                                      topster, q_pos_synonyms, syn_orig_num_tokens,
@@ -2600,7 +3242,9 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         if (!do_synonym_search_op.ok()) {
             return do_synonym_search_op;
         }
+
         filter_result_iterator->reset();
+        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
         // gather up both original query and synonym queries and do drop tokens
 
@@ -2608,16 +3252,36 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
             for (size_t qi = 0; qi < all_queries.size(); qi++) {
                 auto& orig_tokens = all_queries[qi];
                 size_t num_tokens_dropped = 0;
+                size_t total_dirs_done = 0;
 
-                while(exhaustive_search || all_result_ids_len < drop_tokens_threshold) {
+                // NOTE: when dropping both sides we will ignore exhaustive search
+
+                auto curr_direction = drop_tokens_mode.mode;
+                bool drop_both_sides = false;
+
+                if(drop_tokens_mode.mode == both_sides) {
+                    if(orig_tokens.size() <= drop_tokens_mode.token_limit) {
+                        drop_both_sides = true;
+                    } else {
+                        curr_direction = right_to_left;
+                    }
+                }
+
+                while(exhaustive_search || all_result_ids_len < drop_tokens_threshold || drop_both_sides) {
                     // When atleast two tokens from the query are available we can drop one
                     std::vector<token_t> truncated_tokens;
                     std::vector<token_t> dropped_tokens;
 
-                    if(orig_tokens.size() > 1 && num_tokens_dropped < 2*(orig_tokens.size()-1)) {
-                        bool prefix_search = false;
+                    if(num_tokens_dropped >= orig_tokens.size() - 1) {
+                        // swap direction and reset counter
+                        curr_direction = (curr_direction == right_to_left) ? left_to_right : right_to_left;
+                        num_tokens_dropped = 0;
+                        total_dirs_done++;
+                    }
 
-                        if (num_tokens_dropped < orig_tokens.size() - 1) {
+                    if(orig_tokens.size() > 1 && total_dirs_done < 2) {
+                        bool prefix_search = false;
+                        if (curr_direction == right_to_left) {
                             // drop from right
                             size_t truncated_len = orig_tokens.size() - num_tokens_dropped - 1;
                             for (size_t i = 0; i < orig_tokens.size(); i++) {
@@ -2630,7 +3294,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                         } else {
                             // drop from left
                             prefix_search = true;
-                            size_t start_index = (num_tokens_dropped + 1) - orig_tokens.size() + 1;
+                            size_t start_index = (num_tokens_dropped + 1);
                             for(size_t i = 0; i < orig_tokens.size(); i++) {
                                 if(i >= start_index) {
                                     truncated_tokens.emplace_back(orig_tokens[i]);
@@ -2652,10 +3316,11 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                                                                           filter_result_iterator,
                                                                           curated_ids_sorted, excluded_group_ids,
                                                                           sort_fields_std, num_typos, searched_queries,
-                                                                          qtoken_set, topster, groups_processed,
+                                                                          qtoken_set, topster, groups_processed, 
                                                                           all_result_ids, all_result_ids_len,
-                                                                          group_limit, group_by_fields,
-                                                                          prioritize_exact_match, prioritize_token_position, query_hashes,
+                                                                          group_limit, group_by_fields, group_missing_values,
+                                                                          prioritize_exact_match, prioritize_token_position, 
+                                                                          prioritize_num_matching_fields, query_hashes,
                                                                           token_order, prefixes, typo_tokens_threshold,
                                                                           exhaustive_search, max_candidates, min_len_1typo,
                                                                           min_len_2typo, -1, sort_order, field_values, geopoint_indices,
@@ -2673,7 +3338,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
         auto do_infix_search_op =  do_infix_search(num_search_fields, the_fields, infixes, sort_fields_std,
                                                    searched_queries,
-                                                   group_limit, group_by_fields,
+                                                   group_limit, group_by_fields, group_missing_values,
                                                    max_extra_prefix, max_extra_suffix,
                                                    field_query_tokens[0].q_include_tokens,
                                                    topster, filter_result_iterator,
@@ -2684,7 +3349,9 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         if (!do_infix_search_op.ok()) {
             return do_infix_search_op;
         }
+
         filter_result_iterator->reset();
+        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
         if(!vector_query.field_name.empty()) {
             // check at least one of sort fields is text match
@@ -2698,25 +3365,25 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
             if(has_text_match) {
                 // For hybrid search, we need to give weight to text match and vector search
-                constexpr float TEXT_MATCH_WEIGHT = 0.7;
-                constexpr float VECTOR_SEARCH_WEIGHT = 1.0 - TEXT_MATCH_WEIGHT;
+                const float VECTOR_SEARCH_WEIGHT = vector_query.alpha;
+                const float TEXT_MATCH_WEIGHT = 1.0 - VECTOR_SEARCH_WEIGHT;
 
-                VectorFilterFunctor filterFunctor(filter_result_iterator);
+                VectorFilterFunctor filterFunctor(filter_result_iterator, excluded_result_ids, excluded_result_ids_size);
                 auto& field_vector_index = vector_index.at(vector_query.field_name);
 
                 std::vector<std::pair<float, size_t>> dist_labels;
                 // use k as 100 by default for ensuring results stability in pagination
                 size_t default_k = 100;
                 auto k = vector_query.k == 0 ? std::max<size_t>(fetch_size, default_k) : vector_query.k;
-
                 if(field_vector_index->distance_type == cosine) {
                     std::vector<float> normalized_q(vector_query.values.size());
                     hnsw_index_t::normalize_vector(vector_query.values, normalized_q);
-                    dist_labels = field_vector_index->vecdex->searchKnnCloserFirst(normalized_q.data(), k, &filterFunctor);
+                    dist_labels = field_vector_index->vecdex->searchKnnCloserFirst(normalized_q.data(), k, vector_query.ef, &filterFunctor);
                 } else {
-                    dist_labels = field_vector_index->vecdex->searchKnnCloserFirst(vector_query.values.data(), k, &filterFunctor);
+                    dist_labels = field_vector_index->vecdex->searchKnnCloserFirst(vector_query.values.data(), k, vector_query.ef, &filterFunctor);
                 }
                 filter_result_iterator->reset();
+                search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
                 std::vector<std::pair<uint32_t,float>> vec_results;
                 for (const auto& dist_label : dist_labels) {
@@ -2729,16 +3396,40 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                     }
                     vec_results.emplace_back(seq_id, vec_dist_score);
                 }
-                
+
+                // iteration needs to happen on sorted sequence ID but score wise sort needed for compute rank fusion
                 std::sort(vec_results.begin(), vec_results.end(), [](const auto& a, const auto& b) {
                     return a.second < b.second;
                 });
 
-                topster->sort();
+                std::unordered_map<uint32_t, uint32_t> seq_id_to_rank;
+
+                for(size_t vec_index = 0; vec_index < vec_results.size(); vec_index++) {
+                    seq_id_to_rank.emplace(vec_results[vec_index].first, vec_index);
+                }
+
+                std::sort(vec_results.begin(), vec_results.end(), [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+
+                std::vector<KV*> kvs;
+                if(group_limit != 0) {
+                    for(auto& kv_map : topster->group_kv_map) {
+                        for(int i = 0; i < kv_map.second->size; i++) {
+                            kvs.push_back(kv_map.second->getKV(i));
+                        }
+                    }
+                    
+                    std::sort(kvs.begin(), kvs.end(), Topster::is_greater);
+                } else {
+                    topster->sort();
+                }
+
                 // Reciprocal rank fusion
                 // Score is  sum of (1 / rank_of_document) * WEIGHT from each list (text match and vector search)
-                for(uint32_t i = 0; i < topster->size; i++) {
-                    auto result = topster->getKV(i);
+                auto size = (group_limit != 0) ? kvs.size() : topster->size;
+                for(uint32_t i = 0; i < size; i++) {
+                    auto result = (group_limit != 0) ? kvs[i] : topster->getKV(i);
                     if(result->match_score_index < 0 || result->match_score_index > 2) {
                         continue;
                     }
@@ -2749,35 +3440,56 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 }
 
                 std::vector<uint32_t> vec_search_ids;  // list of IDs found only in vector search
+                std::vector<uint32_t> eval_filter_indexes;
 
-                for(size_t res_index = 0; res_index < vec_results.size(); res_index++) {
+                std::vector<group_by_field_it_t> group_by_field_it_vec;
+                if (group_limit != 0) {
+                    group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+                }
+
+                for(size_t res_index = 0; res_index < vec_results.size() &&
+                                filter_result_iterator->validity != filter_result_iterator_t::timed_out; res_index++) {
                     auto& vec_result = vec_results[res_index];
                     auto seq_id = vec_result.first;
 
-                    filter_result_iterator->skip_to(seq_id);
+                    if (!no_filters_provided && filter_result_iterator->is_valid(seq_id) != 1) {
+                        continue;
+                    }
                     auto references = std::move(filter_result_iterator->reference);
                     filter_result_iterator->reset();
-                    auto result_it = topster->kv_map.find(seq_id);
 
-                    if(result_it != topster->kv_map.end()) {
-                        if(result_it->second->match_score_index < 0 || result_it->second->match_score_index > 2) {
+                    KV* found_kv = nullptr;
+                    if(group_limit != 0) {
+                        for(auto& kv : kvs) {
+                            if(kv->key == seq_id) {
+                                found_kv = kv;
+                                break;
+                            }
+                        }
+                    } else {
+                        auto result_it = topster->kv_map.find(seq_id);
+                        if(result_it != topster->kv_map.end()) {
+                            found_kv = result_it->second;
+                        }
+                    }
+                    if(found_kv) {
+                        if(found_kv->match_score_index < 0 || found_kv->match_score_index > 2) {
                             continue;
                         }
 
                         // result overlaps with keyword search: we have to combine the scores
 
-                        KV* kv = result_it->second;
                         // old_score + (1 / rank_of_document) * WEIGHT)
-                        kv->vector_distance = vec_result.second;
-                        kv->text_match_score  = kv->scores[kv->match_score_index];
+                        found_kv->vector_distance = vec_result.second;
+                        found_kv->text_match_score  = found_kv->scores[found_kv->match_score_index];
                         int64_t match_score = float_to_int64_t(
-                                (int64_t_to_float(kv->scores[kv->match_score_index])) +
-                                ((1.0 / (res_index + 1)) * VECTOR_SEARCH_WEIGHT));
+                                (int64_t_to_float(found_kv->scores[found_kv->match_score_index])) +
+                                ((1.0 / (seq_id_to_rank[seq_id] + 1)) * VECTOR_SEARCH_WEIGHT));
                         int64_t match_score_index = -1;
                         int64_t scores[3] = {0};
 
                         auto compute_sort_scores_op = compute_sort_scores(sort_fields_std, sort_order, field_values,
-                                                                          geopoint_indices, seq_id, references, 0,
+                                                                          geopoint_indices, seq_id, references, eval_filter_indexes,
                                                                           match_score, scores, match_score_index,
                                                                           vec_result.second, collection_name);
                         if (!compute_sort_scores_op.ok()) {
@@ -2785,20 +3497,20 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                         }
 
                         for(int i = 0; i < 3; i++) {
-                            kv->scores[i] = scores[i];
+                            found_kv->scores[i] = scores[i];
                         }
 
-                        kv->match_score_index = match_score_index;
+                        found_kv->match_score_index = match_score_index;
 
                     } else {
                         // Result has been found only in vector search: we have to add it to both KV and result_ids
                         // (1 / rank_of_document) * WEIGHT)
                         int64_t scores[3] = {0};
-                        int64_t match_score = float_to_int64_t((1.0 / (res_index + 1)) * VECTOR_SEARCH_WEIGHT);
+                        int64_t match_score = float_to_int64_t((1.0 / (seq_id_to_rank[seq_id] + 1)) * VECTOR_SEARCH_WEIGHT);
                         int64_t match_score_index = -1;
 
                         auto compute_sort_scores_op = compute_sort_scores(sort_fields_std, sort_order, field_values,
-                                                                          geopoint_indices, seq_id, references, 0,
+                                                                          geopoint_indices, seq_id, references, eval_filter_indexes,
                                                                           match_score, scores, match_score_index,
                                                                           vec_result.second, collection_name);
                         if (!compute_sort_scores_op.ok()) {
@@ -2807,7 +3519,12 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
                         uint64_t distinct_id = seq_id;
                         if (group_limit != 0) {
-                            distinct_id = get_distinct_id(group_by_fields, seq_id);
+                            distinct_id = 1;
+
+                            for(auto& kv : group_by_field_it_vec) {
+                                get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+                            }
+
                             if(excluded_group_ids.count(distinct_id) != 0) {
                                 continue;
                             }
@@ -2816,18 +3533,15 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                         kv.text_match_score = 0;
                         kv.vector_distance = vec_result.second;
 
-                        if (filter_result_iterator->is_valid &&
-                            !filter_result_iterator->reference.empty()) {
-                            // The doc_id must be valid otherwise it would've been filtered out upstream.
-                            filter_result_iterator->skip_to(seq_id);
-                            kv.reference_filter_results = std::move(filter_result_iterator->reference);
-                            filter_result_iterator->reset();
-                        }
-
-                        topster->add(&kv);
+                        auto ret = topster->add(&kv);
                         vec_search_ids.push_back(seq_id);
+
+                        if(group_limit != 0 && ret < 2) {
+                            groups_processed[distinct_id]++;
+                        }
                     }
                 }
+                search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
                 if(!vec_search_ids.empty()) {
                     uint32_t* new_all_result_ids = nullptr;
@@ -2852,11 +3566,12 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
     delete [] exclude_token_ids;
     delete [] excluded_result_ids;
 
-    bool estimate_facets = (facet_sample_percent < 100 && all_result_ids_len > facet_sample_threshold);
-    bool is_wildcard_no_filter_query = is_wildcard_query && no_filters_provided;
+    bool estimate_facets = (facet_sample_percent > 0 && facet_sample_percent < 100 &&
+                            all_result_ids_len > facet_sample_threshold);
+    bool is_wildcard_no_filter_query = is_wildcard_non_phrase_query && no_filters_provided;
 
     if(!facets.empty()) {
-        const size_t num_threads = 1;
+        const size_t num_threads = std::min(concurrency, all_result_ids_len);
 
         const size_t window_size = (num_threads == 0) ? 0 :
                                    (all_result_ids_len + num_threads - 1) / num_threads;  // rounds up
@@ -2864,23 +3579,35 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
         std::mutex m_process;
         std::condition_variable cv_process;
 
-        // We have to choose between hash and value index:
-        // 1. Group queries -> requires hash index
-        // 2. Wildcard + no filters -> use value index
-        // 3. Very few unique facet values (< 250) -> use value index
-        // 4. Result match > 50%
-
         std::vector<facet_info_t> facet_infos(facets.size());
         compute_facet_infos(facets, facet_query, facet_query_num_typos, all_result_ids, all_result_ids_len,
                             group_by_fields, group_limit, is_wildcard_no_filter_query,
                             max_candidates, facet_infos, facet_index_type);
 
         std::vector<std::vector<facet>> facet_batches(num_threads);
-        for(size_t i = 0; i < num_threads; i++) {
-            for(const auto& this_facet: facets) {
-                facet_batches[i].emplace_back(facet(this_facet.field_name, this_facet.facet_range_map, 
-                    this_facet.is_range_query, this_facet.is_sort_by_alpha, this_facet.sort_order,
-                    this_facet.sort_field));
+        std::vector<std::vector<facet>> value_facets(concurrency);
+        size_t num_value_facets = 0;
+
+        for(size_t i = 0; i < facets.size(); i++) {
+            const auto& this_facet = facets[i];
+#ifdef TEST_BUILD
+            if(facet_index_type == VALUE) {
+#else
+            if(facet_infos[i].use_value_index) {
+#endif
+                // value based faceting on a single thread
+                value_facets[num_value_facets % num_threads].emplace_back(this_facet.field_name, this_facet.orig_index,
+                                          this_facet.facet_range_map,
+                                          this_facet.is_range_query, this_facet.is_sort_by_alpha,
+                                          this_facet.sort_order, this_facet.sort_field);
+                num_value_facets++;
+                continue;
+            }
+
+            for(size_t j = 0; j < num_threads; j++) {
+                facet_batches[j].emplace_back(this_facet.field_name, this_facet.orig_index, this_facet.facet_range_map,
+                                              this_facet.is_range_query, this_facet.is_sort_by_alpha,
+                                              this_facet.sort_order, this_facet.sort_field);
             }
         }
 
@@ -2900,26 +3627,37 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 batch_res_len = all_result_ids_len - result_index;
             }
 
+            if(facet_batches[thread_id].empty()) {
+                continue;
+            }
+
             uint32_t* batch_result_ids = all_result_ids + result_index;
             num_queued++;
 
-            thread_pool->enqueue([this, thread_id, &facet_batches, &facet_query, group_limit, group_by_fields,
+            thread_pool->enqueue([this, thread_id, &facets, &facet_batches, &facet_query, group_limit, group_by_fields,
                                          batch_result_ids, batch_res_len, &facet_infos, max_facet_values,
-                                         is_wildcard_query, no_filters_provided, estimate_facets, facet_sample_percent,
+                                         is_wildcard_no_filter_query, estimate_facets,
+                                         facet_sample_percent, group_missing_values,
                                          &parent_search_begin, &parent_search_stop_ms, &parent_search_cutoff,
                                          &num_processed, &m_process, &cv_process, facet_index_type]() {
                 search_begin_us = parent_search_begin;
                 search_stop_us = parent_search_stop_ms;
-                search_cutoff = parent_search_cutoff;
+                search_cutoff = false;
 
                 auto fq = facet_query;
-                std::vector<std::pair<std::string, uint32_t>> found_docs;
                 do_facets(facet_batches[thread_id], fq, estimate_facets, facet_sample_percent,
-                          facet_infos, group_limit, group_by_fields,
-                          batch_result_ids, batch_res_len, max_facet_values, 
-                          is_wildcard_query, no_filters_provided,
-                          facet_index_type);
+                          facet_infos, group_limit, group_by_fields, group_missing_values,
+                          batch_result_ids, batch_res_len, max_facet_values,
+                          is_wildcard_no_filter_query, facet_index_type);
+
                 std::unique_lock<std::mutex> lock(m_process);
+
+                auto& facet_batch = facet_batches[thread_id];
+                for(auto& this_facet : facet_batch) {
+                    auto& acc_facet = facets[this_facet.orig_index];
+                    aggregate_facet(group_limit, this_facet, acc_facet);
+                }
+
                 num_processed++;
                 parent_search_cutoff = parent_search_cutoff || search_cutoff;
                 cv_process.notify_one();
@@ -2928,72 +3666,47 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
             result_index += batch_res_len;
         }
 
+        // do value based faceting field-wise parallel but on the entire result set
+        for(size_t thread_id = 0; thread_id < concurrency && num_value_facets > 0; thread_id++) {
+            if(value_facets[thread_id].empty()) {
+                continue;
+            }
+
+            num_queued++;
+
+            thread_pool->enqueue([this, thread_id, &facets, &value_facets, &facet_query, group_limit, group_by_fields,
+                                         all_result_ids, all_result_ids_len, &facet_infos, max_facet_values,
+                                         is_wildcard_no_filter_query, estimate_facets,
+                                         facet_sample_percent, group_missing_values,
+                                         &parent_search_begin, &parent_search_stop_ms, &parent_search_cutoff,
+                                         &num_processed, &m_process, &cv_process, facet_index_type]() {
+                search_begin_us = parent_search_begin;
+                search_stop_us = parent_search_stop_ms;
+                search_cutoff = false;
+
+                auto fq = facet_query;
+
+                do_facets({value_facets[thread_id]}, fq, estimate_facets, facet_sample_percent,
+                          facet_infos, group_limit, group_by_fields, group_missing_values,
+                          all_result_ids, all_result_ids_len, max_facet_values,
+                          is_wildcard_no_filter_query, facet_index_type);
+
+                std::unique_lock<std::mutex> lock(m_process);
+
+                for(auto& this_facet : value_facets[thread_id]) {
+                    auto& acc_facet = facets[this_facet.orig_index];
+                    aggregate_facet(group_limit, this_facet, acc_facet);
+                }
+
+                num_processed++;
+                parent_search_cutoff = parent_search_cutoff || search_cutoff;
+                cv_process.notify_one();
+            });
+        }
+
         std::unique_lock<std::mutex> lock_process(m_process);
         cv_process.wait(lock_process, [&](){ return num_processed == num_queued; });
         search_cutoff = parent_search_cutoff;
-
-        for(auto& facet_batch: facet_batches) {
-            for(size_t fi = 0; fi < facet_batch.size(); fi++) {
-                auto& this_facet = facet_batch[fi];
-                auto& acc_facet = facets[fi];
-
-                acc_facet.is_intersected = this_facet.is_intersected;
-                acc_facet.is_sort_by_alpha = this_facet.is_sort_by_alpha;
-                acc_facet.sort_order = this_facet.sort_order;
-                acc_facet.sort_field = this_facet.sort_field;
-
-                for(auto & facet_kv: this_facet.result_map) {
-                    uint32_t fhash = 0;
-                    if(group_limit) {
-                        fhash = facet_kv.first;
-                        // we have to add all group sets
-                        acc_facet.hash_groups[fhash].insert(
-                            this_facet.hash_groups[fhash].begin(),
-                            this_facet.hash_groups[fhash].end()
-                        );
-                    } else {
-                        size_t count = 0;
-                        if(acc_facet.result_map.count(facet_kv.first) == 0) {
-                            // not found, so set it
-                            count = facet_kv.second.count;
-                        } else {
-                            count = acc_facet.result_map[facet_kv.first].count + facet_kv.second.count;
-                        }
-                        acc_facet.result_map[facet_kv.first].count = count;
-                    }
-
-                    acc_facet.result_map[facet_kv.first].doc_id = facet_kv.second.doc_id;
-                    acc_facet.result_map[facet_kv.first].array_pos = facet_kv.second.array_pos;
-                    acc_facet.result_map[facet_kv.first].sort_field_val = facet_kv.second.sort_field_val;
-
-                    acc_facet.hash_tokens[facet_kv.first] = this_facet.hash_tokens[facet_kv.first];
-                }
-
-                for(auto& facet_kv: this_facet.value_result_map) {
-                    size_t count = 0;
-                    if(acc_facet.value_result_map.count(facet_kv.first) == 0) {
-                        // not found, so set it
-                        count = facet_kv.second.count;
-                    } else {
-                        count = acc_facet.value_result_map[facet_kv.first].count + facet_kv.second.count;
-                    }
-
-                    acc_facet.value_result_map[facet_kv.first].count = count;
-
-                    acc_facet.value_result_map[facet_kv.first].doc_id = facet_kv.second.doc_id;
-                    acc_facet.value_result_map[facet_kv.first].array_pos = facet_kv.second.array_pos;
-
-                    acc_facet.fvalue_tokens[facet_kv.first] = this_facet.fvalue_tokens[facet_kv.first];
-                }
-
-                if(this_facet.stats.fvcount != 0) {
-                    acc_facet.stats.fvcount += this_facet.stats.fvcount;
-                    acc_facet.stats.fvsum += this_facet.stats.fvsum;
-                    acc_facet.stats.fvmax = std::max(acc_facet.stats.fvmax, this_facet.stats.fvmax);
-                    acc_facet.stats.fvmin = std::min(acc_facet.stats.fvmin, this_facet.stats.fvmin);
-                }
-            }
-        }
 
         for(auto & acc_facet: facets) {
             for(auto& facet_kv: acc_facet.result_map) {
@@ -3006,11 +3719,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 }
             }
 
-            for(auto& facet_kv: acc_facet.value_result_map) {
-                if(estimate_facets) {
-                    facet_kv.second.count = size_t(double(facet_kv.second.count) * (100.0f / facet_sample_percent));
-                }
-            }
+            // value_result_map already contains the scaled counts
 
             if(estimate_facets) {
                 acc_facet.sampled = true;
@@ -3021,18 +3730,34 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                 std::chrono::high_resolution_clock::now() - beginF).count();
         LOG(INFO) << "Time for faceting: " << timeMillisF;*/
     }
-    std::vector<std::pair<std::string, uint32_t>> found_docs;
+
     std::vector<facet_info_t> facet_infos(facets.size());
     compute_facet_infos(facets, facet_query, facet_query_num_typos,
                         &included_ids_vec[0], included_ids_vec.size(), group_by_fields,
                         group_limit, is_wildcard_no_filter_query,
                         max_candidates, facet_infos, facet_index_type);
     do_facets(facets, facet_query, estimate_facets, facet_sample_percent,
-              facet_infos, group_limit, group_by_fields, &included_ids_vec[0], 
-              included_ids_vec.size(), max_facet_values, is_wildcard_query, no_filters_provided,
+              facet_infos, group_limit, group_by_fields, group_missing_values, &included_ids_vec[0], 
+              included_ids_vec.size(), max_facet_values, is_wildcard_no_filter_query,
               facet_index_type);
 
     all_result_ids_len += curated_topster->size;
+
+    if(!included_ids_map.empty() && group_limit != 0) {
+        for (auto &acc_facet: facets) {
+            for (auto &facet_kv: acc_facet.result_map) {
+                facet_kv.second.count = acc_facet.hash_groups[facet_kv.first].size();
+
+                if (estimate_facets) {
+                    facet_kv.second.count = size_t(double(facet_kv.second.count) * (100.0f / facet_sample_percent));
+                }
+            }
+
+            if (estimate_facets) {
+                acc_facet.sampled = true;
+            }
+        }
+    }
 
     delete [] all_result_ids;
 
@@ -3043,9 +3768,68 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
     return Option(true);
 }
 
+void Index::aggregate_facet(const size_t group_limit, facet& this_facet, facet& acc_facet) const {
+    acc_facet.is_intersected = this_facet.is_intersected;
+    acc_facet.is_sort_by_alpha = this_facet.is_sort_by_alpha;
+    acc_facet.sort_order = this_facet.sort_order;
+    acc_facet.sort_field = this_facet.sort_field;
+
+    for(auto & facet_kv: this_facet.result_map) {
+        uint32_t fhash = 0;
+        if(group_limit) {
+            fhash = facet_kv.first;
+            // we have to add all group sets
+            acc_facet.hash_groups[fhash].insert(
+                this_facet.hash_groups[fhash].begin(),
+                this_facet.hash_groups[fhash].end()
+            );
+        } else {
+            size_t count = 0;
+            if (acc_facet.result_map.count(facet_kv.first) == 0) {
+                // not found, so set it
+                count = facet_kv.second.count;
+            } else {
+                count = acc_facet.result_map[facet_kv.first].count + facet_kv.second.count;
+            }
+            acc_facet.result_map[facet_kv.first].count = count;
+        }
+
+        acc_facet.result_map[facet_kv.first].doc_id = facet_kv.second.doc_id;
+        acc_facet.result_map[facet_kv.first].array_pos = facet_kv.second.array_pos;
+        acc_facet.result_map[facet_kv.first].sort_field_val = facet_kv.second.sort_field_val;
+
+        acc_facet.hash_tokens[facet_kv.first] = this_facet.hash_tokens[facet_kv.first];
+    }
+
+    for(auto& facet_kv: this_facet.value_result_map) {
+        size_t count = 0;
+        if(acc_facet.value_result_map.count(facet_kv.first) == 0) {
+            // not found, so set it
+            count = facet_kv.second.count;
+        } else {
+            count = acc_facet.value_result_map[facet_kv.first].count + facet_kv.second.count;
+        }
+
+        acc_facet.value_result_map[facet_kv.first].count = count;
+
+        acc_facet.value_result_map[facet_kv.first].doc_id = facet_kv.second.doc_id;
+        acc_facet.value_result_map[facet_kv.first].array_pos = facet_kv.second.array_pos;
+
+        acc_facet.fvalue_tokens[facet_kv.first] = this_facet.fvalue_tokens[facet_kv.first];
+    }
+
+    if(this_facet.stats.fvcount != 0) {
+        acc_facet.stats.fvcount += this_facet.stats.fvcount;
+        acc_facet.stats.fvsum += this_facet.stats.fvsum;
+        acc_facet.stats.fvmax = std::max(acc_facet.stats.fvmax, this_facet.stats.fvmax);
+        acc_facet.stats.fvmin = std::min(acc_facet.stats.fvmin, this_facet.stats.fvmin);
+    }
+}
+
 void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
                                 const std::vector<uint32_t>& excluded_ids,
-                                const std::vector<std::string>& group_by_fields, const size_t group_limit,
+                                const std::vector<std::string>& group_by_fields, const size_t group_limit, 
+                                const bool group_missing_values,
                                 const bool filter_curated_hits, filter_result_iterator_t* const filter_result_iterator,
                                 std::set<uint32_t>& curated_ids,
                                 std::map<size_t, std::map<size_t, uint32_t>>& included_ids_map,
@@ -3056,22 +3840,29 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
         included_ids_vec.push_back(seq_id_pos.first);
     }
 
+    //sort the included ids to keep unidirectional iterators valid
+    std::sort(included_ids_vec.begin(), included_ids_vec.end());
+
     if(group_limit != 0) {
         // if one `id` of a group is present in curated hits, we have to exclude that entire group from results
+        auto group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+
         for(auto seq_id: included_ids_vec) {
-            uint64_t distinct_id = get_distinct_id(group_by_fields, seq_id);
+            uint64_t distinct_id = 1;
+            for(auto& kv : group_by_field_it_vec) {
+                get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+            }
+
             excluded_group_ids.emplace(distinct_id);
         }
     }
 
-    std::sort(included_ids_vec.begin(), included_ids_vec.end());
-
     // if `filter_curated_hits` is enabled, we will remove curated hits that don't match filter condition
     std::set<uint32_t> included_ids_set;
 
-    if(filter_result_iterator->is_valid && filter_curated_hits) {
+    if(filter_result_iterator->validity == filter_result_iterator_t::valid && filter_curated_hits) {
         for (const auto &included_id: included_ids_vec) {
-            auto result = filter_result_iterator->valid(included_id);
+            auto result = filter_result_iterator->is_valid(included_id);
 
             if (result == -1) {
                 break;
@@ -3147,8 +3938,10 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                                         Topster* topster, spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                         uint32_t*& all_result_ids, size_t & all_result_ids_len,
                                         const size_t group_limit, const std::vector<std::string>& group_by_fields,
+                                        const bool group_missing_values,
                                         bool prioritize_exact_match,
                                         const bool prioritize_token_position,
+                                        const bool prioritize_num_matching_fields,
                                         std::set<uint64>& query_hashes,
                                         const token_ordering token_order,
                                         const std::vector<bool>& prefixes,
@@ -3159,9 +3952,11 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                                         size_t min_len_2typo,
                                         int syn_orig_num_tokens,
                                         const int* sort_order,
-                                        std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values,
+                                        std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                         const std::vector<size_t>& geopoint_indices,
-                                        const std::string& collection_name) const {
+                                        const std::string& collection_name,
+                                        bool enable_typos_for_numerical_tokens,
+                                        bool enable_typos_for_alpha_numerical_tokens) const {
 
     // NOTE: `query_tokens` preserve original tokens, while `search_tokens` could be a result of dropped tokens
 
@@ -3175,7 +3970,8 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
 
         std::vector<int> all_costs;
         // This ensures that we don't end up doing a cost of 1 for a single char etc.
-        int bounded_cost = get_bounded_typo_cost(2, token.length(), min_len_1typo, min_len_2typo);
+        int bounded_cost = get_bounded_typo_cost(2, token , token.length(), min_len_1typo, min_len_2typo,
+                                                 enable_typos_for_numerical_tokens, enable_typos_for_alpha_numerical_tokens);
 
         for(int cost = 0; cost <= bounded_cost; cost++) {
             all_costs.push_back(cost);
@@ -3237,7 +4033,7 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
 
                 std::vector<size_t> query_field_ids(num_search_fields);
                 for(size_t field_id = 0; field_id < num_search_fields; field_id++) {
-                    query_field_ids[field_id] = the_fields[field_id].orig_index;
+                    query_field_ids[field_id] = field_id;
                 }
 
                 std::vector<size_t> popular_field_ids; // fields containing the token most across documents
@@ -3258,16 +4054,17 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                     // NOTE: when accessing other field ordered properties like prefixes or num_typos we have to index
                     // them by `the_field.orig_index` since the original fields could be reordered on their weights.
                     auto& the_field = the_fields[field_id];
-                    const bool field_prefix = (the_field.orig_index < prefixes.size()) ? prefixes[the_field.orig_index] : prefixes[0];
+                    const bool field_prefix = the_fields[field_id].prefix;
                     const bool prefix_search = field_prefix && query_tokens[token_index].is_prefix_searched;
                     const size_t token_len = prefix_search ? (int) token.length() : (int) token.length() + 1;
 
                     /*LOG(INFO) << "Searching for field: " << the_field.name << ", token:"
                               << token << " - cost: " << costs[token_index] << ", prefix_search: " << prefix_search;*/
 
-                    int64_t field_num_typos = (the_field.orig_index < num_typos.size()) ? num_typos[the_field.orig_index] : num_typos[0];
+                    int64_t field_num_typos = the_fields[field_id].num_typos;
 
-                    auto& locale = search_schema.at(the_field.name).locale;
+                    const auto& search_field = search_schema.at(the_field.name);
+                    auto& locale = search_field.locale;
                     if(locale != "" && (locale == "zh" || locale == "ko" || locale == "ja")) {
                         // disable fuzzy trie traversal for CJK locales
                         field_num_typos = 0;
@@ -3281,10 +4078,15 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                     const auto& prev_token = last_token ? token_candidates_vec.back().candidates[0] : "";
 
                     std::vector<art_leaf*> field_leaves;
-                    art_fuzzy_search_i(search_index.at(the_field.name), (const unsigned char *) token.c_str(), token_len,
+                    art_fuzzy_search_i(search_index.at(search_field.faceted_name()),
+                                       (const unsigned char *) token.c_str(), token_len,
                                      costs[token_index], costs[token_index], max_candidates, token_order, prefix_search,
                                      last_token, prev_token, filter_result_iterator, field_leaves, unique_tokens);
                     filter_result_iterator->reset();
+                    if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
+                        search_cutoff = true;
+                        return Option<bool>(true);
+                    }
 
                     /*auto timeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::high_resolution_clock::now() - begin).count();
@@ -3308,23 +4110,17 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                     }
                 }
 
-                if(last_token && leaf_tokens.size() < max_candidates) {
-                    // field-wise matching with previous token has failed, have to look at cross fields matching docs
-                    std::vector<uint32_t> prev_token_doc_ids;
-                    find_across_fields(token_candidates_vec.back().token,
-                                       token_candidates_vec.back().candidates[0],
-                                       the_fields, num_search_fields, filter_result_iterator, exclude_token_ids,
-                                       exclude_token_ids_size, prev_token_doc_ids, popular_field_ids);
-                    filter_result_iterator->reset();
-
+                if(last_token && num_search_fields > 1 && leaf_tokens.size() < max_candidates) {
+                    // matching previous token has failed, look at all fields
                     for(size_t field_id: query_field_ids) {
                         auto& the_field = the_fields[field_id];
-                        const bool field_prefix = (the_field.orig_index < prefixes.size()) ? prefixes[the_field.orig_index] : prefixes[0];;
+                        const bool field_prefix = the_fields[field_id].prefix;
                         const bool prefix_search = field_prefix && query_tokens[token_index].is_prefix_searched;
                         const size_t token_len = prefix_search ? (int) token.length() : (int) token.length() + 1;
-                        int64_t field_num_typos = (the_field.orig_index < num_typos.size()) ? num_typos[the_field.orig_index] : num_typos[0];
+                        int64_t field_num_typos = the_fields[field_id].num_typos;
 
-                        auto& locale = search_schema.at(the_field.name).locale;
+                        const auto& search_field = search_schema.at(the_field.name);
+                        auto& locale = search_field.locale;
                         if(locale != "" && locale != "en" && locale != "th" && !Tokenizer::is_cyrillic(locale)) {
                             // disable fuzzy trie traversal for non-english locales
                             field_num_typos = 0;
@@ -3339,6 +4135,10 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                                          costs[token_index], costs[token_index], max_candidates, token_order, prefix_search,
                                          false, "", filter_result_iterator, field_leaves, unique_tokens);
                         filter_result_iterator->reset();
+                        if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
+                            search_cutoff = true;
+                            return Option<bool>(true);
+                        }
 
                         if(field_leaves.empty()) {
                             // look at the next field
@@ -3391,16 +4191,16 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
 
         if(token_candidates_vec.size() == query_tokens.size()) {
             std::vector<uint32_t> id_buff;
-
             auto search_all_candidates_op = search_all_candidates(num_search_fields, match_type, the_fields,
                                                                   filter_result_iterator,
                                                                   exclude_token_ids, exclude_token_ids_size, excluded_group_ids,
                                                                   sort_fields, token_candidates_vec, searched_queries, qtoken_set,
                                                                   dropped_tokens, topster,
                                                                   groups_processed, all_result_ids, all_result_ids_len,
-                                                                  typo_tokens_threshold, group_limit, group_by_fields, query_tokens,
+                                                                  typo_tokens_threshold, group_limit, group_by_fields, 
+                                                                  group_missing_values, query_tokens,
                                                                   num_typos, prefixes, prioritize_exact_match, prioritize_token_position,
-                                                                  exhaustive_search, max_candidates,
+                                                                  prioritize_num_matching_fields, exhaustive_search, max_candidates,
                                                                   syn_orig_num_tokens, sort_order, field_values, geopoint_indices,
                                                                   query_hashes, id_buff, collection_name);
             if (!search_all_candidates_op.ok()) {
@@ -3421,7 +4221,8 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
 
         resume_typo_loop:
 
-        if(!exhaustive_search && all_result_ids_len >= typo_tokens_threshold) {
+        auto results_count = group_limit != 0 ? groups_processed.size() : all_result_ids_len;
+        if(!exhaustive_search && results_count >= typo_tokens_threshold) {
             // if typo threshold is breached, we are done
             return Option<bool>(true);
         }
@@ -3438,14 +4239,14 @@ void Index::popular_fields_of_token(const spp::sparse_hash_map<std::string, art_
                                     const size_t num_search_fields,
                                     std::vector<size_t>& popular_field_ids) {
 
-    const auto token_c_str = (const unsigned char*) previous_token.c_str();
-    const int token_len = (int) previous_token.size() + 1;
+    const auto prev_token_c_str = (const unsigned char*) previous_token.c_str();
+    const int prev_token_len = (int) previous_token.size() + 1;
 
     std::vector<std::pair<size_t, size_t>> field_id_doc_counts;
 
     for(size_t i = 0; i < num_search_fields; i++) {
         const std::string& field_name = the_fields[i].name;
-        auto leaf = static_cast<art_leaf*>(art_search(search_index.at(field_name), token_c_str, token_len));
+        auto leaf = static_cast<art_leaf*>(art_search(search_index.at(field_name), prev_token_c_str, prev_token_len));
 
         if(!leaf) {
             continue;
@@ -3560,14 +4361,16 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
                                          const std::vector<token_t>& dropped_tokens,
                                          const size_t group_limit,
                                          const std::vector<std::string>& group_by_fields,
+                                         const bool group_missing_values,
                                          const bool prioritize_exact_match,
                                          const bool prioritize_token_position,
+                                         const bool prioritize_num_matching_fields,
                                          filter_result_iterator_t* const filter_result_iterator,
                                          const uint32_t total_cost, const int syn_orig_num_tokens,
                                          const uint32_t* exclude_token_ids, size_t exclude_token_ids_size,
                                          const std::unordered_set<uint32_t>& excluded_group_ids,
                                          const int* sort_order,
-                                         std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values,
+                                         std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                          const std::vector<size_t>& geopoint_indices,
                                          std::vector<uint32_t>& id_buff,
                                          uint32_t*& all_result_ids, size_t& all_result_ids_len,
@@ -3591,7 +4394,7 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
         for(size_t i = 0; i < the_fields.size(); i++) {
             const std::string& field_name = the_fields[i].name;
 
-            art_tree* tree = search_index.at(field_name);
+            art_tree* tree = search_index.at(the_fields[i].str_name);
             art_leaf* leaf = static_cast<art_leaf*>(art_search(tree, token_c_str, token.size()+1));
 
             if(!leaf) {
@@ -3616,8 +4419,6 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
         dropped_token_its.push_back(std::move(token_fields));
     }
 
-
-
     // one iterator for each token, each underlying iterator contains results of token across multiple fields
     std::vector<or_iterator_t> token_its;
 
@@ -3638,10 +4439,8 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
 
         for(size_t i = 0; i < num_search_fields; i++) {
             const std::string& field_name = the_fields[i].name;
-            const uint32_t field_num_typos = (the_fields[i].orig_index < num_typos.size())
-                                             ? num_typos[the_fields[i].orig_index] : num_typos[0];
-            const bool field_prefix = (the_fields[i].orig_index < prefixes.size()) ? prefixes[the_fields[i].orig_index]
-                                                                                   : prefixes[0];
+            const uint32_t field_num_typos = the_fields[i].num_typos;
+            const bool field_prefix = the_fields[i].prefix;
 
             if(token_num_typos > field_num_typos) {
                 // since the token can come from any field, we still have to respect per-field num_typos
@@ -3654,7 +4453,7 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
                 continue;
             }
 
-            art_tree* tree = search_index.at(field_name);
+            art_tree* tree = search_index.at(the_fields[i].str_name);
             art_leaf* leaf = static_cast<art_leaf*>(art_search(tree, token_c_str, token_len));
 
             if(!leaf) {
@@ -3688,12 +4487,20 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
     }
 
     std::vector<uint32_t> result_ids;
-    size_t filter_index = 0;
+    std::vector<uint32_t> eval_filter_indexes;
     Option<bool> status(true);
+
+    auto group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
 
     or_iterator_t::intersect(token_its, istate,
                              [&](single_filter_result_t& filter_result, const std::vector<or_iterator_t>& its) {
         auto& seq_id = filter_result.seq_id;
+
+        if(topster == nullptr) {
+            result_ids.push_back(seq_id);
+            return ;
+        }
+
         auto references = std::move(filter_result.reference_filter_results);
         //LOG(INFO) << "seq_id: " << seq_id;
         // Convert [token -> fields] orientation to [field -> tokens] orientation
@@ -3710,6 +4517,28 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
                     field_to_tokens[field_iter.get_field_id()].push_back(field_iter.clone());
                 }
             }
+        }
+
+        size_t query_len = query_tokens.size();
+
+        // check if seq_id exists in any of the dropped_token iters
+        for(size_t ti = 0; ti < dropped_token_its.size(); ti++) {
+            or_iterator_t& token_fields_iters = dropped_token_its[ti];
+            if(token_fields_iters.skip_to(seq_id) && token_fields_iters.id() == seq_id) {
+                query_len++;
+                const std::vector<posting_list_t::iterator_t>& field_iters = token_fields_iters.get_its();
+                for(size_t fi = 0; fi < field_iters.size(); fi++) {
+                    const posting_list_t::iterator_t& field_iter = field_iters[fi];
+                    if(field_iter.id() == seq_id) {
+                        // not all fields might contain a given token
+                        field_to_tokens[field_iter.get_field_id()].push_back(field_iter.clone());
+                    }
+                }
+            }
+        }
+
+        if(syn_orig_num_tokens != -1) {
+            query_len = syn_orig_num_tokens;
         }
 
         int64_t best_field_match_score = 0, best_field_weight = 0;
@@ -3753,7 +4582,11 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
 
         uint64_t distinct_id = seq_id;
         if(group_limit != 0) {
-            distinct_id = get_distinct_id(group_by_fields, seq_id);
+            distinct_id = 1;
+            for(auto& kv : group_by_field_it_vec) {
+                get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+            }
+
             if(excluded_group_ids.count(distinct_id) != 0) {
                return;
            }
@@ -3763,25 +4596,13 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
         int64_t match_score_index = -1;
 
         auto compute_sort_scores_op = compute_sort_scores(sort_fields, sort_order, field_values, geopoint_indices,
-                                                          seq_id, references, filter_index, best_field_match_score,
+                                                          seq_id, references, eval_filter_indexes, best_field_match_score,
                                                           scores, match_score_index, 0, collection_name);
         if (!compute_sort_scores_op.ok()) {
             status = Option<bool>(compute_sort_scores_op.code(), compute_sort_scores_op.error());
             return;
         }
 
-        size_t query_len = query_tokens.size();
-
-        // check if seq_id exists in any of the dropped_token iters and increment matching fields accordingly
-        for(auto& dropped_token_it: dropped_token_its) {
-            if(dropped_token_it.skip_to(seq_id) && dropped_token_it.id() == seq_id) {
-                query_len++;
-            }
-        }
-
-        if(syn_orig_num_tokens != -1) {
-            query_len = syn_orig_num_tokens;
-        }
         query_len = std::min<size_t>(15, query_len);
 
         // NOTE: `query_len` is total tokens matched across fields.
@@ -3797,6 +4618,10 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
 
         auto max_field_weight = std::min<size_t>(FIELD_MAX_WEIGHT, best_field_weight);
         num_matching_fields = std::min<size_t>(7, num_matching_fields);
+
+        if(!prioritize_num_matching_fields) {
+            num_matching_fields = 0;
+        }
 
         uint64_t aggregated_score = match_type == max_score ?
                                     ((int64_t(query_len) << 59) |
@@ -3832,6 +4657,7 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
         }
         result_ids.push_back(seq_id);
     });
+
     if (!status.ok()) {
         for(posting_list_t* plist: expanded_plists) {
             delete plist;
@@ -3876,17 +4702,17 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
 }
 
 Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields, const int* sort_order,
-                                        std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values,
+                                        std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values,
                                         const std::vector<size_t>& geopoint_indices,
                                         uint32_t seq_id, const std::map<basic_string<char>, reference_filter_result_t>& references,
-                                        size_t filter_index, int64_t max_field_match_score, int64_t* scores,
+                                        std::vector<uint32_t>& filter_indexes, int64_t max_field_match_score, int64_t* scores,
                                         int64_t& match_score_index, float vector_distance,
                                         const std::string& collection_name) const {
 
     int64_t geopoint_distances[3];
 
     for(auto& i: geopoint_indices) {
-        spp::sparse_hash_map<uint32_t, int64_t>* geopoints = field_values[i];
+        auto geopoints = field_values[i];
         int64_t dist = INT32_MAX;
 
         S2LatLng reference_lat_lng;
@@ -3936,6 +4762,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
     }
 
     const int64_t default_score = INT64_MIN;  // to handle field that doesn't exist in document (e.g. optional)
+    uint32_t ref_seq_id;
 
     // avoiding loop
     if (sort_fields.size() > 0) {
@@ -3951,7 +4778,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
                 if (references.at(ref_collection_name).count == 1) {
-                    seq_id = references.at(ref_collection_name).docs[0];
+                    ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
                     return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
                                                 multiple_references_error_message : no_references_error_message);
@@ -3966,7 +4793,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                 // Current collection has a reference.
                 if (ref_collection->is_referenced_in(collection_name)) {
-                    auto get_reference_field_op = ref_collection->get_reference_field(collection_name);
+                    auto get_reference_field_op = ref_collection->get_referenced_in_field_with_lock(collection_name);
                     if (!get_reference_field_op.ok()) {
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
@@ -3975,7 +4802,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
                     }
 
-                    seq_id = sort_index.at(field_name)->at(seq_id);
+                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                 // Joined collection has a reference
                 else {
@@ -3997,7 +4824,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                                     "` in `sort_by` not found.");
                     }
 
-                    auto reference_field_name_op = ref_collection->get_reference_field(joined_coll_having_reference);
+                    auto reference_field_name_op = ref_collection->get_referenced_in_field_with_lock(joined_coll_having_reference);
                     if (!reference_field_name_op.ok()) {
                         return Option<bool>(reference_field_name_op.code(), reference_field_name_op.error());
                     }
@@ -4007,13 +4834,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& count = reference.count;
 
                     if (count == 1) {
-                        auto op = joined_collection->get_sort_indexed_field_value(reference_field_name,
-                                                                                  reference.docs[0]);
+                        auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
+                                                                                    reference.docs[0]);
                         if (!op.ok()) {
                             return Option<bool>(op.code(), op.error());
                         }
 
-                        seq_id = op.get();
+                        ref_seq_id = op.get();
                     } else {
                         return Option<bool>(400, count > 1 ? multiple_references_error_message :
                                                                     no_references_error_message);
@@ -4040,7 +4867,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                                 "` not found.");
                 }
 
-                scores[0] = ref_collection->reference_string_sort_score(sort_fields[0].name, seq_id);
+                scores[0] = ref_collection->reference_string_sort_score(sort_fields[0].name, ref_seq_id);
             }
 
             if(scores[0] == adi_tree_t::NOT_FOUND) {
@@ -4055,26 +4882,48 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                 }
             }
         } else if(field_values[0] == &eval_sentinel_value) {
-            // Returns iterator to the first element that is >= to value or last if no such element is found.
-            bool found = false;
-            if (filter_index == 0 || filter_index < sort_fields[0].eval.size) {
-                size_t found_index = std::lower_bound(sort_fields[0].eval.ids + filter_index,
-                                                      sort_fields[0].eval.ids + sort_fields[0].eval.size, seq_id) -
-                                     sort_fields[0].eval.ids;
-
-                if (found_index != sort_fields[0].eval.size && sort_fields[0].eval.ids[found_index] == seq_id) {
-                    filter_index = found_index + 1;
-                    found = true;
-                }
-
-                filter_index = found_index;
+            auto const& count = sort_fields[0].eval_expressions.size();
+            if (filter_indexes.empty()) {
+                filter_indexes = std::vector<uint32_t>(count, 0);
             }
 
-            scores[0] = int64_t(found);
+            bool found = false;
+            uint32_t index = 0;
+            auto const& eval = sort_fields[0].eval;
+            for (; index < count; index++) {
+                auto& filter_index = filter_indexes[index];
+                auto const& eval_ids = eval.eval_ids_vec[index];
+                auto const& eval_ids_count = eval.eval_ids_count_vec[index];
+                if (filter_index == 0 || filter_index < eval_ids_count) {
+                    // Returns iterator to the first element that is >= to value or last if no such element is found.
+                    filter_index = std::lower_bound(eval_ids + filter_index, eval_ids + eval_ids_count, seq_id) -
+                                                            eval_ids;
+
+                    if (filter_index < eval_ids_count && eval_ids[filter_index] == seq_id) {
+                        filter_index++;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            scores[0] = found ? eval.scores[index] : 0;
         } else if(field_values[0] == &vector_distance_sentinel_value) {
             scores[0] = float_to_int64_t(vector_distance);
+        } else if(field_values[0] == &vector_query_sentinel_value) {
+            scores[0] = float_to_int64_t(2.0f);
+            try {
+                const auto& values = sort_fields[0].vector_query.vector_index->vecdex->getDataByLabel<float>(seq_id);
+                const auto& dist_func = sort_fields[0].vector_query.vector_index->space->get_dist_func();
+                float dist = dist_func(sort_fields[0].vector_query.query.values.data(), values.data(), &sort_fields[0].vector_query.vector_index->num_dim);
+                
+                scores[0] = float_to_int64_t(dist);
+            } catch(...) {
+                // probably not found
+                // do nothing
+            }
         } else {
-            auto it = field_values[0]->find(seq_id);
+            auto it = field_values[0]->find(sort_fields[0].reference_collection_name.empty() ? seq_id : ref_seq_id);
             scores[0] = (it == field_values[0]->end()) ? default_score : it->second;
 
             if(scores[0] == INT64_MIN && sort_fields[0].missing_values == sort_by::missing_values_t::first) {
@@ -4104,7 +4953,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
                 if (references.at(ref_collection_name).count == 1) {
-                    seq_id = references.at(ref_collection_name).docs[0];
+                    ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
                     return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
                                              multiple_references_error_message : no_references_error_message);
@@ -4119,7 +4968,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                 // Current collection has a reference.
                 if (ref_collection->is_referenced_in(collection_name)) {
-                    auto get_reference_field_op = ref_collection->get_reference_field(collection_name);
+                    auto get_reference_field_op = ref_collection->get_referenced_in_field_with_lock(collection_name);
                     if (!get_reference_field_op.ok()) {
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
@@ -4128,7 +4977,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
                     }
 
-                    seq_id = sort_index.at(field_name)->at(seq_id);
+                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                     // Joined collection has a reference
                 else {
@@ -4150,7 +4999,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                                  "` in `sort_by` not found.");
                     }
 
-                    auto reference_field_name_op = ref_collection->get_reference_field(joined_coll_having_reference);
+                    auto reference_field_name_op = ref_collection->get_referenced_in_field_with_lock(joined_coll_having_reference);
                     if (!reference_field_name_op.ok()) {
                         return Option<bool>(reference_field_name_op.code(), reference_field_name_op.error());
                     }
@@ -4160,13 +5009,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& count = reference.count;
 
                     if (count == 1) {
-                        auto op = joined_collection->get_sort_indexed_field_value(reference_field_name,
-                                                                                  reference.docs[0]);
+                        auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
+                                                                                    reference.docs[0]);
                         if (!op.ok()) {
                             return Option<bool>(op.code(), op.error());
                         }
 
-                        seq_id = op.get();
+                        ref_seq_id = op.get();
                     } else {
                         return Option<bool>(400, count > 1 ? multiple_references_error_message :
                                                  no_references_error_message);
@@ -4193,7 +5042,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                              "` not found.");
                 }
 
-                scores[1] = ref_collection->reference_string_sort_score(sort_fields[1].name, seq_id);
+                scores[1] = ref_collection->reference_string_sort_score(sort_fields[1].name, ref_seq_id);
             }
 
             if(scores[1] == adi_tree_t::NOT_FOUND) {
@@ -4208,26 +5057,49 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                 }
             }
         } else if(field_values[1] == &eval_sentinel_value) {
-            // Returns iterator to the first element that is >= to value or last if no such element is found.
-            bool found = false;
-            if (filter_index == 0 || filter_index < sort_fields[1].eval.size) {
-                size_t found_index = std::lower_bound(sort_fields[1].eval.ids + filter_index,
-                                                      sort_fields[1].eval.ids + sort_fields[1].eval.size, seq_id) -
-                                     sort_fields[1].eval.ids;
-
-                if (found_index != sort_fields[1].eval.size && sort_fields[1].eval.ids[found_index] == seq_id) {
-                    filter_index = found_index + 1;
-                    found = true;
-                }
-
-                filter_index = found_index;
+            auto const& count = sort_fields[1].eval_expressions.size();
+            if (filter_indexes.empty()) {
+                filter_indexes = std::vector<uint32_t>(count, 0);
             }
 
-            scores[1] = int64_t(found);
+            bool found = false;
+            uint32_t index = 0;
+            auto const& eval = sort_fields[1].eval;
+            for (; index < count; index++) {
+                auto& filter_index = filter_indexes[index];
+                auto const& eval_ids = eval.eval_ids_vec[index];
+                auto const& eval_ids_count = eval.eval_ids_count_vec[index];
+                if (filter_index == 0 || filter_index < eval_ids_count) {
+                    // Returns iterator to the first element that is >= to value or last if no such element is found.
+                    filter_index = std::lower_bound(eval_ids + filter_index, eval_ids + eval_ids_count, seq_id) -
+                                   eval_ids;
+
+                    if (filter_index < eval_ids_count && eval_ids[filter_index] == seq_id) {
+                        filter_index++;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            scores[1] = found ? eval.scores[index] : 0;
         }  else if(field_values[1] == &vector_distance_sentinel_value) {
             scores[1] = float_to_int64_t(vector_distance);
+        } else if(field_values[1] == &vector_query_sentinel_value) {
+            scores[1] = float_to_int64_t(2.0f);
+            try {
+                const auto& values = sort_fields[1].vector_query.vector_index->vecdex->getDataByLabel<float>(seq_id);
+                const auto& dist_func = sort_fields[1].vector_query.vector_index->space->get_dist_func();
+                float dist = dist_func(sort_fields[1].vector_query.query.values.data(), values.data(), &sort_fields[1].vector_query.vector_index->num_dim);
+                
+                scores[1] = float_to_int64_t(dist);
+            } catch(...) {
+                // probably not found
+                // do nothing
+            }
+
         } else {
-            auto it = field_values[1]->find(seq_id);
+            auto it = field_values[1]->find(sort_fields[1].reference_collection_name.empty() ? seq_id : ref_seq_id);
             scores[1] = (it == field_values[1]->end()) ? default_score : it->second;
             if(scores[1] == INT64_MIN && sort_fields[1].missing_values == sort_by::missing_values_t::first) {
                 bool is_asc = (sort_order[1] == -1);
@@ -4253,7 +5125,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
                 if (references.at(ref_collection_name).count == 1) {
-                    seq_id = references.at(ref_collection_name).docs[0];
+                    ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
                     return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
                                              multiple_references_error_message : no_references_error_message);
@@ -4268,7 +5140,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                 // Current collection has a reference.
                 if (ref_collection->is_referenced_in(collection_name)) {
-                    auto get_reference_field_op = ref_collection->get_reference_field(collection_name);
+                    auto get_reference_field_op = ref_collection->get_referenced_in_field_with_lock(collection_name);
                     if (!get_reference_field_op.ok()) {
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
@@ -4277,7 +5149,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
                     }
 
-                    seq_id = sort_index.at(field_name)->at(seq_id);
+                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                     // Joined collection has a reference
                 else {
@@ -4299,7 +5171,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                                  "` in `sort_by` not found.");
                     }
 
-                    auto reference_field_name_op = ref_collection->get_reference_field(joined_coll_having_reference);
+                    auto reference_field_name_op = ref_collection->get_referenced_in_field_with_lock(joined_coll_having_reference);
                     if (!reference_field_name_op.ok()) {
                         return Option<bool>(reference_field_name_op.code(), reference_field_name_op.error());
                     }
@@ -4309,13 +5181,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& count = reference.count;
 
                     if (count == 1) {
-                        auto op = joined_collection->get_sort_indexed_field_value(reference_field_name,
-                                                                                  reference.docs[0]);
+                        auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
+                                                                                    reference.docs[0]);
                         if (!op.ok()) {
                             return Option<bool>(op.code(), op.error());
                         }
 
-                        seq_id = op.get();
+                        ref_seq_id = op.get();
                     } else {
                         return Option<bool>(400, count > 1 ? multiple_references_error_message :
                                                  no_references_error_message);
@@ -4342,7 +5214,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                                              "` not found.");
                 }
 
-                scores[2] = ref_collection->reference_string_sort_score(sort_fields[2].name, seq_id);
+                scores[2] = ref_collection->reference_string_sort_score(sort_fields[2].name, ref_seq_id);
             }
 
             if(scores[2] == adi_tree_t::NOT_FOUND) {
@@ -4357,26 +5229,48 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                 }
             }
         } else if(field_values[2] == &eval_sentinel_value) {
-            // Returns iterator to the first element that is >= to value or last if no such element is found.
-            bool found = false;
-            if (filter_index == 0 || filter_index < sort_fields[2].eval.size) {
-                size_t found_index = std::lower_bound(sort_fields[2].eval.ids + filter_index,
-                                                      sort_fields[2].eval.ids + sort_fields[2].eval.size, seq_id) -
-                                     sort_fields[2].eval.ids;
-
-                if (found_index != sort_fields[2].eval.size && sort_fields[2].eval.ids[found_index] == seq_id) {
-                    filter_index = found_index + 1;
-                    found = true;
-                }
-
-                filter_index = found_index;
+            auto const& count = sort_fields[2].eval_expressions.size();
+            if (filter_indexes.empty()) {
+                filter_indexes = std::vector<uint32_t>(count, 0);
             }
 
-            scores[2] = int64_t(found);
+            bool found = false;
+            uint32_t index = 0;
+            auto const& eval = sort_fields[2].eval;
+            for (; index < count; index++) {
+                auto& filter_index = filter_indexes[index];
+                auto const& eval_ids = eval.eval_ids_vec[index];
+                auto const& eval_ids_count = eval.eval_ids_count_vec[index];
+                if (filter_index == 0 || filter_index < eval_ids_count) {
+                    // Returns iterator to the first element that is >= to value or last if no such element is found.
+                    filter_index = std::lower_bound(eval_ids + filter_index, eval_ids + eval_ids_count, seq_id) -
+                                   eval_ids;
+
+                    if (filter_index < eval_ids_count && eval_ids[filter_index] == seq_id) {
+                        filter_index++;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            scores[2] = found ? eval.scores[index] : 0;
         } else if(field_values[2] == &vector_distance_sentinel_value) {
             scores[2] = float_to_int64_t(vector_distance);
+        } else if(field_values[2] == &vector_query_sentinel_value) {
+            scores[2] = float_to_int64_t(2.0f);
+            try {
+                const auto& values = sort_fields[2].vector_query.vector_index->vecdex->getDataByLabel<float>(seq_id);
+                const auto& dist_func = sort_fields[2].vector_query.vector_index->space->get_dist_func();
+                float dist = dist_func(sort_fields[2].vector_query.query.values.data(), values.data(), &sort_fields[2].vector_query.vector_index->num_dim);
+                
+                scores[2] = float_to_int64_t(dist);
+            } catch(...) {
+                // probably not found
+                // do nothing
+            }
         } else {
-            auto it = field_values[2]->find(seq_id);
+            auto it = field_values[2]->find(sort_fields[2].reference_collection_name.empty() ? seq_id : ref_seq_id);
             scores[2] = (it == field_values[2]->end()) ? default_score : it->second;
             if(scores[2] == INT64_MIN && sort_fields[2].missing_values == sort_by::missing_values_t::first) {
                 bool is_asc = (sort_order[2] == -1);
@@ -4397,9 +5291,10 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
                                      const std::vector<sort_by>& sort_fields,
                                      std::vector<std::vector<art_leaf*>>& searched_queries, const size_t group_limit,
                                      const std::vector<std::string>& group_by_fields,
+                                     const bool group_missing_values,
                                      Topster* actual_topster,
                                      const int sort_order[3],
-                                     std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values,
+                                     std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values,
                                      const std::vector<size_t>& geopoint_indices,
                                      const std::vector<uint32_t>& curated_ids_sorted,
                                      filter_result_iterator_t*& filter_result_iterator,
@@ -4503,7 +5398,7 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
     collate_included_ids({}, included_ids_map, curated_topster, searched_queries);
 
     // AND phrase id matches with filter ids
-    if(filter_result_iterator->is_valid) {
+    if(filter_result_iterator->validity) {
         filter_result_iterator_t::add_phrase_ids(filter_result_iterator, phrase_result_ids, phrase_result_count);
     } else {
         delete filter_result_iterator;
@@ -4516,12 +5411,18 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
         return Option<bool>(true);
     }
 
+    filter_result_iterator->compute_iterators();
     all_result_ids_len = filter_result_iterator->to_filter_id_array(all_result_ids);
     filter_result_iterator->reset();
 
-    size_t filter_index = 0;
+    std::vector<uint32_t> eval_filter_indexes;
+
+    std::vector<group_by_field_it_t> group_by_field_it_vec;
+    if (group_limit != 0) {
+        group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+    }
     // populate topster
-    for(size_t i = 0; i < std::min<size_t>(10000, all_result_ids_len); i++) {
+    for(size_t i = 0; i < all_result_ids_len && filter_result_iterator->validity == filter_result_iterator_t::valid; i++) {
         auto seq_id = filter_result_iterator->seq_id;
         auto references = std::move(filter_result_iterator->reference);
         filter_result_iterator->next();
@@ -4531,7 +5432,7 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
         int64_t match_score_index = -1;
 
         auto compute_sort_scores_op = compute_sort_scores(sort_fields, sort_order, field_values, geopoint_indices,
-                                                          seq_id, references, filter_index, match_score, scores,
+                                                          seq_id, references, eval_filter_indexes, match_score, scores,
                                                           match_score_index, 0, collection_name);
         if (!compute_sort_scores_op.ok()) {
             return compute_sort_scores_op;
@@ -4539,7 +5440,11 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
 
         uint64_t distinct_id = seq_id;
         if(group_limit != 0) {
-            distinct_id = get_distinct_id(group_by_fields, seq_id);
+            distinct_id = 1;
+            for(auto& kv : group_by_field_it_vec) {
+                get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+            }
+
             if(excluded_group_ids.count(distinct_id) != 0) {
                 continue;
             }
@@ -4557,6 +5462,7 @@ Option<bool> Index::do_phrase_search(const size_t num_search_fields, const std::
         }
     }
     filter_result_iterator->reset();
+    search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
     searched_queries.push_back({});
     return Option<bool>(true);
@@ -4569,8 +5475,11 @@ Option<bool> Index::do_synonym_search(const std::vector<search_field_t>& the_fie
                                       const std::vector<sort_by>& sort_fields_std, Topster* curated_topster,
                                       const token_ordering& token_order,
                                       const size_t typo_tokens_threshold, const size_t group_limit,
-                                      const std::vector<std::string>& group_by_fields, bool prioritize_exact_match,
+                                      const std::vector<std::string>& group_by_fields, 
+                                      const bool group_missing_values,
+                                      bool prioritize_exact_match,
                                       const bool prioritize_token_position,
+                                      const bool prioritize_num_matching_fields,
                                       const bool exhaustive_search, const size_t concurrency,
                                       const std::vector<bool>& prefixes,
                                       size_t min_len_1typo,
@@ -4587,7 +5496,7 @@ Option<bool> Index::do_synonym_search(const std::vector<search_field_t>& the_fie
                                       filter_result_iterator_t* const filter_result_iterator,
                                       std::set<uint64>& query_hashes,
                                       const int* sort_order,
-                                      std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values,
+                                      std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                       const std::vector<size_t>& geopoint_indices,
                                       tsl::htrie_map<char, token_leaf>& qtoken_set,
                                       const std::string& collection_name) const {
@@ -4599,7 +5508,10 @@ Option<bool> Index::do_synonym_search(const std::vector<search_field_t>& the_fie
                                                           curated_ids_sorted, excluded_group_ids, sort_fields_std, {0},
                                                           searched_queries, qtoken_set, actual_topster, groups_processed,
                                                           all_result_ids, all_result_ids_len, group_limit, group_by_fields,
-                                                          prioritize_exact_match, prioritize_token_position, query_hashes,
+                                                          group_missing_values,
+                                                          prioritize_exact_match, prioritize_token_position,
+                                                          prioritize_num_matching_fields,
+                                                          query_hashes,
                                                           token_order, prefixes, typo_tokens_threshold, exhaustive_search,
                                                           max_candidates, min_len_1typo, min_len_2typo,
                                                           syn_orig_num_tokens, sort_order, field_values, geopoint_indices,
@@ -4617,12 +5529,14 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
                                     const std::vector<enable_t>& infixes,
                                     const std::vector<sort_by>& sort_fields,
                                     std::vector<std::vector<art_leaf*>>& searched_queries, const size_t group_limit,
-                                    const std::vector<std::string>& group_by_fields, const size_t max_extra_prefix,
+                                    const std::vector<std::string>& group_by_fields, 
+                                    const bool group_missing_values,
+                                    const size_t max_extra_prefix,
                                     const size_t max_extra_suffix,
                                     const std::vector<token_t>& query_tokens, Topster* actual_topster,
                                     filter_result_iterator_t* const filter_result_iterator,
                                     const int sort_order[3],
-                                    std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values,
+                                    std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values,
                                     const std::vector<size_t>& geopoint_indices,
                                     const std::vector<uint32_t>& curated_ids_sorted,
                                     const std::unordered_set<uint32_t>& excluded_group_ids,
@@ -4630,15 +5544,23 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
                                     spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                     const std::string& collection_name) const {
 
+    std::vector<group_by_field_it_t> group_by_field_it_vec;
+    if (group_limit != 0) {
+        group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+    }
+
     for(size_t field_id = 0; field_id < num_search_fields; field_id++) {
         auto& field_name = the_fields[field_id].name;
-        enable_t field_infix = (the_fields[field_id].orig_index < infixes.size())
-                               ? infixes[the_fields[field_id].orig_index] : infixes[0];
+        enable_t field_infix = the_fields[field_id].infix;
 
         if(field_infix == always || (field_infix == fallback && all_result_ids_len == 0)) {
             std::vector<uint32_t> infix_ids;
             filter_result_t filtered_infix_ids;
-            search_infix(query_tokens[0].value, field_name, infix_ids, max_extra_prefix, max_extra_suffix);
+            auto search_infix_op = search_infix(query_tokens[0].value, field_name, infix_ids,
+                                                max_extra_prefix, max_extra_suffix);
+            if (!search_infix_op.ok()) {
+                return search_infix_op;
+            }
 
             if(!infix_ids.empty()) {
                 gfx::timsort(infix_ids.begin(), infix_ids.end());
@@ -4656,7 +5578,7 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
                     raw_infix_ids_length = infix_ids.size();
                 }
 
-                if(filter_result_iterator->is_valid) {
+                if(filter_result_iterator->validity == filter_result_iterator_t::valid) {
                     filter_result_t result;
                     filter_result_iterator->and_scalar(raw_infix_ids, raw_infix_ids_length, result);
                     if(raw_infix_ids != &infix_ids[0]) {
@@ -4664,16 +5586,16 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
                     }
 
                     filtered_infix_ids = std::move(result);
+                    filter_result_iterator->reset();
                 }
 
                 bool field_is_array = search_schema.at(the_fields[field_id].name).is_array();
-                size_t filter_index = 0;
-
+                std::vector<uint32_t> eval_filter_indexes;
                 for(size_t i = 0; i < raw_infix_ids_length; i++) {
                     auto seq_id = raw_infix_ids[i];
-                    std::map<basic_string<char>, reference_filter_result_t> references;
-                    for (const auto& item: filtered_infix_ids.reference_filter_results) {
-                        references[item.first] = item.second[i];
+                    std::map<std::string, reference_filter_result_t> references;
+                    if (filtered_infix_ids.coll_to_references != nullptr) {
+                        references = std::move(filtered_infix_ids.coll_to_references[i]);
                     }
 
                     int64_t match_score = 0;
@@ -4685,7 +5607,7 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
 
                     auto compute_sort_scores_op = compute_sort_scores(sort_fields, sort_order, field_values,
                                                                       geopoint_indices, seq_id, references,
-                                                                      filter_index, 100, scores, match_score_index,
+                                                                      eval_filter_indexes, 100, scores, match_score_index,
                                                                       0, collection_name);
                     if (!compute_sort_scores_op.ok()) {
                         return compute_sort_scores_op;
@@ -4693,7 +5615,11 @@ Option<bool> Index::do_infix_search(const size_t num_search_fields, const std::v
 
                     uint64_t distinct_id = seq_id;
                     if(group_limit != 0) {
-                        distinct_id = get_distinct_id(group_by_fields, seq_id);
+                        distinct_id = 1;
+                        for(auto& kv : group_by_field_it_vec) {
+                            get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+                        }
+
                         if(excluded_group_ids.count(distinct_id) != 0) {
                            continue;
                        }
@@ -4783,8 +5709,8 @@ void Index::handle_exclusion(const size_t num_search_fields, std::vector<query_t
 }
 
 void Index::compute_facet_infos(const std::vector<facet>& facets, facet_query_t& facet_query,
-                                const size_t facet_query_num_typos,
-                                const uint32_t* all_result_ids, const size_t& all_result_ids_len,
+                                const uint32_t facet_query_num_typos,
+                                uint32_t* all_result_ids, const size_t& all_result_ids_len,
                                 const std::vector<std::string>& group_by_fields,
                                 const size_t group_limit, const bool is_wildcard_no_filter_query,
                                 const size_t max_candidates,
@@ -4805,9 +5731,7 @@ void Index::compute_facet_infos(const std::vector<facet>& facets, facet_query_t&
         facet_infos[findex].should_compute_stats = (facet_field.type != field_types::STRING &&
                                                     facet_field.type != field_types::BOOL &&
                                                     facet_field.type != field_types::STRING_ARRAY &&
-                                                    facet_field.type != field_types::BOOL_ARRAY &&
-                                                    facet_field.type != field_types::INT64 &&
-                                                    facet_field.type != field_types::INT64_ARRAY);
+                                                    facet_field.type != field_types::BOOL_ARRAY);
 
         size_t num_facet_values = facet_index_v4->get_facet_count(facet_field.name);
         facet_infos[findex].use_value_index = (group_limit == 0) && (a_facet.sort_field.empty()) &&
@@ -4853,11 +5777,26 @@ void Index::compute_facet_infos(const std::vector<facet>& facets, facet_query_t&
             size_t num_toks_dropped = 0;
             std::vector<sort_by> sort_fields;
 
-            search_field(0, qtokens, nullptr, 0, num_toks_dropped,
-                         facet_field, facet_field.faceted_name(),
-                         all_result_ids, all_result_ids_len, {}, sort_fields, -1, facet_query_num_typos, searched_queries, topster,
-                         groups_processed, &field_result_ids, field_result_ids_len, field_num_results, 0, group_by_fields,
-                         false, 4, query_hashes, MAX_SCORE, true, 0, 1, false, -1, 3, 1000, max_candidates);
+            std::vector<search_field_t> fq_fields;
+            fq_fields.emplace_back(facet_field.name, facet_field.faceted_name(), 1, facet_query_num_typos,
+                                   true, enable_t::off);
+
+            uint32_t* filter_ids = new uint32_t[all_result_ids_len];
+            std::copy(all_result_ids, all_result_ids + all_result_ids_len, filter_ids);
+            filter_result_iterator_t filter_result_it(filter_ids, all_result_ids_len);
+            tsl::htrie_map<char, token_leaf> qtoken_set;
+            std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values{};
+            const std::vector<size_t> geopoint_indices;
+
+            auto fuzzy_search_fields_op = fuzzy_search_fields(fq_fields, qtokens, {}, text_match_type_t::max_score, nullptr, 0,
+                                &filter_result_it, {}, {}, sort_fields, {facet_query_num_typos}, searched_queries,
+                                qtoken_set, topster, groups_processed, field_result_ids, field_result_ids_len,
+                                group_limit, group_by_fields, false, true, false, false, query_hashes, MAX_SCORE, {true}, 1,
+                                false, max_candidates, 3, 7, 0, nullptr, field_values, geopoint_indices, "", true);
+
+            if(!fuzzy_search_fields_op.ok()) {
+                continue;
+            }
 
             //LOG(INFO) << "searched_queries.size: " << searched_queries.size();
 
@@ -4895,9 +5834,7 @@ void Index::compute_facet_infos(const std::vector<facet>& facets, facet_query_t&
                         // need to ensure that document ID actually contains searched_query tokens
                         // since `field_result_ids` contains documents matched across all queries
                         // value based index
-                        for(const auto& val : searched_tokens) {
-                            facet_infos[findex].fvalue_searched_tokens.emplace_back(val);
-                        }
+                        facet_infos[findex].fvalue_searched_tokens.emplace_back(searched_tokens);
                     }
                 }
 
@@ -4988,18 +5925,20 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
                                     const std::vector<sort_by>& sort_fields, Topster* topster, Topster* curated_topster,
                                     spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                                     std::vector<std::vector<art_leaf*>>& searched_queries, const size_t group_limit,
-                                    const std::vector<std::string>& group_by_fields, const std::set<uint32_t>& curated_ids,
+                                    const std::vector<std::string>& group_by_fields, 
+                                    const bool group_missing_values,
+                                    const std::set<uint32_t>& curated_ids,
                                     const std::vector<uint32_t>& curated_ids_sorted, const uint32_t* exclude_token_ids,
                                     size_t exclude_token_ids_size, const std::unordered_set<uint32_t>& excluded_group_ids,
                                     uint32_t*& all_result_ids, size_t& all_result_ids_len,
                                     filter_result_iterator_t* const filter_result_iterator,
                                     const size_t concurrency,
                                     const int* sort_order,
-                                    std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values,
+                                    std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                     const std::vector<size_t>& geopoint_indices,
                                     const std::string& collection_name) const {
 
-    filter_result_iterator->compute_result();
+    filter_result_iterator->compute_iterators();
     auto const& approx_filter_ids_length = filter_result_iterator->approx_filter_ids_length;
 
     uint32_t token_bits = 0;
@@ -5027,11 +5966,15 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     uint32_t excluded_result_index = 0;
     Option<bool>* compute_sort_score_statuses[num_threads];
 
-    for(size_t thread_id = 0; thread_id < num_threads && filter_result_iterator->is_valid; thread_id++) {
-        filter_result_t batch_result;
+    for(size_t thread_id = 0; thread_id < num_threads &&
+                                    filter_result_iterator->validity == filter_result_iterator_t::valid; thread_id++) {
+        auto batch_result = new filter_result_t();
         filter_result_iterator->get_n_ids(window_size, excluded_result_index, exclude_token_ids,
-                                              exclude_token_ids_size, batch_result);
-
+                                          exclude_token_ids_size, batch_result);
+        if (batch_result->count == 0) {
+            delete batch_result;
+            break;
+        }
         num_queued++;
 
         searched_queries.push_back({});
@@ -5041,23 +5984,30 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
 
         thread_pool->enqueue([this, &parent_search_begin, &parent_search_stop_ms, &parent_search_cutoff,
                               thread_id, &sort_fields, &searched_queries,
-                              &group_limit, &group_by_fields, &topsters, &tgroups_processed, &excluded_group_ids,
+                              &group_limit, &group_by_fields, group_missing_values, 
+                              &topsters, &tgroups_processed, &excluded_group_ids,
                               &sort_order, field_values, &geopoint_indices, &plists,
                               check_for_circuit_break,
                               batch_result,
                               &num_processed, &m_process, &cv_process, &compute_sort_score_status, collection_name]() {
+            std::unique_ptr<filter_result_t> batch_result_guard(batch_result);
 
             search_begin_us = parent_search_begin;
             search_stop_us = parent_search_stop_ms;
-            search_cutoff = parent_search_cutoff;
+            search_cutoff = false;
 
-            size_t filter_index = 0;
+            std::vector<uint32_t> filter_indexes;
 
-            for(size_t i = 0; i < batch_result.count; i++) {
-                const uint32_t seq_id = batch_result.docs[i];
+            std::vector<group_by_field_it_t> group_by_field_it_vec;
+            if (group_limit != 0) {
+                group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+            }
+
+            for(size_t i = 0; i < batch_result->count; i++) {
+                const uint32_t seq_id = batch_result->docs[i];
                 std::map<basic_string<char>, reference_filter_result_t> references;
-                for (const auto& item: batch_result.reference_filter_results) {
-                    references[item.first] = item.second[i];
+                if (batch_result->coll_to_references != nullptr) {
+                    references = std::move(batch_result->coll_to_references[i]);
                 }
 
                 int64_t match_score = 0;
@@ -5069,7 +6019,7 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
                 int64_t match_score_index = -1;
 
                 auto compute_sort_scores_op = compute_sort_scores(sort_fields, sort_order, field_values, geopoint_indices,
-                                                                  seq_id, references, filter_index, 100, scores,
+                                                                  seq_id, references, filter_indexes, 100, scores,
                                                                   match_score_index, 0, collection_name);
                 if (!compute_sort_scores_op.ok()) {
                     compute_sort_score_status = new Option<bool>(compute_sort_scores_op.code(), compute_sort_scores_op.error());
@@ -5078,7 +6028,11 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
 
                 uint64_t distinct_id = seq_id;
                 if(group_limit != 0) {
-                    distinct_id = get_distinct_id(group_by_fields, seq_id);
+                    distinct_id = 1;
+                    for(auto& kv : group_by_field_it_vec) {
+                        get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+                    }
+
                     if(excluded_group_ids.count(distinct_id) != 0) {
                        continue;
                    }
@@ -5106,7 +6060,7 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     std::unique_lock<std::mutex> lock_process(m_process);
     cv_process.wait(lock_process, [&](){ return num_processed == num_queued; });
 
-    search_cutoff = parent_search_cutoff;
+    search_cutoff = parent_search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
     for(size_t thread_id = 0; thread_id < num_processed; thread_id++) {
         if (compute_sort_score_statuses[thread_id] != nullptr) {
@@ -5135,14 +6089,26 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     LOG(INFO) << "Time for raw scoring: " << timeMillisF;*/
 
     filter_result_iterator->reset();
-    all_result_ids_len = filter_result_iterator->to_filter_id_array(all_result_ids);
+    if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
+        auto partial_result = new filter_result_t();
+        std::unique_ptr<filter_result_t> partial_result_guard(partial_result);
+
+        filter_result_iterator->get_n_ids(window_size * num_processed,
+                                          excluded_result_index, nullptr, 0, partial_result, true);
+        all_result_ids_len = partial_result->count;
+        all_result_ids = partial_result->docs;
+        partial_result->docs = nullptr;
+    } else if (filter_result_iterator->validity == filter_result_iterator_t::valid) {
+        all_result_ids_len = filter_result_iterator->to_filter_id_array(all_result_ids);
+        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
+    }
 
     return Option<bool>(true);
 }
 
 void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint_indices,
                                   std::vector<sort_by>& sort_fields_std,
-                                  std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values) const {
+                                  std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values) const {
     for (size_t i = 0; i < sort_fields_std.size(); i++) {
         if (!sort_fields_std[i].reference_collection_name.empty()) {
             auto& cm = CollectionManager::get_instance();
@@ -5153,7 +6119,7 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
             std::vector<sort_by> ref_sort_fields_std;
             ref_sort_fields_std.emplace_back(sort_fields_std[i]);
             ref_sort_fields_std.front().reference_collection_name.clear();
-            std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> ref_field_values;
+            std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> ref_field_values;
             ref_collection->reference_populate_sort_mapping(ref_sort_order, ref_geopoint_indices,
                                                             ref_sort_fields_std, ref_field_values);
 
@@ -5180,14 +6146,27 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
             field_values[i] = &seq_id_sentinel_value;
         } else if (sort_fields_std[i].name == sort_field_const::eval) {
             field_values[i] = &eval_sentinel_value;
-            auto filter_result_iterator = filter_result_iterator_t("", this, sort_fields_std[i].eval.filter_tree_root);
-            auto filter_init_op = filter_result_iterator.init_status();
-            if (!filter_init_op.ok()) {
-                return;
+            auto& eval_exp = sort_fields_std[i].eval;
+            auto count = sort_fields_std[i].eval_expressions.size();
+            for (uint32_t j = 0; j < count; j++) {
+                auto filter_result_iterator = filter_result_iterator_t("", this, &eval_exp.filter_trees[j],
+                                                                       search_begin_us, search_stop_us);
+                auto filter_init_op = filter_result_iterator.init_status();
+                if (!filter_init_op.ok()) {
+                    return;
+                }
+
+                filter_result_iterator.compute_iterators();
+                uint32_t* eval_ids = nullptr;
+                auto eval_ids_count = filter_result_iterator.to_filter_id_array(eval_ids);
+
+                eval_exp.eval_ids_vec.push_back(eval_ids);
+                eval_exp.eval_ids_count_vec.push_back(eval_ids_count);
             }
-            sort_fields_std[i].eval.size = filter_result_iterator.to_filter_id_array(sort_fields_std[i].eval.ids);
         } else if(sort_fields_std[i].name == sort_field_const::vector_distance) {
             field_values[i] = &vector_distance_sentinel_value;
+        } else if(sort_fields_std[i].name == sort_field_const::vector_query) {
+            field_values[i] = &vector_query_sentinel_value;
         } else if (search_schema.count(sort_fields_std[i].name) != 0 && search_schema.at(sort_fields_std[i].name).sort) {
             if (search_schema.at(sort_fields_std[i].name).type == field_types::GEOPOINT_ARRAY) {
                 geopoint_indices.push_back(i);
@@ -5207,190 +6186,34 @@ void Index::populate_sort_mapping(int* sort_order, std::vector<size_t>& geopoint
 
 void Index::populate_sort_mapping_with_lock(int* sort_order, std::vector<size_t>& geopoint_indices,
                                             std::vector<sort_by>& sort_fields_std,
-                                            std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3>& field_values) const {
+                                            std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values) const {
     std::shared_lock lock(mutex);
     populate_sort_mapping(sort_order, geopoint_indices, sort_fields_std, field_values);
 }
 
-void Index::search_field(const uint8_t & field_id,
-                         const std::vector<token_t>& query_tokens,
-                         const uint32_t* exclude_token_ids,
-                         size_t exclude_token_ids_size,
-                         size_t& num_tokens_dropped,
-                         const field& the_field, const std::string& field_name, // to handle faceted index
-                         const uint32_t *filter_ids, size_t filter_ids_length,
-                         const std::vector<uint32_t>& curated_ids,
-                         std::vector<sort_by> & sort_fields,
-                         const int last_typo,
-                         const int max_typos,
-                         std::vector<std::vector<art_leaf*>> & searched_queries,
-                         Topster* topster, spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
-                         uint32_t** all_result_ids, size_t & all_result_ids_len, size_t& field_num_results,
-                         const size_t group_limit, const std::vector<std::string>& group_by_fields,
-                         bool prioritize_exact_match,
-                         const size_t concurrency,
-                         std::set<uint64>& query_hashes,
-                         const token_ordering token_order, const bool prefix,
-                         const size_t drop_tokens_threshold,
-                         const size_t typo_tokens_threshold,
-                         const bool exhaustive_search,
-                         int syn_orig_num_tokens,
-                         size_t min_len_1typo,
-                         size_t min_len_2typo,
-                         const size_t max_candidates) const {
+int Index::get_bounded_typo_cost(const size_t max_cost, const std::string& token, const size_t token_len,
+                                 const size_t min_len_1typo, const size_t min_len_2typo,
+                                 bool enable_typos_for_numerical_tokens,
+                                 bool enable_typos_for_alpha_numerical_tokens) {
 
-    // NOTE: `query_tokens` preserve original tokens, while `search_tokens` could be a result of dropped tokens
-
-    size_t max_cost = (max_typos < 0 || max_typos > 2) ? 2 : max_typos;
-
-    if(the_field.locale != "" && the_field.locale != "en" && !Tokenizer::is_cyrillic(the_field.locale)) {
-        // disable fuzzy trie traversal for certain non-english locales
-        max_cost = 0;
+    if(!enable_typos_for_alpha_numerical_tokens) {
+        for(auto c : token) {
+            if(!isalnum(c)) { //some special char which is indexed
+                return 0;
+            }
+        }
     }
 
-    // To prevent us from doing ART search repeatedly as we iterate through possible corrections
-    spp::sparse_hash_map<std::string, std::vector<art_leaf*>> token_cost_cache;
-
-    std::vector<std::vector<int>> token_to_costs;
-
-    for(size_t stoken_index=0; stoken_index < query_tokens.size(); stoken_index++) {
-        const std::string& token = query_tokens[stoken_index].value;
-
-        std::vector<int> all_costs;
-        // This ensures that we don't end up doing a cost of 1 for a single char etc.
-        int bounded_cost = get_bounded_typo_cost(max_cost, token.length(), min_len_1typo, min_len_2typo);
-
-        for(int cost = 0; cost <= bounded_cost; cost++) {
-            all_costs.push_back(cost);
-        }
-
-        token_to_costs.push_back(all_costs);
+    if(!enable_typos_for_numerical_tokens && std::all_of(token.begin(), token.end(), ::isdigit)) {
+        return 0;
     }
 
-    // stores candidates for each token, i.e. i-th index would have all possible tokens with a cost of "c"
-    std::vector<token_candidates> token_candidates_vec;
-
-    std::set<std::string> unique_tokens;
-
-    auto product = []( long long a, std::vector<int>& b ) { return a*b.size(); };
-    long long n = 0;
-    long long int N = std::accumulate(token_to_costs.begin(), token_to_costs.end(), 1LL, product);
-
-    const size_t combination_limit = exhaustive_search ? Index::COMBINATION_MAX_LIMIT : Index::COMBINATION_MIN_LIMIT;
-
-    while(n < N && n < combination_limit) {
-        RETURN_CIRCUIT_BREAKER
-
-        // Outerloop generates combinations of [cost to max_cost] for each token
-        // For e.g. for a 3-token query: [0, 0, 0], [0, 0, 1], [0, 1, 1] etc.
-        std::vector<uint32_t> costs(token_to_costs.size());
-        ldiv_t q { n, 0 };
-        bool valid_combo = false;
-
-        for(long long i = (token_to_costs.size() - 1); 0 <= i ; --i ) {
-            q = ldiv(q.quot, token_to_costs[i].size());
-            costs[i] = token_to_costs[i][q.rem];
-            if(costs[i] == uint32_t(last_typo+1)) {
-                // to support progressive typo searching, there must be atleast one typo that's greater than last_typo
-                valid_combo = true;
-            }
-        }
-
-        if(last_typo != -1 && !valid_combo) {
-            n++;
-            continue;
-        }
-
-        unique_tokens.clear();
-        token_candidates_vec.clear();
-        size_t token_index = 0;
-
-        while(token_index < query_tokens.size()) {
-            // For each token, look up the generated cost for this iteration and search using that cost
-            const std::string& token = query_tokens[token_index].value;
-            const std::string token_cost_hash = token + std::to_string(costs[token_index]);
-
-            std::vector<art_leaf*> leaves;
-            const bool prefix_search = prefix && query_tokens[token_index].is_prefix_searched;
-
-            /*LOG(INFO) << "Searching for field: " << the_field.name << ", token:"
-                      << token << " - cost: " << costs[token_index] << ", prefix_search: " << prefix_search;*/
-
-            if(token_cost_cache.count(token_cost_hash) != 0) {
-                leaves = token_cost_cache[token_cost_hash];
-            } else {
-                const size_t token_len = prefix_search ? (int) token.length() : (int) token.length() + 1;
-
-                //auto begin = std::chrono::high_resolution_clock::now();
-
-                // need less candidates for filtered searches since we already only pick tokens with results
-                art_fuzzy_search(search_index.at(field_name), (const unsigned char *) token.c_str(), token_len,
-                                 costs[token_index], costs[token_index], max_candidates, token_order, prefix_search,
-                                 false, "", filter_ids, filter_ids_length, leaves, unique_tokens);
-
-                /*auto timeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::high_resolution_clock::now() - begin).count();
-                LOG(INFO) << "Time taken for fuzzy search: " << timeMillis << "ms";*/
-
-                if(!leaves.empty()) {
-                    token_cost_cache.emplace(token_cost_hash, leaves);
-                    for(auto leaf: leaves) {
-                        std::string tok(reinterpret_cast<char*>(leaf->key), leaf->key_len - 1);
-                        unique_tokens.emplace(tok);
-                    }
-                }
-            }
-
-            if(!leaves.empty()) {
-                //log_leaves(costs[token_index], token, leaves);
-                token_candidates_vec.push_back(
-                        token_candidates{query_tokens[token_index], costs[token_index], prefix_search, leaves});
-            }
-
-            token_index++;
-        }
-
-        if(token_candidates_vec.size() == query_tokens.size()) {
-            std::vector<uint32_t> id_buff;
-
-            // If all tokens are, go ahead and search for candidates
-            search_candidates(field_id, the_field.is_array(), filter_ids, filter_ids_length,
-                              exclude_token_ids, exclude_token_ids_size,
-                              curated_ids, sort_fields, token_candidates_vec, searched_queries, topster,
-                              groups_processed, all_result_ids, all_result_ids_len, field_num_results,
-                              typo_tokens_threshold, group_limit, group_by_fields, query_tokens,
-                              prioritize_exact_match, exhaustive_search, syn_orig_num_tokens,
-                              concurrency, query_hashes, id_buff);
-
-            if(id_buff.size() > 1) {
-                std::sort(id_buff.begin(), id_buff.end());
-                id_buff.erase(std::unique( id_buff.begin(), id_buff.end() ), id_buff.end());
-            }
-
-            uint32_t* new_all_result_ids = nullptr;
-            all_result_ids_len = ArrayUtils::or_scalar(*all_result_ids, all_result_ids_len, &id_buff[0],
-                                                       id_buff.size(), &new_all_result_ids);
-            delete[] *all_result_ids;
-            *all_result_ids = new_all_result_ids;
-        }
-
-        if(!exhaustive_search && field_num_results >= typo_tokens_threshold) {
-            // if typo threshold is breached, we are done
-            return ;
-        }
-
-        n++;
-    }
-}
-
-int Index::get_bounded_typo_cost(const size_t max_cost, const size_t token_len,
-                                 const size_t min_len_1typo, const size_t min_len_2typo) {
-    if(token_len < min_len_1typo) {
+    if (token_len < min_len_1typo) {
         // typo correction is disabled for small tokens
         return 0;
     }
 
-    if(token_len < min_len_2typo) {
+    if (token_len < min_len_2typo) {
         // 2-typos are enabled only at token length of 7 chars
         return std::min<int>(max_cost, 1);
     }
@@ -5526,9 +6349,10 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
                           const std::vector<art_leaf *> &query_suggestion,
                           spp::sparse_hash_map<uint64_t, uint32_t>& groups_processed,
                           const uint32_t seq_id, const int sort_order[3],
-                          std::array<spp::sparse_hash_map<uint32_t, int64_t>*, 3> field_values,
+                          std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values,
                           const std::vector<size_t>& geopoint_indices,
                           const size_t group_limit, const std::vector<std::string>& group_by_fields,
+                          const bool group_missing_values,
                           const uint32_t token_bits,
                           const bool prioritize_exact_match,
                           const bool single_exact_query_token,
@@ -5538,7 +6362,7 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
     int64_t geopoint_distances[3];
 
     for(auto& i: geopoint_indices) {
-        spp::sparse_hash_map<uint32_t, int64_t>* geopoints = field_values[i];
+        auto geopoints = field_values[i];
         int64_t dist = INT32_MAX;
 
         S2LatLng reference_lat_lng;
@@ -5721,7 +6545,12 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
     uint64_t distinct_id = seq_id;
 
     if(group_limit != 0) {
-        distinct_id = get_distinct_id(group_by_fields, seq_id);
+        distinct_id = 1;
+        auto group_by_field_it_vec = get_group_by_field_iterators(group_by_fields);
+
+        for(auto& kv : group_by_field_it_vec) {
+            get_distinct_id(kv.it, seq_id, kv.is_array, group_missing_values, distinct_id);
+        }
     }
 
     //LOG(INFO) << "Seq id: " << seq_id << ", match_score: " << match_score;
@@ -5735,39 +6564,41 @@ void Index::score_results(const std::vector<sort_by> & sort_fields, const uint16
     //LOG(INFO) << "Time taken for results iteration: " << timeNanos << "ms";
 }
 
-// pre-filter group_by_fields such that we can avoid the find() check
-uint64_t Index::get_distinct_id(const std::vector<std::string>& group_by_fields,
-                                const uint32_t seq_id) const {
-    uint32_t distinct_id = 1; // some constant initial value
-
-    // calculate hash from group_by_fields
-    for(const auto& field_name: group_by_fields) {
-        if(!facet_index_v4->has_hash_index(field_name)) {
-            continue;
+void Index::get_distinct_id(posting_list_t::iterator_t& facet_index_it, const uint32_t seq_id, const bool is_array,
+                            const bool group_missing_values, uint64_t& distinct_id, bool is_reverse) const {
+    if (!facet_index_it.valid()) {
+        if (!group_missing_values) {
+            distinct_id = seq_id;
         }
-
-        posting_list_t* facet_hash_index = facet_index_v4->get_facet_hash_index(field_name);
-        std::vector<uint32_t> facet_hashes;
-        posting_list_t::iterator_t facet_index_it = facet_hash_index->new_iterator();
+        return;
+    }
+    // calculate hash from group_by_fields
+    if(!is_reverse) {
         facet_index_it.skip_to(seq_id);
+    } else {
+        facet_index_it.skip_to_rev(seq_id);
+    }
 
-        if(facet_index_it.valid()) {
+    if (facet_index_it.valid() && facet_index_it.id() == seq_id) {
+        if (is_array) {
+            //LOG(INFO) << "combining hashes for facet array ";
+            std::vector<uint32_t> facet_hashes;
             posting_list_t::get_offsets(facet_index_it, facet_hashes);
-
-            if(search_schema.at(field_name).is_array()) {
-                //LOG(INFO) << "combining hashes for facet array ";
-                for(size_t i = 0; i < facet_hashes.size(); i++) {
-                    distinct_id = StringUtils::hash_combine(distinct_id, facet_hashes[i]);
-                }
-            } else {
-                const auto& facet_hash = facet_hashes[0];
-                //LOG(INFO) << "combining hashes for facet ";
-                distinct_id = StringUtils::hash_combine(distinct_id, facet_hash);
+            for (size_t i = 0; i < facet_hashes.size(); i++) {
+                distinct_id = StringUtils::hash_combine(distinct_id, facet_hashes[i]);
             }
+        } else {
+            //LOG(INFO) << "combining hashes for facet ";
+            distinct_id = StringUtils::hash_combine(distinct_id, facet_index_it.offset());
         }
     }
-    //LOG(INFO) << "distinct id " << distinct_id;
-    return distinct_id;
+
+    //LOG(INFO) << "seq_id: " << seq_id << ", distinct_id: " << distinct_id;
+    if (distinct_id == 1 && !group_missing_values) {
+        distinct_id = seq_id;
+    }
+
+    return;
 }
 
 inline uint32_t Index::next_suggestion2(const std::vector<tok_candidates>& token_candidates_vec,
@@ -5877,7 +6708,8 @@ void Index::remove_facet_token(const field& search_field, spp::sparse_hash_map<s
     }
 }
 
-void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name) {
+void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name,
+                         const bool is_update) {
     const auto& search_field_it = search_schema.find(field_name);
     if(search_field_it == search_schema.end()) {
         return;
@@ -5887,6 +6719,10 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
 
     if(!search_field.index) {
         return;
+    }
+
+    if(search_field.optional && document[field_name].is_null()) {
+        return ;
     }
 
     // Go through all the field names and find the keys+values so that they can be removed from in-memory index
@@ -5905,13 +6741,13 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
                 if (posting_t::num_ids(leaf->values) == 0) {
                     void* values = art_delete(search_index.at(field_name), key, key_len);
                     posting_t::destroy_list(values);
-                }
-            }
 
-            if(search_field.infix) {
-                auto strhash = StringUtils::hash_wy(key, token.size());
-                const auto& infix_sets = infix_index.at(search_field.name);
-                infix_sets[strhash % 4]->erase(token);
+                    if(search_field.infix) {
+                        auto strhash = StringUtils::hash_wy(key, token.size());
+                        const auto& infix_sets = infix_index.at(search_field.name);
+                        infix_sets[strhash % 4]->erase(token);
+                    }
+                }
             }
         }
     } else if(search_field.is_int32()) {
@@ -5949,7 +6785,10 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
             }
         }
     } else if(search_field.num_dim) {
-        vector_index[search_field.name]->vecdex->markDelete(seq_id);
+        if(!is_update) {
+            // since vector index supports upsert natively, we should not attempt to delete for update
+            vector_index[search_field.name]->vecdex->markDelete(seq_id);
+        }
     } else if(search_field.is_float()) {
         const std::vector<float>& values = search_field.is_single_float() ?
                                            std::vector<float>{document[field_name].get<float>()} :
@@ -6016,7 +6855,7 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
     }
 
     // remove facets
-    facet_index_v4->remove(field_name, seq_id);
+    facet_index_v4->remove(document, search_field, seq_id);
 
     // remove sort field
     if(sort_index.count(field_name) != 0) {
@@ -6045,7 +6884,7 @@ Option<uint32_t> Index::remove(const uint32_t seq_id, const nlohmann::json & doc
             }
 
             try {
-                remove_field(seq_id, document, the_field.name);
+                remove_field(seq_id, document, the_field.name, is_update);
             } catch(const std::exception& e) {
                 LOG(WARNING) << "Error while removing field `" << the_field.name << "` from document, message: "
                              << e.what();
@@ -6055,7 +6894,7 @@ Option<uint32_t> Index::remove(const uint32_t seq_id, const nlohmann::json & doc
         for(auto it = document.begin(); it != document.end(); ++it) {
             const std::string& field_name = it.key();
             try {
-                remove_field(seq_id, document, field_name);
+                remove_field(seq_id, document, field_name, is_update);
             } catch(const std::exception& e) {
                 LOG(WARNING) << "Error while removing field `" << field_name << "` from document, message: "
                              << e.what();
@@ -6113,6 +6952,10 @@ const spp::sparse_hash_map<std::string, hnsw_index_t*>& Index::_get_vector_index
     return vector_index;
 }
 
+facet_index_t* Index::_get_facet_index() const {
+    return facet_index_v4;
+}
+
 void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vector<field>& del_fields) {
     std::unique_lock lock(mutex);
 
@@ -6124,14 +6967,14 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
         search_schema.emplace(new_field.name, new_field);
 
         if(new_field.type == field_types::FLOAT_ARRAY && new_field.num_dim > 0) {
-            auto hnsw_index = new hnsw_index_t(new_field.num_dim, 1024, new_field.vec_dist);
+            auto hnsw_index = new hnsw_index_t(new_field.num_dim, 1024, new_field.vec_dist, new_field.hnsw_params["M"].get<uint32_t>(), new_field.hnsw_params["ef_construction"].get<uint32_t>());
             vector_index.emplace(new_field.name, hnsw_index);
             continue;
         }
 
         if(new_field.is_sortable()) {
             if(new_field.is_num_sortable()) {
-                spp::sparse_hash_map<uint32_t, int64_t> * doc_to_score = new spp::sparse_hash_map<uint32_t, int64_t>();
+                auto doc_to_score = new spp::sparse_hash_map<uint32_t, int64_t, Hasher32>();
                 sort_index.emplace(new_field.name, doc_to_score);
             } else if(new_field.is_str_sortable()) {
                 str_sort_index.emplace(new_field.name, new adi_tree_t);
@@ -6299,6 +7142,8 @@ void Index::get_doc_changes(const index_operation_t op, const tsl::htrie_map<cha
 
     if(op == UPSERT) {
         new_doc = update_doc;
+        new_doc.merge_patch(update_doc);  // ensures that null valued keys are deleted
+
         // since UPSERT could replace a doc with lesser fields, we have to add those missing fields to del_doc
         for(auto it = old_doc.begin(); it != old_doc.end(); ++it) {
             if(it.value().is_object() || (it.value().is_array() && (it.value().empty() || it.value()[0].is_object()))) {
@@ -6336,7 +7181,7 @@ void Index::get_doc_changes(const index_operation_t op, const tsl::htrie_map<cha
         if(it.value().is_null()) {
             // null values should not be indexed
             new_doc.erase(it.key());
-            if(old_doc.contains(it.key())) {
+            if(old_doc.contains(it.key()) && !old_doc[it.key()].is_null()) {
                 del_doc[it.key()] = old_doc[it.key()];
             }
             it = update_doc.erase(it);
@@ -6543,11 +7388,13 @@ bool Index::common_results_exist(std::vector<art_leaf*>& leaves, bool must_match
 
 
 void Index::batch_embed_fields(std::vector<index_record*>& records, 
-                                       const tsl::htrie_map<char, field>& embedding_fields,
-                                       const tsl::htrie_map<char, field> & search_schema, const size_t remote_embedding_batch_size) {
+                               const tsl::htrie_map<char, field>& embedding_fields,
+                               const tsl::htrie_map<char, field> & search_schema, const size_t remote_embedding_batch_size,
+                               const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
     for(const auto& field : embedding_fields) {
-        std::vector<std::pair<index_record*, std::string>> texts_to_embed;
-        auto indexing_prefix = TextEmbedderManager::get_instance().get_indexing_prefix(field.embed[fields::model_config]);
+        std::vector<std::pair<index_record*, std::string>> values_to_embed;
+        bool is_image_embedding = false;
+        auto indexing_prefix = EmbedderManager::get_instance().get_indexing_prefix(field.embed[fields::model_config]);
         for(auto& record : records) {
             if(!record->indexed.ok()) {
                 continue;
@@ -6568,7 +7415,7 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                 continue;
             }
 
-            std::string text = indexing_prefix;
+            std::string value = indexing_prefix;
             const auto& embed_from = field.embed[fields::from].get<std::vector<std::string>>();
             for(const auto& field_name : embed_from) {
                 auto field_it = search_schema.find(field_name);
@@ -6576,74 +7423,106 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                 if(doc_field_it == document->end()) {
                         continue;
                 }
+                if(field_it.value().type == field_types::IMAGE) {
+                    is_image_embedding = true;
+                    value = doc_field_it->get<std::string>();
+                    continue;
+                }
                 if(field_it.value().type == field_types::STRING) {
-                    text += doc_field_it->get<std::string>() + " ";
+                    value += doc_field_it->get<std::string>() + " ";
                 } else if(field_it.value().type == field_types::STRING_ARRAY) {
                     for(const auto& val : *(doc_field_it)) {
-                        text += val.get<std::string>() + " ";
+                        value += val.get<std::string>() + " ";
                     }
                 }
             }
-            if(text != indexing_prefix) {
-                texts_to_embed.push_back(std::make_pair(record, text));
+            if(value != indexing_prefix) {
+                values_to_embed.push_back(std::make_pair(record, value));
             }
         }
 
-        if(texts_to_embed.empty()) {
+        if(values_to_embed.empty()) {
             continue;
         }
 
-        TextEmbedderManager& embedder_manager = TextEmbedderManager::get_instance();
-        auto embedder_op = embedder_manager.get_text_embedder(field.embed[fields::model_config]);
-
-        if(!embedder_op.ok()) {
-            LOG(ERROR) << "Error while getting embedder for model: " << field.embed[fields::model_config];
-            LOG(ERROR) << "Error: " << embedder_op.error();
-            return;
-        }
+        std::vector<embedding_res_t> embeddings;
 
         // sort texts by length
-        std::sort(texts_to_embed.begin(), texts_to_embed.end(),
-                  [](const std::pair<index_record*, std::string>& a,
-                     const std::pair<index_record*, std::string>& b) {
-                      return a.second.size() < b.second.size();
-                  });
+        if(!is_image_embedding) {
+            std::sort(values_to_embed.begin(), values_to_embed.end(),
+                    [](const std::pair<index_record*, std::string>& a,
+                        const std::pair<index_record*, std::string>& b) {
+                        return a.second.size() < b.second.size();
+                    });
+        }
         
-        // get vector of texts
-        std::vector<std::string> texts;
-        for(const auto& text_to_embed : texts_to_embed) {
-            texts.push_back(text_to_embed.second);
+        // get vector of values
+        std::vector<std::string> values;
+        for(const auto& value_to_embed : values_to_embed) {
+            values.push_back(value_to_embed.second);
         }
 
-        auto embeddings = embedder_op.get()->batch_embed(texts, remote_embedding_batch_size);
+        EmbedderManager& embedder_manager = EmbedderManager::get_instance();
+        if(is_image_embedding) {
+            auto embedder_op = embedder_manager.get_image_embedder(field.embed[fields::model_config]);
+            if(!embedder_op.ok()) {
+                const std::string& error_msg = "Could not find image embedder for model: " + field.embed[fields::model_config][fields::model_name].get<std::string>();
+                for(auto& record : records) {
+                    record->index_failure(400, error_msg);
+                }
+                LOG(ERROR) << "Error: " << error_msg;
+                return;
+            }
+            embeddings = embedder_op.get()->batch_embed(values);
+        } else {
+            auto embedder_op = embedder_manager.get_text_embedder(field.embed[fields::model_config]);
+            if(!embedder_op.ok()) {
+                LOG(ERROR) << "Error while getting embedder for model: " << field.embed[fields::model_config];
+                LOG(ERROR) << "Error: " << embedder_op.error();
+                return;
+            }
+            embeddings = embedder_op.get()->batch_embed(values, remote_embedding_batch_size, remote_embedding_timeout_ms,
+                                                            remote_embedding_num_tries);
+        }
 
         for(size_t i = 0; i < embeddings.size(); i++) {
             auto& embedding_res = embeddings[i];
             if(!embedding_res.success) {
-                texts_to_embed[i].first->embedding_res = embedding_res.error;
-                texts_to_embed[i].first->index_failure(embedding_res.status_code, "");
+                values_to_embed[i].first->embedding_res = embedding_res.error;
+                values_to_embed[i].first->index_failure(embedding_res.status_code, "");
                 continue;
             }
-            nlohmann::json* document;
-            if(texts_to_embed[i].first->is_update) {
-                document = &texts_to_embed[i].first->new_doc;
-            } else {
-                document = &texts_to_embed[i].first->doc;
-            }
-            (*document)[field.name] = embedding_res.embedding;
+            if(values_to_embed[i].first->is_update) {
+                values_to_embed[i].first->new_doc[field.name] = embedding_res.embedding;
+            } 
+            values_to_embed[i].first->doc[field.name] = embedding_res.embedding;
         }
     }
 }
 
-Option<uint32_t> Index::get_reference_doc_id_with_lock(const string& reference_helper_field_name,
-                                                       const uint32_t& seq_id) const {
-    std::shared_lock lock(mutex);
-    if (sort_index.count(reference_helper_field_name) == 0 ||
-        sort_index.at(reference_helper_field_name)->count(seq_id) == 0) {
-        return Option<uint32_t>(400, "Could not find a reference for doc " + std::to_string(seq_id));
+void Index::repair_hnsw_index() {
+    std::vector<std::string> vector_fields;
+
+    // this lock ensures that the `vector_index` map is not mutated during read
+    std::shared_lock read_lock(mutex);
+
+    for(auto& vec_kv: vector_index) {
+        vector_fields.push_back(vec_kv.first);
     }
 
-    return Option<uint32_t>(sort_index.at(reference_helper_field_name)->at(seq_id));
+    read_lock.unlock();
+
+    for(const auto& vector_field: vector_fields) {
+        read_lock.lock();
+        if(vector_index.count(vector_field) != 0) {
+            // this lock ensures that the vector index is not dropped during repair
+            std::unique_lock lock(vector_index[vector_field]->repair_m);
+            read_lock.unlock();  // release this lock since repair is a long running operation
+            vector_index[vector_field]->vecdex->repair_zero_indegree();
+        } else {
+            read_lock.unlock();
+        }
+    }
 }
 
 int64_t Index::reference_string_sort_score(const string &field_name, const uint32_t &seq_id) const {
@@ -6651,11 +7530,71 @@ int64_t Index::reference_string_sort_score(const string &field_name, const uint3
     return str_sort_index.at(field_name)->rank(seq_id);
 }
 
-Option<uint32_t> Index::get_sort_indexed_field_value(const string& field_name, const uint32_t& seq_id) const {
+Option<bool> Index::get_related_ids(const std::string& collection_name, const string& field_name,
+                                    const uint32_t& seq_id, std::vector<uint32_t>& result) const {
     std::shared_lock lock(mutex);
-    if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
-        return Option<uint32_t>(400, "Could not find `" + field_name + "` value for doc `" + std::to_string(seq_id)
-                                        + "`.");
+    if (search_schema.count(field_name) == 0) {
+        return Option<bool>(400, "Could not find `" + field_name + "` in the collection `" + collection_name + "`.");
+    }
+
+    auto const no_match_op = Option<bool>(400, "Could not find `" + field_name + "` value for doc `" +
+                                                std::to_string(seq_id) + "`.");
+    if (search_schema.at(field_name).is_singular()) {
+        if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
+            return no_match_op;
+        }
+
+        result.emplace_back(sort_index.at(field_name)->at(seq_id));
+        return Option<bool>(true);
+    }
+
+    if (reference_index.count(field_name) == 0) {
+        return no_match_op;
+    }
+
+    size_t ids_len = 0;
+    uint32_t* ids = nullptr;
+    reference_index.at(field_name)->search(EQUALS, seq_id, &ids, ids_len);
+    if (ids_len == 0) {
+        return no_match_op;
+    }
+
+    for (uint32_t i = 0; i < ids_len; i++) {
+        result.emplace_back(ids[i]);
+    }
+    delete [] ids;
+    return Option<bool>(true);
+}
+
+Option<bool> Index::get_object_array_related_id(const std::string& collection_name,
+                                                const std::string& field_name,
+                                                const uint32_t& seq_id, const uint32_t& object_index,
+                                                uint32_t& result) const {
+    std::shared_lock lock(mutex);
+    if (object_array_reference_index.count(field_name) == 0 || object_array_reference_index.at(field_name) == nullptr) {
+        return Option<bool>(404, "`" + field_name + "` not found in `" + collection_name +
+                                    ".object_array_reference_index`");
+    } else if (object_array_reference_index.at(field_name)->count({seq_id, object_index}) == 0) {
+        return Option<bool>(400, "Key `{" + std::to_string(seq_id) + ", " + std::to_string(object_index) + "}`"
+                                    " not found in `" + collection_name + ".object_array_reference_index`");
+    }
+
+    result = object_array_reference_index.at(field_name)->at({seq_id, object_index});
+    return Option<bool>(true);
+}
+
+Option<uint32_t> Index::get_sort_index_value_with_lock(const std::string& collection_name,
+                                                       const std::string& field_name,
+                                                       const uint32_t& seq_id) const {
+    std::shared_lock lock(mutex);
+    if (search_schema.count(field_name) == 0) {
+        return Option<uint32_t>(400, "Could not find `" + field_name + "` in the collection `" + collection_name + "`.");
+    } else if (search_schema.at(field_name).is_array()) {
+        return Option<uint32_t>(400, "Cannot sort on `" + field_name + "` in the collection, `" + collection_name +
+                                        "` is `" + search_schema.at(field_name).type + "`.");
+    } else if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
+        return Option<uint32_t>(400, "Could not find `" + field_name + "` value for doc `" +
+                                     std::to_string(seq_id) + "`.");;
     }
 
     return Option<uint32_t>(sort_index.at(field_name)->at(seq_id));

@@ -34,7 +34,7 @@ rules_foreign_cc_dependencies(
 # brpc and its dependencies
 git_repository(
     name = "com_github_brpc_brpc",
-    commit = "70d702f1c7c4f663d30cd0ca284bf838a8cf7afb",
+    commit = "df31bf51f08ca6afa59ef3b4f3749bf20ebd1858",
     patches = [
         "//bazel/brpc:brpc.patch",
     ],
@@ -49,6 +49,13 @@ new_git_repository(
     remote= "https://github.com/microsoft/onnxruntime",
     patches=["//bazel:onnx.patch"],
     patch_cmds= ["git submodule sync && git submodule foreach  'git fetch --tags' && git submodule update --init --remote"]
+)
+
+new_git_repository(
+    name="clip_tokenizer",
+    branch="master",
+    remote="https://github.com/ozanarmagan/clip_tokenizer_cpp",
+    build_file = "//bazel:clip_tokenizer.BUILD",
 )
 
 new_git_repository(
@@ -179,7 +186,7 @@ new_git_repository(
 new_git_repository(
     name = "hnsw",
     build_file = "//bazel:hnsw.BUILD",
-    commit = "5aba40d4b10dd77aece2ab9a1b3fdf06e433466a",
+    commit = "687d981753f8bafcd16421cbd2a166d0b62bc520",
     remote = "https://github.com/typesense/hnswlib.git",
 )
 
@@ -309,4 +316,31 @@ http_archive(
     sha256 = "ecc406914edf335f0b7fc084ebe6c460c4d6d5175bfdd6688c1c78d9146b8858",
     strip_prefix = "elfutils-0.182",
     urls = ["https://sourceware.org/elfutils/ftp/0.182/elfutils-0.182.tar.bz2"],
+)
+
+new_git_repository(
+    name= "whisper.cpp",
+    build_file = "//bazel:whisper.BUILD",
+    commit = "022756a87204cd06c5d58f67b3708b550dcc38b0",
+    remote = "https://github.com/ggerganov/whisper.cpp.git",
+    patches = ["//bazel:whisper.patch"],
+    patch_args = ["-p1"]
+)
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "rules_cuda",
+    sha256 = "2f8c8c8c85f727bec4423efecec12d3b751cb0a98bda99f0f9d351608a23b858",
+    strip_prefix = "rules_cuda-v0.2.1",
+    urls = ["https://github.com/bazel-contrib/rules_cuda/releases/download/v0.2.1/rules_cuda-v0.2.1.tar.gz"],
+)
+load("@rules_cuda//cuda:repositories.bzl", "register_detected_cuda_toolchains", "rules_cuda_dependencies")
+rules_cuda_dependencies()
+register_detected_cuda_toolchains()
+
+new_git_repository(
+    name= "snowball",
+    build_file = "//bazel:snowball.BUILD",
+    branch = "master",
+    remote = "https://github.com/snowballstem/snowball.git"
 )

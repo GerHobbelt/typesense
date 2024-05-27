@@ -1487,6 +1487,157 @@ TEST_F(CollectionNestedFieldsTest, ExplicitSchemaForNestedArrayTypeValidation) {
               "Hint: field inside an array of objects must be an array type as well.", add_op.error());
 }
 
+TEST_F(CollectionNestedFieldsTest, OptionalNestedOptionalOjectArrStringField) {
+    nlohmann::json schema = R"({
+            "name": "coll1",
+            "enable_nested_fields": true,
+            "fields": [
+              {"facet":true,"name":"data","optional":false,"type":"object"},
+              {"facet":false,"name":"data.locations.stateShort","optional":true,"type":"string[]"}
+            ]
+        })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+          "data": {
+            "locations": [
+              {
+                "stateShort": null
+              }
+            ]
+          }
+        })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    doc1 = R"({
+          "data": {
+            "locations": [
+              {
+                "stateShort": null
+              },
+              {
+                "stateShort": "NY"
+              }
+            ]
+          }
+        })"_json;
+
+    coll1->add(doc1.dump(), CREATE);
+
+    auto results = coll1->search("ny", {"data.locations.stateShort"},
+                                 "", {}, {}, {0}, 10, 1,
+                                 token_ordering::FREQUENCY, {true}, 10, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4).get();
+
+    ASSERT_EQ(1, results["found"].get<size_t>());
+}
+
+TEST_F(CollectionNestedFieldsTest, OptionalNestedNonOptionalOjectArrStringField) {
+    nlohmann::json schema = R"({
+            "name": "coll1",
+            "enable_nested_fields": true,
+            "fields": [
+              {"facet":true,"name":"data","type":"object"},
+              {"facet":false,"name":"data.locations.stateShort","type":"string[]"}
+            ]
+        })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+          "data": {
+            "locations": [
+              {
+                "stateShort": null
+              }
+            ]
+          }
+        })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_FALSE(add_op.ok());
+    ASSERT_EQ("Field `data.locations.stateShort` has been declared in the schema, but is not found in the document.",
+    add_op.error());
+
+    doc1 = R"({
+          "data": {
+            "locations": [
+              {
+                "stateShort": null
+              },
+              {
+                "stateShort": "NY"
+              }
+            ]
+          }
+        })"_json;
+
+    coll1->add(doc1.dump(), CREATE);
+
+    auto results = coll1->search("ny", {"data.locations.stateShort"},
+                                 "", {}, {}, {0}, 10, 1,
+                                 token_ordering::FREQUENCY, {true}, 10, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4).get();
+
+    ASSERT_EQ(1, results["found"].get<size_t>());
+}
+
+
+TEST_F(CollectionNestedFieldsTest, UnindexedNestedFieldShouldNotClutterSchema) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+            {"name": "block", "type": "object", "optional": true, "index": false}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "block": {"text": "Hello world."}
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    // child fields should not become part of schema
+    ASSERT_EQ(1, coll1->get_fields().size());
+}
+
+TEST_F(CollectionNestedFieldsTest, UnindexedNonOptionalFieldShouldBeAllowed) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+            {"name": "block", "type": "object", "index": false}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "block": {"text": "Hello world."}
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    // child fields should not become part of schema
+    ASSERT_EQ(1, coll1->get_fields().size());
+}
+
 TEST_F(CollectionNestedFieldsTest, SortByNestedField) {
     nlohmann::json schema = R"({
         "name": "coll1",
@@ -2352,6 +2503,34 @@ TEST_F(CollectionNestedFieldsTest, NestedSchemaAutoAndFacet) {
     ASSERT_TRUE(coll1->get_schema()["schools.name"].optional);
 }
 
+TEST_F(CollectionNestedFieldsTest, NestedObjectOfObjectEnableFacet) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "variants", "type": "object"},
+          {"name": "variants\\..*\\.price", "type": "int64", "facet": true}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "variants": {
+            "store_1": {"price": 100},
+            "store_2": {"price": 200}
+        }
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    ASSERT_TRUE(coll1->get_schema()["variants.store_1.price"].facet);
+    ASSERT_TRUE(coll1->get_schema()["variants.store_2.price"].facet);
+}
+
 TEST_F(CollectionNestedFieldsTest, ArrayOfObjectsFaceting) {
     nlohmann::json schema = R"({
         "name": "coll1",
@@ -2656,6 +2835,56 @@ TEST_F(CollectionNestedFieldsTest, EmplaceWithNullValueOnOptionalField) {
     ASSERT_EQ(0, results["hits"][0]["document"]["currency"].size());
 }
 
+TEST_F(CollectionNestedFieldsTest, UpsertWithNullValueOnOptionalField) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "status", "type": "object"},
+          {"name": "title", "type": "string"}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "id": "0",
+        "title": "Title Alpha",
+        "status": {"name": "Foo"}
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), UPSERT);
+    ASSERT_TRUE(add_op.ok());
+
+    auto results = coll1->search("alpha", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
+    ASSERT_EQ(3, results["hits"][0]["document"].size());  // id, title, status
+    ASSERT_EQ(1, results["hits"][0]["document"]["status"].size());
+
+    results = coll1->search("foo", {"status"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
+
+    // upsert again with null value
+    doc1 = R"({
+        "id": "0",
+        "title": "Title Alpha",
+        "status": {"name": null}
+    })"_json;
+
+    add_op = coll1->add(doc1.dump(), UPSERT);
+    ASSERT_TRUE(add_op.ok());
+
+    results = coll1->search("alpha", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
+    ASSERT_EQ(3, results["hits"][0]["document"].size());  // id, title, status
+    ASSERT_EQ(0, results["hits"][0]["document"]["status"].size());
+
+    results = coll1->search("foo", {"status"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(0, results["found"].get<size_t>());
+}
+
 TEST_F(CollectionNestedFieldsTest, EmplaceWithMissingArrayValueOnOptionalField) {
     nlohmann::json schema = R"({
         "name": "coll1",
@@ -2805,6 +3034,64 @@ TEST_F(CollectionNestedFieldsTest, UpdateNestedDocumentAutoSchema) {
     ASSERT_EQ(1, results["found"].get<size_t>());
 }
 
+TEST_F(CollectionNestedFieldsTest, UpdateNestedDocumentWithOptionalNullValue) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "contributors", "type": "object", "optional": true},
+          {"name": "title", "type": "string", "optional": false}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "id": "0",
+        "title": "Title Alpha",
+        "contributors": {"first_name": "John", "last_name": null}
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    // update document partially
+
+    doc1 = R"({
+        "id": "0",
+        "title": "Title Beta",
+        "contributors": {"first_name": "Jack", "last_name": null}
+    })"_json;
+
+    add_op = coll1->add(doc1.dump(), UPDATE);
+    ASSERT_TRUE(add_op.ok());
+
+    auto results = coll1->search("beta", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
+
+    // emplace document partially
+
+    doc1 = R"({
+        "id": "0",
+        "title": "Title Gamma",
+        "contributors": {"first_name": "Jim", "last_name": null}
+    })"_json;
+
+    add_op = coll1->add(doc1.dump(), EMPLACE);
+    ASSERT_TRUE(add_op.ok());
+
+    results = coll1->search("gamma", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
+
+    // remove field with null value
+    auto del_op = coll1->remove("0");
+    ASSERT_TRUE(del_op.ok());
+    results = coll1->search("gamma", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(0, results["found"].get<size_t>());
+}
+
 TEST_F(CollectionNestedFieldsTest, ImproveErrorMessageForNestedArrayNumericalFields) {
     nlohmann::json schema = R"({
         "name": "coll1",
@@ -2952,6 +3239,81 @@ TEST_F(CollectionNestedFieldsTest, HighlightArrayOfObjects) {
     ASSERT_EQ(1, results["hits"][0]["highlight"]["details"][0].size());
     ASSERT_EQ(1, results["hits"][0]["highlight"]["details"][1].size());
     ASSERT_EQ(1, results["hits"][0]["highlight"]["details"][2].size());
+}
+
+TEST_F(CollectionNestedFieldsTest, DeepNestedOptionalArrayValue) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+            {
+                "facet": false,
+                "index": true,
+                "infix": false,
+                "locale": "",
+                "name": "items.name",
+                "optional": true,
+                "sort": false,
+                "type": "string[]"
+            },
+            {
+                "facet": false,
+                "index": true,
+                "infix": false,
+                "locale": "",
+                "name": "items.description",
+                "optional": true,
+                "sort": false,
+                "type": "string[]"
+            },
+            {
+                "facet": false,
+                "index": true,
+                "infix": false,
+                "locale": "",
+                "name": "items.nested_items.name",
+                "optional": true,
+                "sort": false,
+                "type": "string[]"
+            }
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "items": [
+            {
+                "description": "random description.",
+                "name": "foobar",
+                "nested_items": [
+                    {
+                        "isAvailable": true
+                    },
+                    {
+                        "description": "nested description here",
+                        "isAvailable": true,
+                        "name": "naruto"
+                    },
+                    {
+                        "description": "description again",
+                        "isAvailable": true,
+                        "name": "dragon ball"
+                    }
+                ]
+            }
+        ]
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    auto results = coll1->search("naruto", {"items.nested_items.name"}, "", {}, {}, {0}, 10, 1, FREQUENCY,
+                                 {true}, 1, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4).get();
+    ASSERT_EQ(1, results["found"].get<size_t>());
 }
 
 TEST_F(CollectionNestedFieldsTest, FloatInsideNestedObject) {
@@ -3105,4 +3467,30 @@ TEST_F(CollectionNestedFieldsTest, HighlightOnFlatFieldWithSnippeting) {
                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title,body").get();
 
     ASSERT_EQ(highlight_doc.dump(), results["hits"][0]["highlight"].dump());
+}
+
+TEST_F(CollectionNestedFieldsTest, NestedObjecEnableSortOnString) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "status", "type": "object"},
+          {"name": "status\\..*", "type": "string", "sort": true}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "status": {
+            "1": "ACCEPTED"
+        }
+    })"_json;
+
+    auto add_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(add_op.ok());
+
+    ASSERT_TRUE(coll1->get_schema()["status.1"].sort);
 }

@@ -11,6 +11,7 @@ private:
 
     static constexpr char* EVENT_TYPE = "type";
     static constexpr char* EVENT_DATA = "data";
+    static constexpr char* EVENT_NAME = "name";
 
 public:
     static EventManager& get_instance() {
@@ -21,6 +22,6 @@ public:
     EventManager(EventManager const&) = delete;
     void operator=(EventManager const&) = delete;
 
-    bool add_event(const nlohmann::json& event);
+    Option<bool> add_event(const nlohmann::json& event, const std::string& ip);
 
 };

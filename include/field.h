@@ -10,7 +10,10 @@
 #include <tsl/htrie_map.h>
 #include <filter.h>
 #include "json.hpp"
-#include "text_embedder_manager.h"
+#include "embedder_manager.h"
+#include "vector_query_ops.h"
+#include <mutex>
+#include "stemmer_manager.h"
 
 namespace field_types {
     // first field value indexed will determine the type
@@ -32,8 +35,14 @@ namespace field_types {
     static const std::string BOOL_ARRAY = "bool[]";
     static const std::string GEOPOINT_ARRAY = "geopoint[]";
 
+    static const std::string IMAGE = "image";
+
     static bool is_string_or_array(const std::string& type_def) {
         return type_def == "string*";
+    }
+
+    static bool is_array(const std::string& type_def) {
+        return type_def.size() > 2 && type_def[type_def.size() - 2] == '[' &&  type_def[type_def.size() - 1] == ']';
     }
 }
 
@@ -55,6 +64,7 @@ namespace fields {
     static const std::string from = "from";
     static const std::string model_name = "model_name";
     static const std::string range_index = "range_index";
+    static const std::string stem = "stem";
 
     // Some models require additional parameters to be passed to the model during indexing/querying
     // For e.g. e5-small model requires prefix "passage:" for indexing and "query:" for querying
@@ -62,6 +72,13 @@ namespace fields {
     static const std::string query_prefix = "query_prefix";
     static const std::string api_key = "api_key";
     static const std::string model_config = "model_config";
+
+    static const std::string reference_helper_fields = ".ref";
+    static const std::string REFERENCE_HELPER_FIELD_SUFFIX = "_sequence_id";
+
+    static const std::string store = "store";
+    
+    static const std::string hnsw_params = "hnsw_params";
 }
 
 enum vector_distance_type_t {
@@ -81,6 +98,8 @@ struct field {
 
     bool nested;        // field inside an object
 
+    bool store = true;        // store the field in disk
+
     // field inside an array of objects that is forced to be an array
     // integer to handle tri-state: true (1), false (0), not known yet (2)
     // third state is used to diff between array of object and array within object during write
@@ -96,17 +115,30 @@ struct field {
 
     bool range_index;
 
+    bool is_reference_helper = false;
+
+    bool stem = false;
+    std::shared_ptr<Stemmer> stemmer;
+  
+    nlohmann::json hnsw_params;
+
     field() {}
 
     field(const std::string &name, const std::string &type, const bool facet, const bool optional = false,
           bool index = true, std::string locale = "", int sort = -1, int infix = -1, bool nested = false,
           int nested_array = 0, size_t num_dim = 0, vector_distance_type_t vec_dist = cosine,
-          std::string reference = "", const nlohmann::json& embed = nlohmann::json(), const bool range_index = false) :
+          std::string reference = "", const nlohmann::json& embed = nlohmann::json(), const bool range_index = false, const bool store = true, const bool stem = false, const nlohmann::json hnsw_params = nlohmann::json()) :
             name(name), type(type), facet(facet), optional(optional), index(index), locale(locale),
             nested(nested), nested_array(nested_array), num_dim(num_dim), vec_dist(vec_dist), reference(reference),
-            embed(embed), range_index(range_index) {
+            embed(embed), range_index(range_index), store(store), stem(stem), hnsw_params(hnsw_params) {
 
         set_computed_defaults(sort, infix);
+
+        auto const suffix = std::string(fields::REFERENCE_HELPER_FIELD_SUFFIX);
+        is_reference_helper = name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
+        if (stem) {
+            stemmer = StemmerManager::get_instance().get_stemmer(locale);
+        }
     }
 
     void set_computed_defaults(int sort, int infix) {
@@ -145,6 +177,10 @@ struct field {
 
     bool is_single_geopoint() const {
         return (type == field_types::GEOPOINT);
+    }
+
+    bool is_image() const {
+        return (type == field_types::IMAGE);
     }
 
     bool is_integer() const {
@@ -233,9 +269,13 @@ struct field {
         return is_num_sortable() || is_str_sortable();
     }
 
+    bool is_stem() const {
+        return stem;
+    }
+
     bool has_valid_type() const {
         bool is_basic_type = is_string() || is_integer() || is_float() || is_bool() || is_geopoint() ||
-                             is_object() || is_auto();
+                             is_object() || is_auto() || is_image();
         if(!is_basic_type) {
             return field_types::is_string_or_array(type);
         }
@@ -246,6 +286,10 @@ struct field {
         return (facet && !is_string()) ? "_fstr_" + name : name;
     }
 
+    std::shared_ptr<Stemmer> get_stemmer() const {
+        return stemmer;
+    }
+    
     static bool get_type(const nlohmann::json& obj, std::string& field_type) {
         if(obj.is_array()) {
             if(obj.empty()) {
@@ -318,6 +362,8 @@ struct field {
             field_val[fields::infix] = field.infix;
 
             field_val[fields::locale] = field.locale;
+
+            field_val[fields::store] = field.store;
             
             if(field.embed.count(fields::from) != 0) {
                 field_val[fields::embed] = field.embed;
@@ -367,10 +413,6 @@ struct field {
                 return Option<bool>(400, "Field `" + field.name + "` must be an optional field.");
             }
 
-            if(!field.index && !field.optional) {
-                return Option<bool>(400, "Field `" + field.name + "` must be optional since it is marked as non-indexable.");
-            }
-
             if(field.name == ".*" && !field.index) {
                 return Option<bool>(400, "Field `" + field.name + "` cannot be marked as non-indexable.");
             }
@@ -381,7 +423,7 @@ struct field {
             }
 
             if(!field.is_sort_field() && field.sort) {
-                return Option<bool>(400, "Field `" + field.name + "` cannot be a sortabale field.");
+                return Option<bool>(400, "Field `" + field.name + "` cannot be a sortable field.");
             }
         }
 
@@ -485,12 +527,48 @@ namespace sort_field_const {
     static const std::string missing_values = "missing_values";
 
     static const std::string vector_distance = "_vector_distance";
+    static const std::string vector_query = "_vector_query";
 }
 
-struct ref_include_fields {
-    std::string expression;
+namespace ref_include {
+    static const std::string strategy_key = "strategy";
+    static const std::string merge_string = "merge";
+    static const std::string nest_string = "nest";
+    static const std::string nest_array_string = "nest_array";
+
+    enum strategy_enum {merge = 0, nest, nest_array};
+
+    static Option<strategy_enum> string_to_enum(const std::string& strategy) {
+        if (strategy == merge_string) {
+            return Option<strategy_enum>(merge);
+        } else if (strategy == nest_string) {
+            return Option<strategy_enum>(nest);
+        } else if (strategy == nest_array_string) {
+            return Option<strategy_enum>(nest_array);
+        }
+
+        return Option<strategy_enum>(400, "Unknown include strategy `" + strategy + "`. "
+                                           "Valid options are `merge`, `nest`, `nest_array`.");
+    }
+}
+
+struct ref_include_exclude_fields {
+    std::string collection_name;
+    std::string include_fields;
+    std::string exclude_fields;
     std::string alias;
+    ref_include::strategy_enum strategy = ref_include::nest;
+
+    // In case we have nested join.
+    std::vector<ref_include_exclude_fields> nested_join_includes = {};
 };
+
+struct hnsw_index_t;
+
+struct sort_vector_query_t {
+        vector_query_t query;
+        hnsw_index_t* vector_index;
+}; 
 
 struct sort_by {
     enum missing_values_t {
@@ -500,12 +578,14 @@ struct sort_by {
     };
 
     struct eval_t {
-        filter_node_t* filter_tree_root = nullptr;
-        uint32_t* ids = nullptr;
-        uint32_t  size = 0;
+        filter_node_t* filter_trees = nullptr;
+        std::vector<uint32_t*> eval_ids_vec;
+        std::vector<uint32_t> eval_ids_count_vec;
+        std::vector<int64_t> scores;
     };
 
     std::string name;
+    std::vector<std::string> eval_expressions;
     std::string order;
 
     // for text_match score bucketing
@@ -520,11 +600,18 @@ struct sort_by {
     eval_t eval;
 
     std::string reference_collection_name;
+    sort_vector_query_t vector_query;
 
     sort_by(const std::string & name, const std::string & order):
             name(name), order(order), text_match_buckets(0), geopoint(0), exclude_radius(0), geo_precision(0),
             missing_values(normal) {
+    }
 
+    sort_by(std::vector<std::string> eval_expressions, std::vector<int64_t> scores, std::string  order):
+            eval_expressions(std::move(eval_expressions)), order(std::move(order)), text_match_buckets(0), geopoint(0), exclude_radius(0),
+            geo_precision(0), missing_values(normal) {
+        name = sort_field_const::eval;
+        eval.scores = std::move(scores);
     }
 
     sort_by(const std::string &name, const std::string &order, uint32_t text_match_buckets, int64_t geopoint,
@@ -532,13 +619,13 @@ struct sort_by {
             name(name), order(order), text_match_buckets(text_match_buckets),
             geopoint(geopoint), exclude_radius(exclude_radius), geo_precision(geo_precision),
             missing_values(normal) {
-
     }
 
     sort_by(const sort_by& other) {
         if (&other == this)
             return;
         name = other.name;
+        eval_expressions = other.eval_expressions;
         order = other.order;
         text_match_buckets = other.text_match_buckets;
         geopoint = other.geopoint;
@@ -547,10 +634,12 @@ struct sort_by {
         missing_values = other.missing_values;
         eval = other.eval;
         reference_collection_name = other.reference_collection_name;
+        vector_query = other.vector_query;
     }
 
     sort_by& operator=(const sort_by& other) {
         name = other.name;
+        eval_expressions = other.eval_expressions;
         order = other.order;
         text_match_buckets = other.text_match_buckets;
         geopoint = other.geopoint;
@@ -606,9 +695,18 @@ struct facet_count_t {
 
 struct facet_stats_t {
     double fvmin = std::numeric_limits<double>::max(),
-            fvmax = -std::numeric_limits<double>::min(),
+            fvmax = -std::numeric_limits<double>::max(),
             fvcount = 0,
             fvsum = 0;
+};
+
+struct range_specs_t {
+    std::string range_label;
+    int64_t lower_range;
+
+    bool is_in_range(int64_t key) {
+        return key >= lower_range;
+    }
 };
 
 struct facet {
@@ -626,7 +724,7 @@ struct facet {
     facet_stats_t stats;
 
     //dictionary of key=>pair(range_id, range_val)
-    std::map<int64_t, std::string> facet_range_map;
+    std::map<int64_t, range_specs_t> facet_range_map;
 
     bool is_range_query;
 
@@ -642,6 +740,8 @@ struct facet {
 
     std::string sort_field="";
 
+    uint32_t orig_index;
+
     bool get_range(int64_t key, std::pair<int64_t, std::string>& range_pair) {
         if(facet_range_map.empty()) {
             LOG (ERROR) << "Facet range is not defined!!!";
@@ -649,28 +749,32 @@ struct facet {
 
         auto it = facet_range_map.lower_bound(key);
 
-        if(it != facet_range_map.end()) {
+        if(it != facet_range_map.end() && it->first == key) {
+            it++;
+        }
+
+        if(it != facet_range_map.end() && it->second.is_in_range(key)) {
             range_pair.first = it->first;
-            range_pair.second = it->second;
+            range_pair.second = it->second.range_label;
             return true;
         }
 
         return false;
     }
 
-    explicit facet(const std::string& field_name, std::map<int64_t, std::string> facet_range = {},
+    explicit facet(const std::string& field_name, uint32_t orig_index, std::map<int64_t, range_specs_t> facet_range = {},
                    bool is_range_q = false, bool sort_by_alpha=false, const std::string& order="",
                    const std::string& sort_by_field="")
                    : field_name(field_name), facet_range_map(facet_range),
                    is_range_query(is_range_q), is_sort_by_alpha(sort_by_alpha), sort_order(order),
-                   sort_field(sort_by_field) {
+                   sort_field(sort_by_field), orig_index(orig_index) {
     }
 };
 
 struct facet_info_t {
     // facet hash => resolved tokens
     std::unordered_map<uint64_t, std::vector<std::string>> hashes;
-    std::vector<std::string> fvalue_searched_tokens;
+    std::vector<std::vector<std::string>> fvalue_searched_tokens;
     bool use_facet_query = false;
     bool should_compute_stats = false;
     bool use_value_index = false;
@@ -687,6 +791,7 @@ struct facet_value_t {
     std::string highlighted;
     uint32_t count;
     int64_t sort_field_val;
+    nlohmann::json parent;
 };
 
 struct facet_hash_values_t {

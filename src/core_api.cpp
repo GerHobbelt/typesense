@@ -1,6 +1,5 @@
 #include <chrono>
 #include <thread>
-#include <cstdlib> 
 #include <app_metrics.h>
 #include <regex>
 #include <analytics_manager.h>
@@ -17,14 +16,27 @@
 #include "event_manager.h"
 #include "http_proxy.h"
 #include "include/stopwords_manager.h"
+#include "conversation_manager.h"
+#include "conversation_model_manager.h"
+#include "conversation_model.h"
 
 using namespace std::chrono_literals;
 
 std::shared_mutex mutex;
 LRU::Cache<uint64_t, cached_res_t> res_cache;
 
+std::atomic<bool> alter_in_progress = false;
+
 void init_api(uint32_t cache_num_entries) {
     res_cache.capacity(cache_num_entries);
+}
+
+void set_alter_in_progress(bool in_progress) {
+    alter_in_progress = in_progress;
+}
+
+bool get_alter_in_progress() {
+    return alter_in_progress;
 }
 
 bool handle_authentication(std::map<std::string, std::string>& req_params,
@@ -32,16 +44,23 @@ bool handle_authentication(std::map<std::string, std::string>& req_params,
                            const std::string& body,
                            const route_path& rpath,
                            const std::string& req_auth_key) {
-    CollectionManager & collectionManager = CollectionManager::get_instance();
-
-    std::vector<collection_key_t> collections;
-
-    get_collections_for_auth(req_params, body, rpath, req_auth_key, collections, embedded_params_vec);
 
     if(rpath.handler == get_health) {
         // health endpoint requires no authentication
         return true;
     }
+
+    if(rpath.handler == get_health_with_resource_usage) {
+        // health_rusage end-point will be authenticated via pre-determined keys
+        return !req_auth_key.empty() && (
+                req_auth_key == Config::get_instance().get_api_key() ||
+                req_auth_key == Config::get_instance().get_health_rusage_api_key()
+                );
+    }
+
+    CollectionManager & collectionManager = CollectionManager::get_instance();
+    std::vector<collection_key_t> collections;
+    get_collections_for_auth(req_params, body, rpath, req_auth_key, collections, embedded_params_vec);
 
     if(collections.size() != embedded_params_vec.size()) {
         LOG(ERROR) << "Impossible error: size of collections and embedded_params_vec don't match, "
@@ -169,7 +188,36 @@ index_operation_t get_index_operation(const std::string& action) {
 
 bool get_collections(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     CollectionManager & collectionManager = CollectionManager::get_instance();
-    nlohmann::json json_response = collectionManager.get_collection_summaries();
+
+    uint32_t offset = 0, limit = 0;
+    if(req->params.count("offset") != 0) {
+        const auto &offset_str = req->params["offset"];
+        if(!StringUtils::is_uint32_t(offset_str)) {
+            res->set(400, "Offset param should be unsigned integer.");
+            return false;
+        }
+        offset = std::stoi(offset_str);
+    }
+
+    if(req->params.count("limit") != 0) {
+        const auto &limit_str = req->params["limit"];
+        if(!StringUtils::is_uint32_t(limit_str)) {
+            res->set(400, "Limit param should be unsigned integer.");
+            return false;
+        }
+        limit = std::stoi(limit_str);
+    }
+
+    AuthManager &auth_manager = collectionManager.getAuthManager();
+    auto api_key_collections = auth_manager.get_api_key_collections(req->api_auth_key);
+
+    auto collections_summaries_op = collectionManager.get_collection_summaries(limit, offset, api_key_collections);
+    if(!collections_summaries_op.ok()) {
+        res->set(collections_summaries_op.code(), collections_summaries_op.error());
+        return false;
+    }
+
+    nlohmann::json json_response = collections_summaries_op.get();
     res->set_200(json_response.dump());
     return true;
 }
@@ -218,6 +266,7 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
     } catch(const std::exception& e) {
         //LOG(ERROR) << "JSON error: " << e.what();
         res->set_400("Bad JSON.");
+        alter_in_progress = false;
         return false;
     }
 
@@ -226,23 +275,31 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
 
     if(collection == nullptr) {
         res->set_404();
+        alter_in_progress = false;
         return false;
     }
 
     auto alter_op = collection->alter(req_json);
     if(!alter_op.ok()) {
         res->set(alter_op.code(), alter_op.error());
+        alter_in_progress = false;
         return false;
     }
 
+    alter_in_progress = false;
     res->set_200(req_json.dump());
     return true;
 }
 
 bool del_drop_collection(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
-    std::string doc_id = req->params["id"];
+    bool compact_store = false;
+
+    if(req->params.count("compact_store") != 0) {
+        compact_store = (req->params["compact_store"] == "true");
+    }
+
     CollectionManager & collectionManager = CollectionManager::get_instance();
-    Option<nlohmann::json> drop_op = collectionManager.drop_collection(req->params["collection"], true);
+    Option<nlohmann::json> drop_op = collectionManager.drop_collection(req->params["collection"], true, compact_store);
 
     if(!drop_op.ok()) {
         res->set(drop_op.code(), drop_op.error());
@@ -264,10 +321,54 @@ bool get_debug(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_
     return true;
 }
 
+bool get_health_with_resource_usage(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    nlohmann::json result;
+    bool alive = server->is_alive();
+
+    auto resource_check = cached_resource_stat_t::get_instance().has_enough_resources(
+        Config::get_instance().get_data_dir(),
+        Config::get_instance().get_disk_used_max_percentage(),
+        Config::get_instance().get_memory_used_max_percentage()
+    );
+
+    if (resource_check != cached_resource_stat_t::resource_check_t::OK) {
+        result["resource_error"] = std::string(magic_enum::enum_name(resource_check));
+    }
+
+    if(req->params.count("cpu_threshold") != 0 && StringUtils::is_float(req->params["cpu_threshold"])) {
+        float cpu_threshold = std::stof(req->params["cpu_threshold"]);
+        SystemMetrics sys_metrics;
+        std::vector<cpu_stat_t> cpu_stats = sys_metrics.get_cpu_stats();
+        if(!cpu_stats.empty() && StringUtils::is_float(cpu_stats[0].active)) {
+            alive = alive && (std::stof(cpu_stats[0].active) < cpu_threshold);
+        }
+    }
+
+    result["ok"] = alive;
+
+    if(alive) {
+        res->set_body(200, result.dump());
+    } else {
+        res->set_body(503, result.dump());
+    }
+
+    return alive;
+}
+
 bool get_health(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     nlohmann::json result;
     bool alive = server->is_alive();
     result["ok"] = alive;
+
+    auto resource_check = cached_resource_stat_t::get_instance().has_enough_resources(
+        Config::get_instance().get_data_dir(),
+        Config::get_instance().get_disk_used_max_percentage(),
+        Config::get_instance().get_memory_used_max_percentage()
+    );
+
+    if (resource_check != cached_resource_stat_t::resource_check_t::OK) {
+        result["resource_error"] = std::string(magic_enum::enum_name(resource_check));
+    }
 
     if(alive) {
         res->set_body(200, result.dump());
@@ -345,7 +446,7 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
 
         //LOG(INFO) << "req_hash = " << req_hash;
 
-        std::shared_lock lock(mutex);
+        std::unique_lock lock(mutex);
         auto hit_it = res_cache.find(req_hash);
         if(hit_it != res_cache.end()) {
             //LOG(INFO) << "Result found in cache.";
@@ -362,8 +463,6 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
             }
 
             // Result found in cache but ttl has lapsed.
-            lock.unlock();
-            std::unique_lock ulock(mutex);
             res_cache.erase(req_hash);
         }
     }
@@ -418,7 +517,7 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
         //LOG(INFO) << "req_hash = " << req_hash;
 
-        std::shared_lock lock(mutex);
+        std::unique_lock lock(mutex);
         auto hit_it = res_cache.find(req_hash);
         if(hit_it != res_cache.end()) {
             //LOG(INFO) << "Result found in cache.";
@@ -435,8 +534,6 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             }
 
             // Result found in cache but ttl has lapsed.
-            lock.unlock();
-            std::unique_lock ulock(mutex);
             res_cache.erase(req_hash);
         }
     }
@@ -522,6 +619,63 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         }
     }
 
+    bool conversation = orig_req_params["conversation"] == "true";
+    bool conversation_history = orig_req_params.find("conversation_id") != orig_req_params.end();
+    std::string common_query;
+
+    if(!conversation && conversation_history) {
+        res->set_400("`conversation_id` can only be used if `conversation` is enabled.");
+        return false;
+    }
+
+    if(conversation) {
+        if(orig_req_params.find("q") == orig_req_params.end()) {
+            res->set_400("`q` parameter has to be common for all searches if conversation is enabled. Please set `q` as a query parameter in the request, instead of inside the POST body");
+            return false;
+        }
+
+        if(orig_req_params.find("conversation_model_id") == orig_req_params.end()) {
+            res->set_400("`conversation_model_id` is needed if conversation is enabled.");
+            return false;
+        }
+
+        const std::string& conversation_model_id = orig_req_params["conversation_model_id"];
+        auto conversation_model = ConversationModelManager::get_model(conversation_model_id);
+
+        if(!conversation_model.ok()) {
+            res->set_400("`conversation_model_id` is invalid.");
+            return false;
+        }
+
+        if(conversation_history) {
+            std::string conversation_id = orig_req_params["conversation_id"];
+
+            auto conversation_history = ConversationManager::get_instance().get_conversation(conversation_id);
+
+            if(!conversation_history.ok()) {
+                res->set_400("`conversation_id` is invalid.");
+                return false;
+            }
+        }
+
+        common_query = orig_req_params["q"];
+
+        if(conversation_history) {
+            const std::string& conversation_model_id = orig_req_params["conversation_model_id"];
+            auto conversation_id = orig_req_params["conversation_id"];
+            auto conversation_model = ConversationModelManager::get_model(conversation_model_id).get();
+            auto conversation_history = ConversationManager::get_instance().get_conversation(conversation_id).get();
+            auto generate_standalone_q = ConversationModel::get_standalone_question(conversation_history, common_query, conversation_model);
+
+            if(!generate_standalone_q.ok()) {
+                res->set_400(generate_standalone_q.error());
+                return false;
+            }
+
+            orig_req_params["q"] = generate_standalone_q.get();
+        }
+    }
+
     for(size_t i = 0; i < searches.size(); i++) {
         auto& search_params = searches[i];
 
@@ -538,6 +692,29 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
                 continue;
             }
 
+            if(conversation && search_item.key() == "q") {
+                // q is common for all searches
+                res->set_400("`q` parameter cannot be used in POST body if `conversation` is enabled. Please set `q` as a query parameter in the request, instead of inside the POST body");
+                return false;
+            }
+
+            if(conversation && search_item.key() == "conversation_model_id") {
+                // conversation_model_id is common for all searches
+                res->set_400("`conversation_model_id` cannot be used in POST body. Please set `conversation_model_id` as a query parameter in the request, instead of inside the POST body");
+                return false;
+            }
+
+            if(conversation && search_item.key() == "conversation_id") {
+                // conversation_id is common for all searches
+                res->set_400("`conversation_id` cannot be used in POST body. Please set `conversation_id` as a query parameter in the request, instead of inside the POST body");
+                return false;
+            }
+
+            if(search_item.key() == "conversation") {
+                res->set_400("`conversation` cannot be used in POST body. Please set `conversation` as a query parameter in the request, instead of inside the POST body");
+                return false;
+            }
+
             // overwrite = false since req params will contain embedded params and so has higher priority
             bool populated = AuthManager::add_item_to_params(req->params, search_item, false);
             if(!populated) {
@@ -546,12 +723,28 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             }
         }
 
+        if(req->params.count("conversation") != 0) {
+            req->params.erase("conversation");
+        }
+
+        if(req->params.count("conversation_id") != 0) {
+            req->params.erase("conversation_id");
+        }
+
+        if(req->params.count("conversation_model_id") != 0) {
+            req->params.erase("conversation_model_id");
+        }
+
         std::string results_json_str;
         Option<bool> search_op = CollectionManager::do_search(req->params, req->embedded_params_vec[i],
                                                               results_json_str, req->conn_ts);
 
         if(search_op.ok()) {
-            response["results"].push_back(nlohmann::json::parse(results_json_str));
+            auto results_json = nlohmann::json::parse(results_json_str);
+            if(conversation) {
+                results_json["request_params"]["q"] = common_query;
+            }
+            response["results"].push_back(results_json);
         } else {
             if(search_op.code() == 408) {
                 res->set(search_op.code(), search_op.error());
@@ -563,6 +756,157 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             err_res["code"] = search_op.code();
             response["results"].push_back(err_res);
         }
+    }
+
+    if(conversation) {
+        nlohmann::json result_docs_arr = nlohmann::json::array();
+        int res_index = 0;
+        for(const auto& result : response["results"]) {
+            if(result.count("code") != 0) {
+                continue;
+            }
+
+            nlohmann::json result_docs = nlohmann::json::array();
+
+            std::vector<std::string> vector_fields;
+
+            auto collection = CollectionManager::get_instance().get_collection(searches[res_index]["collection"].get<std::string>());
+            auto search_schema = collection->get_schema();
+
+            for(const auto& field : search_schema) {
+                if(field.type == field_types::FLOAT_ARRAY) {
+                    vector_fields.push_back(field.name);
+                }
+            }
+
+            if(result.contains("grouped_hits")) {
+                for(const auto& grouped_hit : result["grouped_hits"]) {
+                    for(const auto& hit : grouped_hit["hits"]) {
+                        auto doc = hit["document"];
+                        for(const auto& vector_field : vector_fields) {
+                            if(doc.contains(vector_field)) {
+                                doc.erase(vector_field);
+                            }
+                        }
+                        result_docs.push_back(doc);
+                    }
+                }
+            }
+            else {
+                for(const auto& hit : result["hits"]) {
+                    auto doc = hit["document"];
+                    for(const auto& vector_field : vector_fields) {
+                        if(doc.contains(vector_field)) {
+                            doc.erase(vector_field);
+                        }
+                    }
+                    result_docs.push_back(doc);
+                }
+            }
+
+            result_docs_arr.push_back(result_docs);
+        }
+
+        const std::string& conversation_model_id = orig_req_params["conversation_model_id"];
+        auto conversation_model = ConversationModelManager::get_model(conversation_model_id).get();
+        auto min_required_bytes_op = ConversationModel::get_minimum_required_bytes(conversation_model);
+        if(!min_required_bytes_op.ok()) {
+            res->set_400(min_required_bytes_op.error());
+            return false;
+        }
+        auto min_required_bytes = min_required_bytes_op.get();
+        auto prompt = req->params["q"];
+        if(conversation_model["max_bytes"].get<size_t>() < min_required_bytes + prompt.size()) {
+            res->set_400("`max_bytes` of the conversation model is less than the minimum required bytes(" + std::to_string(min_required_bytes) + ").");
+            return false;
+        }
+
+        // remove document with lowest score until total tokens is less than MAX_TOKENS
+        while(result_docs_arr.dump(0).size() > conversation_model["max_bytes"].get<size_t>() - min_required_bytes - prompt.size()) {
+            // sort the result_docs_arr by size descending
+            std::sort(result_docs_arr.begin(), result_docs_arr.end(), [](const auto& a, const auto& b) {
+                return a.size() > b.size();
+            });
+
+            // pop the last element from first array
+            if(result_docs_arr.size() > 0 && result_docs_arr[0].size() > 0) {
+                result_docs_arr[0].erase(result_docs_arr[0].size() - 1);
+            }
+        }
+
+        // Make result_docs_arr 1D
+        nlohmann::json result_docs = nlohmann::json::array();
+        for(const auto& result_doc : result_docs_arr) {
+            for(const auto& doc : result_doc) {
+                result_docs.push_back(doc);
+            }
+        }
+
+        auto answer_op = ConversationModel::get_answer(result_docs.dump(0), prompt, conversation_model);
+
+        if(!answer_op.ok()) {
+            res->set_400(answer_op.error());
+            return false;
+        }
+
+        response["conversation"] = nlohmann::json::object();
+        response["conversation"]["query"] = common_query;
+        response["conversation"]["answer"] = answer_op.get();
+
+        auto formatted_question_op = ConversationModel::format_question(common_query, conversation_model);
+        if(!formatted_question_op.ok()) {
+            res->set_400(formatted_question_op.error());
+            return false;
+        }
+
+        auto formatted_answer_op = ConversationModel::format_answer(answer_op.get(), conversation_model);
+        if(!formatted_answer_op.ok()) {
+            res->set_400(formatted_answer_op.error());
+            return false;
+        }
+
+        std::vector<std::string> exclude_fields;
+        StringUtils::split(req->params["exclude_fields"], exclude_fields, ",");
+        bool exclude_conversation_history = std::find(exclude_fields.begin(), exclude_fields.end(), "conversation_history") != exclude_fields.end();
+
+        if(conversation_history) {
+            std::string conversation_id = orig_req_params["conversation_id"];
+            ConversationManager::get_instance().append_conversation(conversation_id, formatted_question_op.get());
+            ConversationManager::get_instance().append_conversation(conversation_id, formatted_answer_op.get());
+            auto get_conversation_op = ConversationManager::get_instance().get_conversation(conversation_id);
+            if(!get_conversation_op.ok()) {
+                res->set_400(get_conversation_op.error());
+                return false;
+            }
+
+            auto conversation_history = get_conversation_op.get();
+            if(!exclude_conversation_history) {
+                response["conversation"]["conversation_history"] = conversation_history;
+            } else {
+                response["conversation"]["conversation_id"] = conversation_id;
+            }
+        } else {
+            nlohmann::json conversation_history = nlohmann::json::array();
+            conversation_history.push_back(formatted_question_op.get());
+            conversation_history.push_back(formatted_answer_op.get());
+
+            auto create_conversation_op = ConversationManager::get_instance().create_conversation(conversation_history);
+            if(!create_conversation_op.ok()) {
+                res->set_400(create_conversation_op.error());
+                return false;
+            }
+
+            auto get_conversation_op = ConversationManager::get_instance().get_conversation(create_conversation_op.get());
+            if(!get_conversation_op.ok()) {
+                res->set_400(get_conversation_op.error());
+                return false;
+            }
+            if(!exclude_conversation_history) {
+                response["conversation"]["conversation_history"] = get_conversation_op.get();
+            }
+            response["conversation"]["conversation_id"] = create_conversation_op.get();
+        }
+
     }
 
     res->set_200(response.dump());
@@ -747,6 +1091,8 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
     const char *RETURN_DOC = "return_doc";
     const char *RETURN_ID = "return_id";
     const char *REMOTE_EMBEDDING_BATCH_SIZE = "remote_embedding_batch_size";
+    const char *REMOTE_EMBEDDING_TIMEOUT_MS = "remote_embedding_timeout_ms";
+    const char *REMOTE_EMBEDDING_NUM_TRIES = "remote_embedding_num_tries";
 
     if(req->params.count(BATCH_SIZE) == 0) {
         req->params[BATCH_SIZE] = "40";
@@ -801,8 +1147,18 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
         return false;
     }
 
+    if(req->params.count(REMOTE_EMBEDDING_TIMEOUT_MS) == 0) {
+        req->params[REMOTE_EMBEDDING_TIMEOUT_MS] = "60000";
+    }
+
+    if(req->params.count(REMOTE_EMBEDDING_NUM_TRIES) == 0) {
+        req->params[REMOTE_EMBEDDING_NUM_TRIES] = "2";
+    }
+
     const size_t IMPORT_BATCH_SIZE = std::stoi(req->params[BATCH_SIZE]);
     const size_t REMOTE_EMBEDDING_BATCH_SIZE_VAL = std::stoi(req->params[REMOTE_EMBEDDING_BATCH_SIZE]);
+    const size_t REMOTE_EMBEDDING_TIMEOUT_MS_VAL = std::stoi(req->params[REMOTE_EMBEDDING_TIMEOUT_MS]);
+    const size_t REMOTE_EMBEDDING_NUM_TRIES_VAL = std::stoi(req->params[REMOTE_EMBEDDING_NUM_TRIES]);
 
     if(IMPORT_BATCH_SIZE == 0) {
         res->final = true;
@@ -814,6 +1170,20 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
     if(REMOTE_EMBEDDING_BATCH_SIZE_VAL == 0) {
         res->final = true;
         res->set_400("Parameter `" + std::string(REMOTE_EMBEDDING_BATCH_SIZE) + "` must be a positive integer.");
+        stream_response(req, res);
+        return false;
+    }
+
+    if(REMOTE_EMBEDDING_TIMEOUT_MS_VAL == 0) {
+        res->final = true;
+        res->set_400("Parameter `" + std::string(REMOTE_EMBEDDING_TIMEOUT_MS) + "` must be a positive integer.");
+        stream_response(req, res);
+        return false;
+    }
+
+    if(REMOTE_EMBEDDING_NUM_TRIES_VAL == 0) {
+        res->final = true;
+        res->set_400("Parameter `" + std::string(REMOTE_EMBEDDING_NUM_TRIES) + "` must be a positive integer.");
         stream_response(req, res);
         return false;
     }
@@ -887,24 +1257,28 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
         const bool& return_doc = req->params[RETURN_DOC] == "true";
         const bool& return_id = req->params[RETURN_ID] == "true";
         nlohmann::json json_res = collection->add_many(json_lines, document, operation, "",
-                                                       dirty_values, return_doc, return_id, REMOTE_EMBEDDING_BATCH_SIZE_VAL);
+                                                       dirty_values, return_doc, return_id, REMOTE_EMBEDDING_BATCH_SIZE_VAL, REMOTE_EMBEDDING_TIMEOUT_MS_VAL, REMOTE_EMBEDDING_NUM_TRIES_VAL);
         //const std::string& import_summary_json = json_res->dump();
         //response_stream << import_summary_json << "\n";
 
         for (size_t i = 0; i < json_lines.size(); i++) {
-            bool res_final = req->last_chunk_aggregate && (i == json_lines.size()-1);
+            bool res_start = (res->status_code == 0) && (i == 0);
 
-            if(res_final) {
-                // indicates last record of last batch
+            if(res_start) {
+                // indicates first import result to be streamed
                 response_stream << json_lines[i];
             } else {
-                response_stream << json_lines[i] << "\n";
+                response_stream << "\n" << json_lines[i];
             }
         }
+
+        // Since we use `res->status_code == 0` for flagging `res_start`, we will only set this
+        // when we have accumulated enough response data to stream.
+        // Otherwise, we will send an empty line as first response.
+        res->status_code = 200;
     }
 
     res->content_type_header = "text/plain; charset=utf-8";
-    res->status_code = 200;
     res->body = response_stream.str();
 
     res->final.store(req->last_chunk_aggregate);
@@ -931,6 +1305,7 @@ bool post_add_document(const std::shared_ptr<http_req>& req, const std::shared_p
         req->params[DIRTY_VALUES_PARAM] = "";  // set it empty as default will depend on whether schema is enabled
     }
 
+
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
@@ -942,10 +1317,22 @@ bool post_add_document(const std::shared_ptr<http_req>& req, const std::shared_p
     const index_operation_t operation = get_index_operation(req->params[ACTION]);
     const auto& dirty_values = collection->parse_dirty_values_option(req->params[DIRTY_VALUES_PARAM]);
 
+    size_t remote_embedding_timeout_ms = 60000;
+    size_t remote_embedding_num_tries = 2;
+
+    if(req->params.count("remote_embedding_timeout_ms") != 0) {
+        remote_embedding_timeout_ms = std::stoul(req->params["remote_embedding_timeout_ms"]);
+    }
+
+    if(req->params.count("remote_embedding_num_tries") != 0) {
+        remote_embedding_num_tries = std::stoul(req->params["remote_embedding_num_tries"]);
+    }
+
     nlohmann::json document;
     std::vector<std::string> json_lines = {req->body};
     const nlohmann::json& inserted_doc_op = collection->add_many(json_lines, document, operation, "", dirty_values,
-                                                                 false, false);
+                                                                 false, false, 200, remote_embedding_timeout_ms,
+                                                                 remote_embedding_num_tries);
 
     if(!inserted_doc_op["success"].get<bool>()) {
         nlohmann::json res_doc;
@@ -1007,7 +1394,7 @@ bool patch_update_document(const std::shared_ptr<http_req>& req, const std::shar
         return false;
     }
 
-    res->set_201(upserted_doc_op.get().dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
+    res->set_200(upserted_doc_op.get().dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
     return true;
 }
 
@@ -1033,6 +1420,7 @@ bool patch_update_documents(const std::shared_ptr<http_req>& req, const std::sha
         req->params[DIRTY_VALUES_PARAM] = "";  // set it empty as default will depend on whether schema is enabled
     }
 
+    search_stop_us = UINT64_MAX; // Filtering shouldn't timeout during update operation.
     auto update_op = collection->update_matching_filter(filter_query, req->body, req->params[DIRTY_VALUES_PARAM]);
     if(update_op.ok()) {
         res->set_200(update_op.get().dump());
@@ -1067,6 +1455,11 @@ bool get_fetch_document(const std::shared_ptr<http_req>& req, const std::shared_
 bool del_remove_document(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     std::string doc_id = req->params["id"];
 
+    bool ignore_not_found = false;
+    if((req->params.count("ignore_not_found") != 0) && (req->params["ignore_not_found"] == "true")) {
+        ignore_not_found = true;
+    }
+
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
     if(collection == nullptr) {
@@ -1076,20 +1469,35 @@ bool del_remove_document(const std::shared_ptr<http_req>& req, const std::shared
 
     Option<nlohmann::json> doc_option = collection->get(doc_id);
 
-    if(!doc_option.ok()) {
+    if (!doc_option.ok()) {
+        if (ignore_not_found && doc_option.code() == 404) {
+            nlohmann::json resp;
+            resp["id"] = doc_id;
+            res->set_200(resp.dump());
+            return true;
+        }
+
         res->set(doc_option.code(), doc_option.error());
         return false;
     }
 
     Option<std::string> deleted_id_op = collection->remove(doc_id);
 
-    if(!deleted_id_op.ok()) {
+    if (!deleted_id_op.ok()) {
+        if (ignore_not_found && deleted_id_op.code() == 404) {
+            nlohmann::json resp;
+            resp["id"] = doc_id;
+            res->set_200(resp.dump());
+            return true;
+        }
+
         res->set(deleted_id_op.code(), deleted_id_op.error());
         return false;
     }
 
     nlohmann::json doc = doc_option.get();
     res->set_200(doc.dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
+
     return true;
 }
 
@@ -1187,6 +1595,7 @@ bool del_remove_documents(const std::shared_ptr<http_req>& req, const std::share
         // destruction of data is managed by req destructor
         req->data = deletion_state;
 
+        search_stop_us = UINT64_MAX; // Filtering shouldn't timeout during delete operation.
         filter_result_t filter_result;
         auto filter_ids_op = collection->get_filter_ids(simple_filter_query, filter_result);
 
@@ -1342,13 +1751,38 @@ bool get_overrides(const std::shared_ptr<http_req>& req, const std::shared_ptr<h
         return false;
     }
 
+    uint32_t offset = 0, limit = 0;
+    if(req->params.count("offset") != 0) {
+        const auto &offset_str = req->params["offset"];
+        if(!StringUtils::is_uint32_t(offset_str)) {
+            res->set(400, "Offset param should be unsigned integer.");
+            return false;
+        }
+        offset = std::stoi(offset_str);
+    }
+
+    if(req->params.count("limit") != 0) {
+        const auto &limit_str = req->params["limit"];
+        if(!StringUtils::is_uint32_t(limit_str)) {
+            res->set(400, "Limit param should be unsigned integer.");
+            return false;
+        }
+        limit = std::stoi(limit_str);
+    }
+
     nlohmann::json res_json;
     res_json["overrides"] = nlohmann::json::array();
 
-    const std::map<std::string, override_t>& overrides = collection->get_overrides();
-    for(const auto & kv: overrides) {
-        nlohmann::json override = kv.second.to_json();
-        res_json["overrides"].push_back(override);
+    auto overrides_op = collection->get_overrides(limit, offset);
+    if(!overrides_op.ok()) {
+        res->set(overrides_op.code(), overrides_op.error());
+        return false;
+    }
+
+    const auto overrides = overrides_op.get();
+
+    for(const auto &kv: overrides) {
+        res_json["overrides"].push_back(kv.second->to_json());
     }
 
     res->set_200(res_json.dump());
@@ -1366,16 +1800,15 @@ bool get_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
 
     std::string override_id = req->params["id"];
 
-    const std::map<std::string, override_t>& overrides = collection->get_overrides();
+    auto overrides_op = collection->get_override(override_id);
 
-    if(overrides.count(override_id) != 0) {
-        nlohmann::json override = overrides.at(override_id).to_json();
-        res->set_200(override.dump());
-        return true;
+    if(!overrides_op.ok()) {
+        res->set(overrides_op.code(), overrides_op.error());
+        return false;
     }
 
-    res->set_404();
-    return false;
+    res->set_200(overrides_op.get().to_json().dump());
+    return true;
 }
 
 bool put_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
@@ -1495,6 +1928,10 @@ bool post_create_key(const std::shared_ptr<http_req>& req, const std::shared_ptr
         req_json["expires_at"] = api_key_t::FAR_FUTURE_TIMESTAMP;
     }
 
+    if(req_json.count("autodelete") == 0) {
+        req_json["autodelete"] = false;
+    }
+
     const std::string &rand_key = (req_json.count("value") != 0) ?
             req_json["value"].get<std::string>() : req->metadata;
 
@@ -1503,7 +1940,8 @@ bool post_create_key(const std::shared_ptr<http_req>& req, const std::shared_ptr
         req_json["description"].get<std::string>(),
         req_json["actions"].get<std::vector<std::string>>(),
         req_json["collections"].get<std::vector<std::string>>(),
-        req_json["expires_at"].get<uint64_t>()
+        req_json["expires_at"].get<uint64_t>(),
+        req_json["autodelete"].get<bool>()
     );
 
     const Option<api_key_t>& api_key_op = auth_manager.create_key(api_key);
@@ -1663,13 +2101,37 @@ bool get_synonyms(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
         return false;
     }
 
+    uint32_t offset = 0, limit = 0;
+    if(req->params.count("offset") != 0) {
+        const auto &offset_str = req->params["offset"];
+        if(!StringUtils::is_uint32_t(offset_str)) {
+            res->set(400, "Offset param should be unsigned integer.");
+            return false;
+        }
+        offset = std::stoi(offset_str);
+    }
+
+    if(req->params.count("limit") != 0) {
+        const auto &limit_str = req->params["limit"];
+        if(!StringUtils::is_uint32_t(limit_str)) {
+            res->set(400, "Limit param should be unsigned integer.");
+            return false;
+        }
+        limit = std::stoi(limit_str);
+    }
+
     nlohmann::json res_json;
     res_json["synonyms"] = nlohmann::json::array();
 
-    const auto& synonyms = collection->get_synonyms();
+    auto synonyms_op = collection->get_synonyms(limit, offset);
+    if(!synonyms_op.ok()) {
+        res->set(synonyms_op.code(), synonyms_op.error());
+        return false;
+    }
+
+    const auto synonyms = synonyms_op.get();
     for(const auto & kv: synonyms) {
-        nlohmann::json synonym = kv.second.to_view_json();
-        res_json["synonyms"].push_back(synonym);
+        res_json["synonyms"].push_back(kv.second->to_view_json());
     }
 
     res->set_200(res_json.dump());
@@ -1787,6 +2249,18 @@ bool is_doc_import_route(uint64_t route_hash) {
     return found && (rpath->handler == post_import_documents);
 }
 
+bool is_coll_create_route(uint64_t route_hash) {
+    route_path* rpath;
+    bool found = server->get_route(route_hash, &rpath);
+    return found && (rpath->handler == post_create_collection);
+}
+
+bool is_drop_collection_route(uint64_t route_hash) {
+    route_path* rpath;
+    bool found = server->get_route(route_hash, &rpath);
+    return found && (rpath->handler == del_drop_collection);
+}
+
 bool is_doc_write_route(uint64_t route_hash) {
     route_path* rpath;
     bool found = server->get_route(route_hash, &rpath);
@@ -1896,16 +2370,12 @@ bool del_preset(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
 
 bool get_stopwords(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     StopwordsManager& stopwordManager = StopwordsManager::get_instance();
-    const spp::sparse_hash_map<std::string, spp::sparse_hash_set<std::string>>& stopwords = stopwordManager.get_stopwords();
+    const spp::sparse_hash_map<std::string, stopword_struct_t>& stopwords = stopwordManager.get_stopwords();
     nlohmann::json res_json = nlohmann::json::object();
     res_json["stopwords"] = nlohmann::json::array();
 
     for(const auto& stopwords_kv: stopwords) {
-        nlohmann::json stopword;
-        stopword["id"] = stopwords_kv.first;
-        for(const auto& val : stopwords_kv.second) {
-            stopword["stopwords"].push_back(val);
-        }
+        auto stopword = stopwords_kv.second.to_json();
         res_json["stopwords"].push_back(stopword);
     }
 
@@ -1917,8 +2387,8 @@ bool get_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     const std::string & stopword_name = req->params["name"];
     StopwordsManager& stopwordManager = StopwordsManager::get_instance();
 
-    spp::sparse_hash_set<std::string> stopwords;
-    Option<bool> stopword_op = stopwordManager.get_stopword(stopword_name, stopwords);
+    stopword_struct_t stopwordStruct;
+    Option<bool> stopword_op = stopwordManager.get_stopword(stopword_name, stopwordStruct);
 
     if(!stopword_op.ok()) {
         res->set(stopword_op.code(), stopword_op.error());
@@ -1926,10 +2396,8 @@ bool get_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     }
 
     nlohmann::json res_json;
-    res_json["name"] = stopword_name;
-    for(const auto& stopword : stopwords) {
-        res_json["value"].push_back(stopword);
-    }
+
+    res_json["stopwords"] = stopwordStruct.to_json();
 
     res->set_200(res_json.dump());
     return true;
@@ -1955,7 +2423,7 @@ bool put_upsert_stopword(const std::shared_ptr<http_req>& req, const std::shared
         return false;
     }
 
-    req_json["name"] = stopword_name;
+    req_json["id"] = stopword_name;
 
     res->set_200(req_json.dump());
     return true;
@@ -1965,25 +2433,15 @@ bool del_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     const std::string & stopword_name = req->params["name"];
     StopwordsManager& stopwordManager = StopwordsManager::get_instance();
 
-    spp::sparse_hash_set<std::string> stopwords;
-    Option<bool> stopword_op = stopwordManager.get_stopword(stopword_name, stopwords);
-    if(!stopword_op.ok()) {
-        res->set(stopword_op.code(), stopword_op.error());
-        return false;
-    }
-
     Option<bool> delete_op = stopwordManager.delete_stopword(stopword_name);
 
     if(!delete_op.ok()) {
-        res->set_500(delete_op.error());
+        res->set(delete_op.code(), delete_op.error());
         return false;
     }
 
     nlohmann::json res_json;
     res_json["id"] = stopword_name;
-    for(const auto& stopword : stopwords) {
-        res_json["stopwords"].push_back(stopword);
-    }
 
     res->set_200(res_json.dump());
     return true;
@@ -2135,9 +2593,15 @@ bool get_limit_exceed_counts(const std::shared_ptr<http_req>& req, const std::sh
 }
 
 Option<std::pair<std::string,std::string>> get_api_key_and_ip(const std::string& metadata) {
-        // format <length of api_key>:<api_key><ip>
+    // format <length of api_key>:<api_key><ip>
     // length of api_key is a uint32_t
     if(metadata.size() < 10) {
+        if(metadata.size() >= 2 && metadata[0] == '0' && metadata[1] == ':') {
+            // e.g. "0:0.0.0.0" (when api key is not provided at all)
+            std::string ip = metadata.substr(metadata.find(":") + 1);
+            return Option<std::pair<std::string,std::string>>(std::make_pair("", ip));
+        }
+
         return Option<std::pair<std::string,std::string>>(400, "Invalid metadata");
     }
 
@@ -2145,15 +2609,17 @@ Option<std::pair<std::string,std::string>> get_api_key_and_ip(const std::string&
         return Option<std::pair<std::string,std::string>>(400, "Invalid metadata");
     }
 
-    if(!StringUtils::is_uint32_t(metadata.substr(0, metadata.find(":")))) {
+    std::string key_len_str = metadata.substr(0, metadata.find(":"));
+
+    if(!StringUtils::is_uint32_t(key_len_str)) {
         return Option<std::pair<std::string,std::string>>(400, "Invalid metadata");
     }
 
-    if(metadata.size() < std::stoul(metadata.substr(0, metadata.find(":"))) + metadata.find(":") + 7) {
+    uint32_t api_key_length = static_cast<uint32_t>(std::stoul(key_len_str));
+
+    if(metadata.size() < api_key_length + metadata.find(":") + 7) {
         return Option<std::pair<std::string,std::string>>(400, "Invalid metadata");
     }
-
-    uint32_t api_key_length = static_cast<uint32_t>(std::stoul(metadata.substr(0, metadata.find(":"))));
 
     std::string api_key = metadata.substr(metadata.find(":") + 1, api_key_length);
     std::string ip = metadata.substr(metadata.find(":") + 1 + api_key_length);
@@ -2178,13 +2644,13 @@ bool post_create_event(const std::shared_ptr<http_req>& req, const std::shared_p
         return false;
     }
 
-    bool success = EventManager::get_instance().add_event(req_json);
-    if(success) {
+    auto add_event_op = EventManager::get_instance().add_event(req_json, req->client_ip);
+    if(add_event_op.ok()) {
         res->set_201(R"({"ok": true)");
         return true;
     }
 
-    res->set_400(R"({"ok": false)");
+    res->set_400(add_event_op.error());
     return false;
 }
 
@@ -2329,5 +2795,189 @@ bool post_proxy(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
     }
 
     res->set_200(response.body);
+    return true;
+}
+
+
+bool get_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    std::string conversation_id = req->params["id"];
+
+    auto conversation_op = ConversationManager::get_instance().get_conversation(conversation_id);
+
+    if(!conversation_op.ok()) {
+        res->set(conversation_op.code(), conversation_op.error());
+        return false;
+    }
+
+    res->set_200(conversation_op.get().dump());
+    return true;
+}
+
+
+bool del_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    std::string conversation_id = req->params["id"];
+
+    auto conversation_op = ConversationManager::get_instance().delete_conversation(conversation_id);
+
+    if(!conversation_op.ok()) {
+        res->set(conversation_op.code(), conversation_op.error());
+        return false;
+    }
+
+    res->set_200(conversation_op.get().dump());
+    return true;
+}
+
+bool get_conversations(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    auto conversations_op = ConversationManager::get_instance().get_all_conversations();
+
+    if(!conversations_op.ok()) {
+        res->set(conversations_op.code(), conversations_op.error());
+        return false;
+    }
+
+    res->set_200(conversations_op.get().dump());
+    return true;
+}
+
+bool put_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    std::string conversation_id = req->params["id"];
+
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    req_json["id"] = conversation_id;
+
+    auto conversation_op = ConversationManager::get_instance().update_conversation(req_json);
+
+    if(!conversation_op.ok()) {
+        res->set(conversation_op.code(), conversation_op.error());
+        return false;
+    }
+
+    res->set_200(conversation_op.get().dump());
+    return true;
+}
+
+bool post_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    if(!req_json.is_object()) {
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    auto add_model_op = ConversationModelManager::add_model(req_json);
+
+    if(!add_model_op.ok()) {
+        res->set(add_model_op.code(), add_model_op.error());
+        return false;
+    }
+
+    auto model = add_model_op.get();
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
+    return true;
+}
+
+bool get_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    auto model_op = ConversationModelManager::get_model(model_id);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
+    return true;
+}
+
+bool get_conversation_models(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    auto models_op = ConversationModelManager::get_all_models();
+
+    if(!models_op.ok()) {
+        res->set(models_op.code(), models_op.error());
+        return false;
+    }
+
+    auto models = models_op.get();
+
+    for(auto& model: models) {
+        Collection::hide_credential(model, "api_key");
+    }
+
+    res->set_200(models.dump());
+    return true;
+}
+
+bool del_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    auto model_op = ConversationModelManager::delete_model(model_id);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
+    return true;
+}
+
+bool put_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    if(!req_json.is_object()) {
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    auto model_op = ConversationModelManager::update_model(model_id, req_json);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
     return true;
 }

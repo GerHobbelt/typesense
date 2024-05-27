@@ -1,10 +1,11 @@
 #include <store.h>
 #include "field.h"
 #include "magic_enum.hpp"
-#include "text_embedder_manager.h"
+#include "embedder_manager.h"
 #include <stack>
 #include <collection_manager.h>
 #include <regex>
+
 
 Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::json& field_json,
                                         std::vector<field>& the_fields,
@@ -23,6 +24,11 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
         return Option<bool>(400, "Wrong format for `fields`. It should be an array of objects containing "
                                  "`name`, `type`, `optional` and `facet` properties.");
+    }
+
+    if(field_json.count("store") != 0 && !field_json.at("store").is_boolean()) {
+        return Option<bool>(400, std::string("The `store` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
     }
 
     if(field_json.count("drop") != 0) {
@@ -73,6 +79,31 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         return Option<bool>(400, "Reference should be a string.");
     } else if (field_json.count(fields::reference) == 0) {
         field_json[fields::reference] = "";
+    }
+
+    if(field_json.count(fields::stem) != 0) {
+        if(!field_json.at(fields::stem).is_boolean()) {
+            return Option<bool>(400, std::string("The `stem` property of the field `") +
+                                     field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
+        }
+
+        if(field_json[fields::stem] && field_json[fields::type] != field_types::STRING && field_json[fields::type] != field_types::STRING_ARRAY) {
+            return Option<bool>(400, std::string("The `stem` property is only allowed for string and string[] fields."));
+        }
+
+        if(field_json[fields::stem].get<bool>()) {
+            std::string locale;
+            if(field_json.count(fields::locale) != 0) {
+                locale = field_json[fields::locale].get<std::string>();
+            }
+            auto stem_validation = StemmerManager::get_instance().validate_language(locale);
+            if(!stem_validation) {
+                return Option<bool>(400, std::string("The `locale` value of the field `") +
+                                         field_json[fields::name].get<std::string>() + std::string("` is not supported for stem."));
+            }
+        }
+    } else {
+        field_json[fields::stem] = false;
     }
 
     if (field_json.count(fields::range_index) != 0) {
@@ -159,6 +190,10 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
     if(field_json.count(fields::locale) == 0) {
         field_json[fields::locale] = "";
+    }
+
+    if(field_json.count(fields::store) == 0) {
+        field_json[fields::store] = true;
     }
 
     if(field_json.count(fields::sort) == 0) {
@@ -278,6 +313,47 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         }
     }
 
+    if(field_json.count(fields::hnsw_params) != 0) {
+        if(!field_json[fields::hnsw_params].is_object()) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + "` must be an object.");
+        }
+
+        if(field_json[fields::hnsw_params].count("ef_construction") != 0 &&
+           (!field_json[fields::hnsw_params]["ef_construction"].is_number_unsigned() ||
+            field_json[fields::hnsw_params]["ef_construction"] == 0)) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + ".ef_construction` must be a positive integer.");
+        }
+
+        if(field_json[fields::hnsw_params].count("M") != 0 &&
+           (!field_json[fields::hnsw_params]["M"].is_number_unsigned() ||
+            field_json[fields::hnsw_params]["M"] == 0)) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + ".M` must be a positive integer.");
+        }
+
+        // remove unrelated properties except for m ef_construction and M
+        auto it = field_json[fields::hnsw_params].begin();
+        while(it != field_json[fields::hnsw_params].end()) {
+            if(it.key() != "max_elements" && it.key() != "ef_construction" && it.key() != "M" && it.key() != "ef") {
+                it = field_json[fields::hnsw_params].erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if(field_json[fields::hnsw_params].count("ef_construction") == 0) {
+            field_json[fields::hnsw_params]["ef_construction"] = 200;
+        }
+
+        if(field_json[fields::hnsw_params].count("M") == 0) {
+            field_json[fields::hnsw_params]["M"] = 16;
+        }
+    } else {
+        field_json[fields::hnsw_params] = R"({
+                                            "M": 16,
+                                            "ef_construction": 200
+                                        })"_json;
+    }
+
     if(field_json.count(fields::optional) == 0) {
         // dynamic type fields are always optional
         bool is_dynamic = field::is_dynamic(field_json[fields::name], field_json[fields::type]);
@@ -314,6 +390,14 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         if (tokens.size() < 2) {
             return Option<bool>(400, "Invalid reference `" + field_json[fields::reference].get<std::string>()  + "`.");
         }
+
+        tokens.clear();
+        StringUtils::split(field_json[fields::name].get<std::string>(), tokens, ".");
+
+        if (tokens.size() > 2) {
+            return Option<bool>(400, "`" + field_json[fields::name].get<std::string>() + "` field cannot have a reference."
+                                        " Only the top-level field of an object is allowed.");
+        }
     }
 
     the_fields.emplace_back(
@@ -321,16 +405,18 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
                   field_json[fields::optional], field_json[fields::index], field_json[fields::locale],
                   field_json[fields::sort], field_json[fields::infix], field_json[fields::nested],
                   field_json[fields::nested_array], field_json[fields::num_dim], vec_dist,
-                  field_json[fields::reference], field_json[fields::embed], field_json[fields::range_index])
+                  field_json[fields::reference], field_json[fields::embed], field_json[fields::range_index], 
+                  field_json[fields::store], field_json[fields::stem], field_json[fields::hnsw_params])
     );
 
     if (!field_json[fields::reference].get<std::string>().empty()) {
         // Add a reference helper field in the schema. It stores the doc id of the document it references to reduce the
         // computation while searching.
-        the_fields.emplace_back(
-                field(field_json[fields::name].get<std::string>() + Collection::REFERENCE_HELPER_FIELD_SUFFIX,
-                      "int64", false, field_json[fields::optional], true)
-        );
+        auto f = field(field_json[fields::name].get<std::string>() + fields::REFERENCE_HELPER_FIELD_SUFFIX,
+                       field_types::is_array(field_json[fields::type].get<std::string>()) ? field_types::INT64_ARRAY : field_types::INT64,
+                       false, field_json[fields::optional], true);
+        f.nested = field_json[fields::nested];
+        the_fields.emplace_back(std::move(f));
     }
 
     return Option<bool>(true);
@@ -346,9 +432,8 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
         while(it != value.end()) {
             const std::string& child_field_name = flat_name + "." + it.key();
             if(it.value().is_null()) {
-                if(has_array) {
-                    doc[child_field_name].push_back(nullptr);
-                } else {
+                if(!has_array) {
+                    // we don't want to push null values into an array because that's not valid
                     doc[child_field_name] = nullptr;
                 }
 
@@ -380,6 +465,7 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
 
         std::string detected_type;
         bool found_dynamic_field = false;
+        field dyn_field(the_field.name, field_types::STRING, false);
 
         for(auto dyn_field_it = dyn_fields.begin(); dyn_field_it != dyn_fields.end(); dyn_field_it++) {
             auto& dynamic_field = dyn_field_it->second;
@@ -391,6 +477,7 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
             if(std::regex_match(flat_name, std::regex(dynamic_field.name))) {
                 detected_type = dynamic_field.type;
                 found_dynamic_field = true;
+                dyn_field = dynamic_field;
                 break;
             }
         }
@@ -412,13 +499,15 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
             doc[flat_name] = value;
         }
 
-        field flattened_field = the_field;
+        field flattened_field = found_dynamic_field ? dyn_field : the_field;
         flattened_field.name = flat_name;
         flattened_field.type = detected_type;
         flattened_field.optional = true;
         flattened_field.nested = true;
         flattened_field.nested_array = has_obj_array;
-        flattened_field.set_computed_defaults(-1, -1);
+        int sort_op = flattened_field.sort ? 1 : -1;
+        int infix_op = flattened_field.infix ? 1 : -1;
+        flattened_field.set_computed_defaults(sort_op, infix_op);
         flattened_fields[flat_name] = flattened_field;
     }
 
@@ -536,9 +625,11 @@ Option<bool> field::flatten_field(nlohmann::json& doc, nlohmann::json& obj, cons
             return flatten_field(doc, it.value(), the_field, path_parts, path_index + 1, has_array, has_obj_array,
                                  is_update, dyn_fields, flattened_fields);
         }
-    } {
+    } else if(!the_field.optional) {
         return Option<bool>(404, "Field `" + the_field.name + "` not found.");
     }
+
+    return Option<bool>(true);
 }
 
 Option<bool> field::flatten_doc(nlohmann::json& document,
@@ -549,6 +640,10 @@ Option<bool> field::flatten_doc(nlohmann::json& document,
     std::unordered_map<std::string, field> flattened_fields_map;
 
     for(auto& nested_field: nested_fields) {
+        if(!nested_field.index) {
+            continue;
+        }
+
         std::vector<std::string> field_parts;
         StringUtils::split(nested_field.name, field_parts, ".");
 
@@ -625,8 +720,9 @@ Option<bool> field::validate_and_init_embed_field(const tsl::htrie_map<char, fie
                                                   const nlohmann::json& fields_json,
                                                   field& the_field) {
     const std::string err_msg = "Property `" + fields::embed + "." + fields::from +
-                                    "` can only refer to string or string array fields.";
+                                    "` can only refer to string, string array or image (for supported models) fields.";
 
+    bool found_image_field = false;
     for(auto& field_name : field_json[fields::embed][fields::from].get<std::vector<std::string>>()) {
 
         auto embed_field = std::find_if(fields_json.begin(), fields_json.end(), [&field_name](const nlohmann::json& x) {
@@ -638,18 +734,36 @@ Option<bool> field::validate_and_init_embed_field(const tsl::htrie_map<char, fie
             const auto& embed_field2 = search_schema.find(field_name);
             if (embed_field2 == search_schema.end()) {
                 return Option<bool>(400, err_msg);
-            } else if (embed_field2->type != field_types::STRING && embed_field2->type != field_types::STRING_ARRAY) {
+            } else if (embed_field2->type != field_types::STRING && embed_field2->type != field_types::STRING_ARRAY && embed_field2->type != field_types::IMAGE) {
                 return Option<bool>(400, err_msg);
             }
+            if(embed_field2->type == field_types::IMAGE) {
+                if(found_image_field) {
+                    return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
+                }
+                if(field_json[fields::embed][fields::from].get<std::vector<std::string>>().size() > 1) {
+                    return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
+                }
+                found_image_field = true;
+            }
         } else if((*embed_field)[fields::type] != field_types::STRING &&
-                  (*embed_field)[fields::type] != field_types::STRING_ARRAY) {
+                  (*embed_field)[fields::type] != field_types::STRING_ARRAY &&
+                    (*embed_field)[fields::type] != field_types::IMAGE) {
             return Option<bool>(400, err_msg);
+        } else if((*embed_field)[fields::type] == field_types::IMAGE) {
+            if(found_image_field) {
+                return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
+            }
+            if(field_json[fields::embed][fields::from].get<std::vector<std::string>>().size() > 1) {
+                return Option<bool>(400, "Only one field can be used in the `embed.from` property of an embed field when embedding from an image field.");
+            }
+            found_image_field = true;
         }
     }
 
     const auto& model_config = field_json[fields::embed][fields::model_config];
-    size_t num_dim = 0;
-    auto res = TextEmbedderManager::get_instance().validate_and_init_model(model_config, num_dim);
+    size_t num_dim = field_json[fields::num_dim].get<size_t>();
+    auto res = EmbedderManager::get_instance().validate_and_init_model(model_config, num_dim);
     if(!res.ok()) {
         return Option<bool>(res.code(), res.error());
     }

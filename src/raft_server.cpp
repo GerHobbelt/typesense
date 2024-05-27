@@ -163,6 +163,12 @@ string ReplicationState::resolve_node_hosts(const string& nodes_config) {
             continue;
         }
 
+        if(node_parts[0].size() > 64) {
+            LOG(ERROR) << "Host name is too long (must be < 64 characters): " << node_parts[0];
+            final_nodes_vec.emplace_back("");
+            continue;
+        }
+
         butil::ip_t ip;
         int status = butil::hostname2ip(node_parts[0].c_str(), &ip);
 
@@ -256,6 +262,20 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
         response->final = true;
         auto req_res = new async_req_res_t(request, response, true);
         return message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+    }
+
+    route_path* rpath = nullptr;
+    bool route_found = server->get_route(request->route_hash, &rpath);
+
+    if(route_found && rpath->handler == patch_update_collection) {
+        if(get_alter_in_progress()) {
+            response->set_422("Another collection update operation is in progress.");
+            response->final = true;
+            auto req_res = new async_req_res_t(request, response, true);
+            return message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+        }
+
+        set_alter_in_progress(true);
     }
 
     std::shared_lock lock(node_mutex);
@@ -364,18 +384,17 @@ void ReplicationState::write_to_leader(const std::shared_ptr<http_req>& request,
                     response->content_type_header = res_headers["content-type"];
                     response->set_500("");
                 } else {
-                    pending_writes--;
                     return ;
                 }
             } else {
                 std::string api_res;
-                long status = HttpClient::post_response(url, request->body, api_res, res_headers, {}, 10*1000, true);
+                long status = HttpClient::post_response(url, request->body, api_res, res_headers, {}, 0, true);
                 response->content_type_header = res_headers["content-type"];
                 response->set_body(status, api_res);
             }
         } else if(request->http_method == "PUT") {
             std::string api_res;
-            long status = HttpClient::put_response(url, request->body, api_res, res_headers, 10*1000, true);
+            long status = HttpClient::put_response(url, request->body, api_res, res_headers, 0, true);
             response->content_type_header = res_headers["content-type"];
             response->set_body(status, api_res);
         } else if(request->http_method == "DELETE") {
@@ -388,13 +407,7 @@ void ReplicationState::write_to_leader(const std::shared_ptr<http_req>& request,
             std::string api_res;
             route_path* rpath = nullptr;
             bool route_found = server->get_route(request->route_hash, &rpath);
-
-            long timeout_ms = 10 * 1000;
-            if(route_found && rpath->handler == patch_update_collection) {
-                timeout_ms = 0;  // patching a collection can take a long time
-            }
-
-            long status = HttpClient::patch_response(url, request->body, api_res, res_headers, timeout_ms, true);
+            long status = HttpClient::patch_response(url, request->body, api_res, res_headers, 0, true);
             response->content_type_header = res_headers["content-type"];
             response->set_body(status, api_res);
         } else {
@@ -475,7 +488,22 @@ void* ReplicationState::save_snapshot(void* arg) {
         std::string file_name = std::string(db_snapshot_name) + "/" + file.BaseName().value();
         if (sa->writer->add_file(file_name) != 0) {
             sa->done->status().set_error(EIO, "Fail to add file to writer.");
+            sa->replication_state->snapshot_in_progress = false;
             return nullptr;
+        }
+    }
+
+    if(!sa->analytics_db_snapshot_path.empty()) {
+        //add analytics db snapshot files to writer state
+        butil::FileEnumerator analytics_dir_enum(butil::FilePath(sa->analytics_db_snapshot_path), false,
+                                                 butil::FileEnumerator::FILES);
+        for (butil::FilePath file = analytics_dir_enum.Next(); !file.empty(); file = analytics_dir_enum.Next()) {
+            auto file_name = std::string(analytics_db_snapshot_name) + "/" + file.BaseName().value();
+            if (sa->writer->add_file(file_name) != 0) {
+                sa->done->status().set_error(EIO, "Fail to add analytics file to writer.");
+                sa->replication_state->snapshot_in_progress = false;
+                return nullptr;
+            }
         }
     }
 
@@ -513,6 +541,7 @@ void* ReplicationState::save_snapshot(void* arg) {
     // NOTE: *must* do a dummy write here since snapshots cannot be triggered if no write has happened since the
     // last snapshot. By doing a dummy write right after a snapshot, we ensure that this can never be the case.
     sa->replication_state->do_dummy_write();
+    sa->replication_state->snapshot_in_progress = false;
 
     LOG(INFO) << "save_snapshot done";
 
@@ -523,7 +552,9 @@ void* ReplicationState::save_snapshot(void* arg) {
 void ReplicationState::on_snapshot_save(braft::SnapshotWriter* writer, braft::Closure* done) {
     LOG(INFO) << "on_snapshot_save";
 
+    snapshot_in_progress = true;
     std::string db_snapshot_path = writer->get_path() + "/" + db_snapshot_name;
+    std::string analytics_db_snapshot_path = writer->get_path() + "/" + analytics_db_snapshot_name;
 
     {
         // grab batch indexer lock so that we can take a clean snapshot
@@ -532,7 +563,7 @@ void ReplicationState::on_snapshot_save(braft::SnapshotWriter* writer, braft::Cl
 
         nlohmann::json batch_index_state;
         batched_indexer->serialize_state(batch_index_state);
-        store->insert(CollectionManager::BATCHED_INDEXER_STATE_KEY, batch_index_state.dump());
+        store->insert(BATCHED_INDEXER_STATE_KEY, batch_index_state.dump());
 
         // we will delete all the skip indices in meta store and flush that DB
         // this will block writes, but should be pretty fast
@@ -546,6 +577,18 @@ void ReplicationState::on_snapshot_save(braft::SnapshotWriter* writer, braft::Cl
             LOG(ERROR) << "Failure during checkpoint creation, msg:" << status.ToString();
             done->status().set_error(EIO, "Checkpoint creation failure.");
         }
+
+        if(analytics_store) {
+            analytics_store->insert(BATCHED_INDEXER_STATE_KEY, batch_index_state.dump());
+            rocksdb::Checkpoint* checkpoint2 = nullptr;
+            status = analytics_store->create_check_point(&checkpoint2, analytics_db_snapshot_path);
+            std::unique_ptr<rocksdb::Checkpoint> checkpoint_guard(checkpoint2);
+
+            if(!status.ok()) {
+                LOG(ERROR) << "AnalyticsStore : Failure during checkpoint creation, msg:" << status.ToString();
+                done->status().set_error(EIO, "AnalyticsStore : Checkpoint creation failure.");
+            }
+        }
     }
 
     SnapshotArg* arg = new SnapshotArg;
@@ -554,6 +597,10 @@ void ReplicationState::on_snapshot_save(braft::SnapshotWriter* writer, braft::Cl
     arg->state_dir_path = raft_dir_path;
     arg->db_snapshot_path = db_snapshot_path;
     arg->done = done;
+
+    if(analytics_store) {
+        arg->analytics_db_snapshot_path = analytics_db_snapshot_path;
+    }
 
     if(!ext_snapshot_path.empty()) {
         arg->ext_snapshot_path = ext_snapshot_path;
@@ -579,6 +626,16 @@ int ReplicationState::init_db() {
         return 1;
     }
 
+    if(batched_indexer != nullptr) {
+        LOG(INFO) << "Initializing batched indexer from snapshot state...";
+        std::string batched_indexer_state_str;
+        StoreStatus s = store->get(BATCHED_INDEXER_STATE_KEY, batched_indexer_state_str);
+        if(s == FOUND) {
+            nlohmann::json batch_indexer_state = nlohmann::json::parse(batched_indexer_state_str);
+            batched_indexer->load_state(batch_indexer_state);
+        }
+    }
+
     return 0;
 }
 
@@ -595,6 +652,17 @@ int ReplicationState::on_snapshot_load(braft::SnapshotReader* reader) {
 
     // Load snapshot from leader, replacing the running StateMachine
     std::string snapshot_path = reader->get_path();
+
+    if(analytics_store) {
+        snapshot_path.append(std::string("/") + analytics_db_snapshot_name);
+        int reload_store = analytics_store->reload(true, snapshot_path);
+        if (reload_store != 0) {
+            LOG(ERROR) << "Failed to reload analytics db snapshot.";
+            return reload_store;
+        }
+    }
+
+    snapshot_path = reader->get_path();
     snapshot_path.append(std::string("/") + db_snapshot_name);
 
     int reload_store = store->reload(true, snapshot_path);
@@ -623,13 +691,14 @@ void ReplicationState::refresh_nodes(const std::string & nodes, const size_t raf
     node->get_status(&nodeStatus);
 
     LOG(INFO) << "Term: " << nodeStatus.term
-             << ", last_index index: " << nodeStatus.last_index
-             << ", committed_index: " << nodeStatus.committed_index
-             << ", known_applied_index: " << nodeStatus.known_applied_index
-             << ", applying_index: " << nodeStatus.applying_index
-             << ", queued_writes: " << batched_indexer->get_queued_writes()
-             << ", pending_queue_size: " << nodeStatus.pending_queue_size
-             << ", local_sequence: " << store->get_latest_seq_number();
+              << ", pending_queue: " << nodeStatus.pending_queue_size
+              << ", last_index: " << nodeStatus.last_index
+              << ", committed: " << nodeStatus.committed_index
+              << ", known_applied: " << nodeStatus.known_applied_index
+              << ", applying: " << nodeStatus.applying_index
+              << ", pending_writes: " << pending_writes
+              << ", queued_writes: " << batched_indexer->get_queued_writes()
+              << ", local_sequence: " << store->get_latest_seq_number();
 
     if(node->is_leader()) {
         RefreshNodesClosure* refresh_nodes_done = new RefreshNodesClosure;
@@ -762,18 +831,18 @@ void ReplicationState::refresh_catchup_status(bool log_msg) {
 }
 
 ReplicationState::ReplicationState(HttpServer* server, BatchedIndexer* batched_indexer,
-                                   Store *store, ThreadPool* thread_pool,
+                                   Store *store, Store* analytics_store, ThreadPool* thread_pool,
                                    http_message_dispatcher *message_dispatcher,
                                    bool api_uses_ssl, const Config* config,
                                    size_t num_collections_parallel_load, size_t num_documents_parallel_load):
         node(nullptr), leader_term(-1), server(server), batched_indexer(batched_indexer),
-        store(store),
+        store(store), analytics_store(analytics_store),
         thread_pool(thread_pool), message_dispatcher(message_dispatcher), api_uses_ssl(api_uses_ssl),
         config(config),
         num_collections_parallel_load(num_collections_parallel_load),
         num_documents_parallel_load(num_documents_parallel_load),
         read_caught_up(false), write_caught_up(false),
-        ready(false), shutting_down(false), pending_writes(0),
+        ready(false), shutting_down(false), pending_writes(0), snapshot_in_progress(false),
         last_snapshot_ts(std::time(nullptr)), snapshot_interval_s(config->get_snapshot_interval_seconds()) {
 
 }
@@ -798,7 +867,21 @@ uint64_t ReplicationState::node_state() const {
 
 void ReplicationState::do_snapshot(const std::string& snapshot_path, const std::shared_ptr<http_req>& req,
                                    const std::shared_ptr<http_res>& res) {
-    LOG(INFO) << "Triggerring an on demand snapshot...";
+    if(node == nullptr) {
+        res->set_500("Could not trigger a snapshot, as node is not initialized.");
+        auto req_res = new async_req_res_t(req, res, true);
+        get_message_dispatcher()->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+        return ;
+    }
+
+    if(snapshot_in_progress) {
+        res->set_409("Another snapshot is in progress.");
+        auto req_res = new async_req_res_t(req, res, true);
+        get_message_dispatcher()->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
+        return ;
+    }
+
+    LOG(INFO) << "Triggering an on demand snapshot...";
 
     thread_pool->enqueue([&snapshot_path, req, res, this]() {
         OnDemandSnapshotClosure* snapshot_closure = new OnDemandSnapshotClosure(this, req, res);
@@ -1045,6 +1128,10 @@ std::string ReplicationState::get_leader_url() const {
 
     const std::string protocol = api_uses_ssl ? "https" : "http";
     return get_node_url_path(leader_addr, "/", protocol);
+}
+
+void ReplicationState::decr_pending_writes() {
+    pending_writes--;
 }
 
 void TimedSnapshotClosure::Run() {

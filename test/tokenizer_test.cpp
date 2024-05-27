@@ -252,7 +252,13 @@ TEST(TokenizerTest, ShouldTokenizeLocaleText) {
     ASSERT_EQ("วัน", tokens[1]);
     ASSERT_EQ("ที่", tokens[2]);
     ASSERT_EQ("31", tokens[3]);
-    ASSERT_EQ("มี.ค", tokens[4]);
+    ASSERT_EQ("มีค", tokens[4]);
+
+    tokens.clear();
+    str = "12345_678";
+    Tokenizer(str, false, false, "th").tokenize(tokens);
+    ASSERT_EQ(1, tokens.size());
+    ASSERT_EQ("12345678", tokens[0]);
 
     tokens.clear();
     Tokenizer("Odd Thomas", false, false, "en").tokenize(tokens);
@@ -323,6 +329,11 @@ TEST(TokenizerTest, ShouldTokenizeLocaleText) {
 
     tokens.clear();  // 配管
     Tokenizer("配管", true, false, "ja").tokenize(tokens);
+
+    // persian containing zwnj
+    tokens.clear();
+    Tokenizer("روان\u200Cشناسی", false, false, "fa").tokenize(tokens);
+    ASSERT_EQ(2, tokens.size());
 }
 
 TEST(TokenizerTest, ShouldTokenizeLocaleTextWithEnglishText) {
@@ -332,6 +343,41 @@ TEST(TokenizerTest, ShouldTokenizeLocaleTextWithEnglishText) {
     ASSERT_EQ(14, ttokens.size());
     ASSERT_EQ("discrete", ttokens[7]);
     ASSERT_EQ("math", ttokens[8]);
+}
+
+TEST(TokenizerTest, ShouldRemoveGenericPunctuationFromThaiText) {
+    std::string tstr = "f’’b";
+    std::vector<std::string> ttokens;
+    Tokenizer(tstr, true, false, "th").tokenize(ttokens);
+    ASSERT_EQ(2, ttokens.size());
+    ASSERT_EQ("f", ttokens[0]);
+    ASSERT_EQ("b", ttokens[1]);
+
+    ttokens.clear();
+    tstr = "Lay’s";
+    Tokenizer(tstr, true, false, "th").tokenize(ttokens);
+    ASSERT_EQ(1, ttokens.size());
+    ASSERT_EQ("lays", ttokens[0]);
+}
+
+TEST(TokenizerTest, ShouldTokenizeLocaleTextWithSwedishText) {
+    std::string tstr = "södra";
+    std::vector<std::string> ttokens;
+    Tokenizer(tstr, true, false, "sv").tokenize(ttokens);
+    ASSERT_EQ(1, ttokens.size());
+    ASSERT_EQ("södra", ttokens[0]);
+
+    tstr = "Ängelholm";
+    ttokens.clear();
+    Tokenizer(tstr, true, false, "sv").tokenize(ttokens);
+    ASSERT_EQ(1, ttokens.size());
+    ASSERT_EQ("ängelholm", ttokens[0]);
+
+    tstr = "Ängelholm";
+    ttokens.clear();
+    Tokenizer(tstr, true, false, "").tokenize(ttokens);
+    ASSERT_EQ(1, ttokens.size());
+    ASSERT_EQ("angelholm", ttokens[0]);
 }
 
 TEST(TokenizerTest, ShouldTokenizeWithDifferentSymbolConfigs) {
@@ -362,4 +408,9 @@ TEST(TokenizerTest, ShouldTokenizeWithDifferentSymbolConfigs) {
     ASSERT_EQ("ความ", tokens[0]);
     ASSERT_EQ("เหลื่อม", tokens[1]);
     ASSERT_EQ("ล้ํา", tokens[2]);
+
+    tokens.clear();
+    Tokenizer("ความ_เห", true, false, "th", {}, {}).tokenize(tokens);
+    ASSERT_EQ(1, tokens.size());
+    ASSERT_EQ("ความเห", tokens[0]);
 }

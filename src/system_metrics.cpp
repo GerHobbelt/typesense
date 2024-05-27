@@ -72,6 +72,13 @@ void SystemMetrics::get(const std::string &data_dir_path, nlohmann::json &result
     result["system_memory_total_bytes"] = std::to_string(get_memory_total_bytes());
     result["system_memory_used_bytes"] = std::to_string(get_memory_used_bytes());
 
+#ifdef __linux__
+    struct sysinfo sys_info;
+    sysinfo(&sys_info);
+    auto swap_used_bytes = sys_info.totalswap - sys_info.freeswap;
+    result["system_memory_total_swap_bytes"] = std::to_string(sys_info.totalswap);
+    result["system_memory_used_swap_bytes"] = std::to_string(swap_used_bytes);
+#endif
     // CPU and Network metrics
 #if __linux__
     const std::vector<cpu_stat_t>& cpu_stats = get_cpu_stats();

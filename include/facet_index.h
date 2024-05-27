@@ -34,8 +34,13 @@ struct facet_value_id_t {
     }
 };
 
+struct docid_count_t {
+    uint32_t doc_id;
+    uint32_t count;
+};
+
 class facet_index_t {
-private:
+public:
     struct facet_count_t {
         facet_count_t() = delete;
 
@@ -58,7 +63,7 @@ private:
         uint32_t count;
         uint32_t facet_id;
     };
-
+private:
     struct facet_id_seq_ids_t {
         void* seq_ids;
         uint32_t facet_id;
@@ -75,7 +80,9 @@ private:
     struct facet_doc_ids_list_t {
         std::map<std::string, facet_id_seq_ids_t> fvalue_seq_ids;
         std::list<facet_count_t> counts;
+        std::map<uint32_t, std::list<facet_count_t>::iterator> count_map;
         posting_list_t* seq_id_hashes = nullptr;
+        spp::sparse_hash_map<uint32_t, int64_t> fhash_to_int64_map;
 
         bool has_value_index = true;
         bool has_hash_index = true;
@@ -104,9 +111,14 @@ private:
 
     // field -> facet_index
     std::unordered_map<std::string, facet_doc_ids_list_t> facet_field_map;
-
     // auto incrementing ID that is assigned to each unique facet value string
-    uint32_t next_facet_id = 0;
+    std::atomic_uint32_t next_facet_id = 0;
+
+    void get_stringified_value(const nlohmann::json& value, const field& afield,
+                               std::vector<std::string>& values);
+
+    void get_stringified_values(const nlohmann::json& document, const field& afield,
+                                std::vector<std::string>& values);
 
 public:
 
@@ -116,20 +128,25 @@ public:
 
     void insert(const std::string& field_name, std::unordered_map<facet_value_id_t,
                 std::vector<uint32_t>, facet_value_id_t::Hash>& fvalue_to_seq_ids,
-                std::unordered_map<uint32_t, std::vector<facet_value_id_t>>& seq_id_to_fvalues);
+                std::unordered_map<uint32_t, std::vector<facet_value_id_t>>& seq_id_to_fvalues,
+                bool is_string_field = false);
 
     void erase(const std::string& field_name);
 
-    void remove(const std::string& field_name, const uint32_t seq_id);
+    void remove(const nlohmann::json& doc, const field& afield, const uint32_t seq_id);
 
     bool contains(const std::string& field_name);
 
     size_t get_facet_count(const std::string& field_name);
 
-    size_t intersect(facet& a_facet,
-                     bool has_facet_query, const std::vector<std::string>& fvalue_searched_tokens,
+    size_t intersect(facet& a_facet, const field& facet_field,
+                     bool has_facet_query,
+                     bool estimate_facets,
+                     size_t facet_sample_interval,
+                     const std::vector<std::vector<std::string>>& fvalue_searched_tokens,
+                     const std::vector<char>& symbols_to_index, const std::vector<char>& token_separators,
                      const uint32_t* result_ids, size_t result_id_len,
-                     size_t max_facet_count, std::map<std::string, uint32_t>& found,
+                     size_t max_facet_count, std::map<std::string, docid_count_t>& found,
                      bool is_wildcard_no_filter_query, const std::string& sort_order = "");
     
     size_t get_facet_indexes(const std::string& field, 
@@ -140,9 +157,26 @@ public:
     void handle_index_change(const std::string& field_name, size_t total_num_docs,
                              size_t facet_index_threshold, size_t facet_count);
 
+    void check_for_high_cardinality(const std::string& field_name, size_t total_num_docs);
+
     bool has_hash_index(const std::string& field_name);
 
     bool has_value_index(const std::string& field_name);
 
     posting_list_t* get_facet_hash_index(const std::string& field_name);
+
+    //get fhash=>int64 map for stats
+    const spp::sparse_hash_map<uint32_t, int64_t>& get_fhash_int64_map(const std::string& field_name);
+
+    static void update_count_nodes(std::list<facet_count_t>& count_list,
+                            std::map<uint32_t, std::list<facet_count_t>::iterator>& count_map,
+                            uint32_t old_count, uint32_t new_count,
+                            std::list<facet_count_t>::iterator& curr);
+
+    bool facet_value_exists(const std::string& field_name, const std::string& fvalue);
+
+    size_t facet_val_num_ids(const std::string& field_name, const std::string& fvalue);
+
+    size_t facet_node_count(const std::string& field_name, const std::string& fvalue);
+
 };

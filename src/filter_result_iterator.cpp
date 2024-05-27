@@ -1,3 +1,4 @@
+#include <memory>
 #include <queue>
 #include <id_list.h>
 #include <s2/s2point.h>
@@ -13,6 +14,31 @@
 #include "posting.h"
 #include "collection_manager.h"
 
+void copy_references_helper(const std::map<std::string, reference_filter_result_t>* from,
+                            std::map<std::string, reference_filter_result_t>*& to, const uint32_t& count) {
+    if (from == nullptr) {
+        return;
+    }
+
+    to = new std::map<std::string, reference_filter_result_t>[count] {};
+    for (uint32_t i = 0; i < count; i++) {
+        if (from[i].empty()) {
+            continue;
+        }
+
+        auto& ref = to[i];
+        ref.insert(from[i].begin(), from[i].end());
+    }
+}
+
+void reference_filter_result_t::copy_references(const reference_filter_result_t& from, reference_filter_result_t& to) {
+    return copy_references_helper(from.coll_to_references, to.coll_to_references, from.count);
+}
+
+void filter_result_t::copy_references(const filter_result_t& from, filter_result_t& to) {
+    return copy_references_helper(from.coll_to_references, to.coll_to_references, from.count);
+}
+
 void filter_result_t::and_filter_results(const filter_result_t& a, const filter_result_t& b, filter_result_t& result) {
     auto lenA = a.count, lenB = b.count;
     if (lenA == 0 || lenB == 0) {
@@ -25,16 +51,8 @@ void filter_result_t::and_filter_results(const filter_result_t& a, const filter_
     const uint32_t *endA = A + lenA;
     const uint32_t *endB = B + lenB;
 
-    // Add an entry of references in the result for each unique collection in a and b.
-    for (auto const& item: a.reference_filter_results) {
-        if (result.reference_filter_results.count(item.first) == 0) {
-            result.reference_filter_results[item.first] = new reference_filter_result_t[std::min(lenA, lenB)];
-        }
-    }
-    for (auto const& item: b.reference_filter_results) {
-        if (result.reference_filter_results.count(item.first) == 0) {
-            result.reference_filter_results[item.first] = new reference_filter_result_t[std::min(lenA, lenB)];
-        }
+    if (a.coll_to_references != nullptr || b.coll_to_references != nullptr) {
+        result.coll_to_references = new std::map<std::string, reference_filter_result_t>[std::min(lenA, lenB)] {};
     }
 
     while (true) {
@@ -54,12 +72,15 @@ void filter_result_t::and_filter_results(const filter_result_t& a, const filter_
         if (*A == *B) {
             *out = *A;
 
-            // Copy the references of the document from every collection into result.
-            for (auto const& item: a.reference_filter_results) {
-                result.reference_filter_results[item.first][out - result.docs] = item.second[A - a.docs];
-            }
-            for (auto const& item: b.reference_filter_results) {
-                result.reference_filter_results[item.first][out - result.docs] = item.second[B - b.docs];
+            if (result.coll_to_references != nullptr) {
+                // Copy the references of the document from every collection into result.
+                auto& ref = result.coll_to_references[out - result.docs];
+                if (a.coll_to_references != nullptr) {
+                    ref.insert(a.coll_to_references[A - a.docs].begin(), a.coll_to_references[A - a.docs].end());
+                }
+                if (b.coll_to_references != nullptr) {
+                    ref.insert(b.coll_to_references[B - b.docs].begin(), b.coll_to_references[B - b.docs].end());
+                }
             }
 
             out++;
@@ -92,16 +113,8 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
     size_t indexA = 0, indexB = 0, res_index = 0, lenA = a.count, lenB = b.count;
     result.docs = new uint32_t[lenA + lenB];
 
-    // Add an entry of references in the result for each unique collection in a and b.
-    for (auto const& item: a.reference_filter_results) {
-        if (result.reference_filter_results.count(item.first) == 0) {
-            result.reference_filter_results[item.first] = new reference_filter_result_t[lenA + lenB];
-        }
-    }
-    for (auto const& item: b.reference_filter_results) {
-        if (result.reference_filter_results.count(item.first) == 0) {
-            result.reference_filter_results[item.first] = new reference_filter_result_t[lenA + lenB];
-        }
+    if (a.coll_to_references != nullptr || b.coll_to_references != nullptr) {
+        result.coll_to_references = new std::map<std::string, reference_filter_result_t>[lenA + lenB] {};
     }
 
     while (indexA < lenA && indexB < lenB) {
@@ -112,9 +125,10 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
                 res_index++;
             }
 
-            // Copy references of the last result document from every collection in a.
-            for (auto const& item: a.reference_filter_results) {
-                result.reference_filter_results[item.first][res_index - 1] = item.second[indexA];
+            if (a.coll_to_references != nullptr) {
+                // Copy references of the last result document from every collection in a.
+                auto &ref = result.coll_to_references[res_index - 1];
+                ref.insert(a.coll_to_references[indexA].begin(), a.coll_to_references[indexA].end());
             }
 
             indexA++;
@@ -124,8 +138,9 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
                 res_index++;
             }
 
-            for (auto const& item: b.reference_filter_results) {
-                result.reference_filter_results[item.first][res_index - 1] = item.second[indexB];
+            if (b.coll_to_references != nullptr) {
+                auto &ref = result.coll_to_references[res_index - 1];
+                ref.insert(b.coll_to_references[indexB].begin(), b.coll_to_references[indexB].end());
             }
 
             indexB++;
@@ -138,8 +153,9 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
             res_index++;
         }
 
-        for (auto const& item: a.reference_filter_results) {
-            result.reference_filter_results[item.first][res_index - 1] = item.second[indexA];
+        if (a.coll_to_references != nullptr) {
+            auto &ref = result.coll_to_references[res_index - 1];
+            ref.insert(a.coll_to_references[indexA].begin(), a.coll_to_references[indexA].end());
         }
 
         indexA++;
@@ -151,8 +167,9 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
             res_index++;
         }
 
-        for (auto const& item: b.reference_filter_results) {
-            result.reference_filter_results[item.first][res_index - 1] = item.second[indexB];
+        if (b.coll_to_references != nullptr) {
+            auto &ref = result.coll_to_references[res_index - 1];
+            ref.insert(b.coll_to_references[indexB].begin(), b.coll_to_references[indexB].end());
         }
 
         indexB++;
@@ -160,39 +177,78 @@ void filter_result_t::or_filter_results(const filter_result_t& a, const filter_r
 
     result.count = res_index;
 
+    if (res_index == lenA + lenB) {
+        return;
+    }
+
     // shrink fit
     auto out = new uint32_t[res_index];
     memcpy(out, result.docs, res_index * sizeof(uint32_t));
     delete[] result.docs;
     result.docs = out;
 
-    for (auto &item: result.reference_filter_results) {
-        auto out_references = new reference_filter_result_t[res_index];
-
-        for (uint32_t i = 0; i < result.count; i++) {
-            out_references[i] = item.second[i];
-        }
-        delete[] item.second;
-        item.second = out_references;
+    if (result.coll_to_references == nullptr) {
+        return;
     }
+
+    auto out_references = new std::map<std::string, reference_filter_result_t>[res_index] {};
+    for (uint32_t i = 0; i < res_index; i++) {
+        auto& ref = out_references[i];
+        ref.insert(result.coll_to_references[i].begin(), result.coll_to_references[i].end());
+    }
+
+    delete[] result.coll_to_references;
+    result.coll_to_references = out_references;
 }
 
 void filter_result_iterator_t::and_filter_iterators() {
-    while (left_it->is_valid && right_it->is_valid) {
-        while (left_it->seq_id < right_it->seq_id) {
-            left_it->skip_to(right_it->seq_id);
-            if (!left_it->is_valid) {
-                is_valid = false;
+    while (left_it->validity && right_it->validity) {
+        if (left_it->seq_id < right_it->seq_id) {
+            auto const& left_validity = left_it->is_valid(right_it->seq_id);
+
+            if (left_validity == 1) {
+                seq_id = right_it->seq_id;
+
+                reference.clear();
+                for (const auto& item: left_it->reference) {
+                    reference[item.first] = item.second;
+                }
+                for (const auto& item: right_it->reference) {
+                    reference[item.first] = item.second;
+                }
+
+                return;
+            }
+
+            if (left_validity == -1) {
+                validity = invalid;
                 return;
             }
         }
 
-        while (left_it->seq_id > right_it->seq_id) {
-            right_it->skip_to(left_it->seq_id);
-            if (!right_it->is_valid) {
-                is_valid = false;
+        if (left_it->seq_id > right_it->seq_id) {
+            auto const& right_validity = right_it->is_valid(left_it->seq_id);
+
+            if (right_validity == 1) {
+                seq_id = left_it->seq_id;
+
+                reference.clear();
+                for (const auto& item: left_it->reference) {
+                    reference[item.first] = item.second;
+                }
+                for (const auto& item: right_it->reference) {
+                    reference[item.first] = item.second;
+                }
+
                 return;
             }
+
+            if (right_validity == -1) {
+                validity = invalid;
+                return;
+            }
+
+            continue;
         }
 
         if (left_it->seq_id == right_it->seq_id) {
@@ -210,11 +266,11 @@ void filter_result_iterator_t::and_filter_iterators() {
         }
     }
 
-    is_valid = false;
+    validity = invalid;
 }
 
 void filter_result_iterator_t::or_filter_iterators() {
-    if (left_it->is_valid && right_it->is_valid) {
+    if (left_it->validity && right_it->validity) {
         if (left_it->seq_id < right_it->seq_id) {
             seq_id = left_it->seq_id;
             reference.clear();
@@ -250,7 +306,7 @@ void filter_result_iterator_t::or_filter_iterators() {
         return;
     }
 
-    if (left_it->is_valid) {
+    if (left_it->validity) {
         seq_id = left_it->seq_id;
         reference.clear();
 
@@ -261,7 +317,7 @@ void filter_result_iterator_t::or_filter_iterators() {
         return;
     }
 
-    if (right_it->is_valid) {
+    if (right_it->validity) {
         seq_id = right_it->seq_id;
         reference.clear();
 
@@ -272,7 +328,7 @@ void filter_result_iterator_t::or_filter_iterators() {
         return;
     }
 
-    is_valid = false;
+    validity = invalid;
 }
 
 void filter_result_iterator_t::advance_string_filter_token_iterators() {
@@ -390,28 +446,34 @@ void filter_result_iterator_t::get_string_filter_next_match(const bool& field_is
     }
 
     if (one_is_valid) {
-        seq_id = lowest_id;
+        equals_iterator_id = seq_id = lowest_id;
     }
 
-    is_valid = one_is_valid;
+    is_equals_iterator_valid = one_is_valid;
+    validity = one_is_valid || is_not_equals_iterator ? valid : invalid;
 }
 
 void filter_result_iterator_t::next() {
-    if (!is_valid) {
+    if (validity != valid) {
         return;
     }
 
-    // No need to traverse iterator tree if there's only one filter or compute_result() has been called.
+    if (timeout_info != nullptr && is_timed_out()) {
+        return;
+    }
+
+    // No need to traverse iterator tree if there's only one filter or compute_iterators() has been called.
     if (is_filter_result_initialized) {
         if (++result_index >= filter_result.count) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
         seq_id = filter_result.docs[result_index];
         reference.clear();
-        for (auto const& item: filter_result.reference_filter_results) {
-            reference[item.first] = item.second[result_index];
+        if (filter_result.coll_to_references != nullptr) {
+            auto& ref = filter_result.coll_to_references[result_index];
+            reference.insert(ref.begin(), ref.end());
         }
 
         return;
@@ -429,7 +491,7 @@ void filter_result_iterator_t::next() {
                 right_it->next();
             } else if (left_it->seq_id == seq_id) {
                 left_it->next();
-            } else {
+            } else if (right_it->seq_id == seq_id) {
                 right_it->next();
             }
 
@@ -442,45 +504,28 @@ void filter_result_iterator_t::next() {
     const filter a_filter = filter_node->filter_exp;
 
     if (!index->field_is_indexed(a_filter.field_name)) {
-        is_valid = false;
+        validity = invalid;
         return;
     }
 
     field f = index->search_schema.at(a_filter.field_name);
 
-    if (f.is_string()) {
-        if (filter_node->filter_exp.apply_not_equals) {
-            if (++seq_id < result_index) {
-                return;
-            }
+    if (is_not_equals_iterator) {
+        return;
+    }
 
-            uint32_t previous_match;
-            do {
-                previous_match = seq_id;
-                advance_string_filter_token_iterators();
-                get_string_filter_next_match(f.is_array());
-            } while (is_valid && previous_match + 1 == seq_id);
-
-            if (!is_valid) {
-                // We've reached the end of the index, no possible matches pending.
-                if (previous_match >= index->seq_ids->last_id()) {
-                    return;
-                }
-
-                is_valid = true;
-                result_index = index->seq_ids->last_id() + 1;
-                seq_id = previous_match + 1;
-                return;
-            }
-
-            result_index = seq_id;
-            seq_id = previous_match + 1;
+    if (f.is_bool()) {
+        bool_iterator.next();
+        if (!bool_iterator.is_valid) {
+            validity = invalid;
             return;
         }
 
+        seq_id = bool_iterator.seq_id;
+        return;
+    } else if (f.is_string()) {
         advance_string_filter_token_iterators();
         get_string_filter_next_match(f.is_array());
-
         return;
     }
 }
@@ -520,50 +565,6 @@ void apply_not_equals(uint32_t*&& all_ids,
     result_ids_len = to_include_ids_len;
 }
 
-void filter_result_iterator_t::get_string_filter_first_match(const bool& field_is_array) {
-    get_string_filter_next_match(field_is_array);
-
-    if (filter_node->filter_exp.apply_not_equals) {
-        // filter didn't match any id. So by applying not equals, every id in the index is a match.
-        if (!is_valid) {
-            is_valid = true;
-            seq_id = 0;
-            result_index = index->seq_ids->last_id() + 1;
-            return;
-        }
-
-        // [0, seq_id) are a match for not equals.
-        if (seq_id > 0) {
-            result_index = seq_id;
-            seq_id = 0;
-            return;
-        }
-
-        // Keep ignoring the consecutive matches.
-        uint32_t previous_match;
-        do {
-            previous_match = seq_id;
-            advance_string_filter_token_iterators();
-            get_string_filter_next_match(field_is_array);
-        } while (is_valid && previous_match + 1 == seq_id);
-
-        if (!is_valid) {
-            // filter matched all the ids in the index. So for not equals, there's no match.
-            if (previous_match >= index->seq_ids->last_id()) {
-                return;
-            }
-
-            is_valid = true;
-            result_index = index->seq_ids->last_id() + 1;
-            seq_id = previous_match + 1;
-            return;
-        }
-
-        result_index = seq_id;
-        seq_id = previous_match + 1;
-    }
-}
-
 void filter_result_iterator_t::init() {
     if (filter_node == nullptr) {
         return;
@@ -578,7 +579,7 @@ void filter_result_iterator_t::init() {
             approx_filter_ids_length = std::max(left_it->approx_filter_ids_length, right_it->approx_filter_ids_length);
         }
 
-        // Rearranging the subtree in hope to reduce computation if/when compute_result() is called.
+        // Rearranging the subtree in hope to reduce computation if/when compute_iterators() is called.
         if (left_it->approx_filter_ids_length > right_it->approx_filter_ids_length) {
             std::swap(left_it, right_it);
         }
@@ -592,41 +593,77 @@ void filter_result_iterator_t::init() {
     if (is_referenced_filter) {
         // Apply filter on referenced collection and get the sequence ids of current collection from the filtered documents.
         auto& cm = CollectionManager::get_instance();
-        auto const& ref_collection_name = a_filter.referenced_collection_name;
+        auto ref_collection_name = a_filter.referenced_collection_name;
         auto ref_collection = cm.get_collection(ref_collection_name);
         if (ref_collection == nullptr) {
             status = Option<bool>(400, "Referenced collection `" + ref_collection_name + "` not found.");
-            is_valid = false;
+            validity = invalid;
             return;
         }
+        // `CollectionManager::get_collection` accounts for collection alias being used and provides pointer to the
+        // original collection.
+        ref_collection_name = ref_collection->name;
 
         auto coll = cm.get_collection(collection_name);
-        if (coll->referenced_in.count(ref_collection_name) == 0 || coll->referenced_in.at(ref_collection_name).empty()) {
-            status = Option<bool>(400, "Could not find a reference to `" + collection_name + "` in `" +
-                                        ref_collection_name + "` collection.");
-            is_valid = false;
+        bool is_referenced = coll->referenced_in.count(ref_collection_name) > 0,
+                has_reference = ref_collection->is_referenced_in(collection_name);
+        if (!is_referenced && !has_reference) {
+            status = Option<bool>(400, "Failed to join on `" + ref_collection_name + "`: No reference field found.");
+            validity = invalid;
             return;
         }
 
-        auto const& field_name = coll->referenced_in.at(ref_collection_name);
-        auto reference_filter_op = ref_collection->get_reference_filter_ids(a_filter.field_name,
-                                                                            filter_result,
-                                                                            field_name);
-        if (!reference_filter_op.ok()) {
-            status = Option<bool>(400, "Failed to apply reference filter on `" + a_filter.referenced_collection_name
-                                       + "` collection: " + reference_filter_op.error());
-            is_valid = false;
-            return;
+        if (is_referenced) {
+            auto const& field_name = coll->referenced_in.at(ref_collection_name);
+            auto reference_filter_op = ref_collection->get_reference_filter_ids(a_filter.field_name,
+                                                                                filter_result,
+                                                                                field_name);
+            if (!reference_filter_op.ok()) {
+                status = Option<bool>(400, "Failed to join on `" + a_filter.referenced_collection_name
+                                           + "` collection: " + reference_filter_op.error());
+                validity = invalid;
+                return;
+            }
+        } else if (has_reference) {
+            // Get the doc ids of reference collection matching the filter then apply filter on the current collection's
+            // reference helper field.
+            filter_result_t result;
+            auto reference_filter_op = ref_collection->get_filter_ids(a_filter.field_name, result);
+            if (!reference_filter_op.ok()) {
+                status = Option<bool>(400, "Failed to join on `" + a_filter.referenced_collection_name
+                                           + "` collection: " + reference_filter_op.error());
+                validity = invalid;
+                return;
+            }
+
+            auto get_reference_field_op = ref_collection->get_referenced_in_field_with_lock(collection_name);
+            if (!get_reference_field_op.ok()) {
+                status = Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
+                validity = invalid;
+                return;
+            }
+
+            auto const& reference_helper_field_name = get_reference_field_op.get();
+            auto op = index->do_filtering_with_reference_ids(reference_helper_field_name, ref_collection_name,
+                                                             std::move(result));
+            if (!op.ok()) {
+                status = Option<bool>(op.code(), op.error());
+                validity = invalid;
+                return;
+            }
+
+            filter_result = op.get();
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
         seq_id = filter_result.docs[result_index];
-        for (auto const& item: filter_result.reference_filter_results) {
-            reference[item.first] = item.second[result_index];
+        if (filter_result.coll_to_references != nullptr) {
+            auto& ref = filter_result.coll_to_references[result_index];
+            reference.insert(ref.begin(), ref.end());
         }
 
         is_filter_result_initialized = true;
@@ -653,7 +690,7 @@ void filter_result_iterator_t::init() {
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -665,7 +702,7 @@ void filter_result_iterator_t::init() {
 
     if (!index->field_is_indexed(a_filter.field_name)) {
         status = Option<bool>(400, "Cannot filter on non-indexed field `" + a_filter.field_name + "`.");
-        is_valid = false;
+        validity = invalid;
         return;
     }
 
@@ -736,7 +773,7 @@ void filter_result_iterator_t::init() {
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -811,7 +848,7 @@ void filter_result_iterator_t::init() {
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -848,6 +885,20 @@ void filter_result_iterator_t::init() {
         } else {
             auto num_tree = index->numerical_index.at(a_filter.field_name);
 
+            // For a boolean filter like `in_stock: true` that could match a large number of ids, we use bool_iterator.
+            if (a_filter.values.size() == 1 && a_filter.comparators[0] == EQUALS && !a_filter.apply_not_equals &&
+                num_tree->approx_search_count(EQUALS, (a_filter.values[0] == "1" ? 1 : 0)) > bool_filter_ids_threshold) {
+                bool_iterator = num_tree_t::iterator_t(num_tree, EQUALS, (a_filter.values[0] == "1" ? 1 : 0));
+                if (!bool_iterator.is_valid) {
+                    validity = invalid;
+                    return;
+                }
+
+                seq_id = bool_iterator.seq_id;
+                approx_filter_ids_length = bool_iterator.approx_filter_ids_length;
+                return;
+            }
+
             size_t value_index = 0;
             for (const std::string& filter_value : a_filter.values) {
                 int64_t bool_int64 = (filter_value == "1") ? 1 : 0;
@@ -872,7 +923,7 @@ void filter_result_iterator_t::init() {
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -921,7 +972,7 @@ void filter_result_iterator_t::init() {
                     status = Option<bool>(400, "Polygon" + (a_filter.values.size() > 1 ?
                                                                 " at position " + std::to_string(fi + 1) : "")
                                                                 + " is invalid: " + error.text());
-                    is_valid = false;
+                    validity = invalid;
                     return;
                 } else {
                     query_region = loop;
@@ -978,7 +1029,7 @@ void filter_result_iterator_t::init() {
             std::vector<uint32_t> exact_geo_result_ids;
 
             if (f.is_single_geopoint()) {
-                spp::sparse_hash_map<uint32_t, int64_t>* sort_field_index = index->sort_index.at(f.name);
+                auto sort_field_index = index->sort_index.at(f.name);
 
                 for (auto result_id : geo_result_ids) {
                     // no need to check for existence of `result_id` because of indexer based pre-filtering above
@@ -1023,7 +1074,7 @@ void filter_result_iterator_t::init() {
         }
 
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -1034,7 +1085,12 @@ void filter_result_iterator_t::init() {
     } else if (f.is_string()) {
         art_tree* t = index->search_index.at(a_filter.field_name);
 
-        for (const std::string& filter_value : a_filter.values) {
+        for (std::string filter_value : a_filter.values) {
+            auto is_prefix_match = filter_value.size() > 1 && filter_value[filter_value.size() - 1] == '*';
+            if (is_prefix_match) {
+                filter_value.erase(filter_value.size() - 1);
+            }
+
             std::vector<void*> raw_posting_lists;
 
             // there could be multiple tokens in a filter value, which we have to treat as ANDs
@@ -1044,6 +1100,7 @@ void filter_result_iterator_t::init() {
             std::string str_token;
             size_t token_index = 0;
             std::vector<std::string> str_tokens;
+            auto approx_filter_value_match = UINT32_MAX;
 
             while (tokenizer.next(str_token, token_index)) {
                 if (str_token.size() > 100) {
@@ -1051,14 +1108,102 @@ void filter_result_iterator_t::init() {
                 }
                 str_tokens.push_back(str_token);
 
+                if (is_prefix_match) {
+                    continue;
+                }
+
                 art_leaf* leaf = (art_leaf *) art_search(t, (const unsigned char*) str_token.c_str(),
                                                          str_token.length()+1);
                 if (leaf == nullptr) {
                     continue;
                 }
 
-                approx_filter_ids_length += posting_t::num_ids(leaf->values);
+                // Tokens of a filter value get AND.
+                approx_filter_value_match = std::min(posting_t::num_ids(leaf->values), approx_filter_value_match);
                 raw_posting_lists.push_back(leaf->values);
+            }
+
+            if (str_tokens.empty()) {
+                status = Option<bool>(400, "Error with filter field `" + f.name + "`: Filter value cannot be empty.");
+                validity = invalid;
+                return;
+            }
+
+            if (is_prefix_match) {
+                std::vector<search_field_t> fq_fields;
+                fq_fields.emplace_back(f.name, f.name, 1, 0, true, enable_t::off);
+
+                std::vector<token_t> value_tokens;
+                for (size_t i = 0; i < str_tokens.size(); i++) {
+                    value_tokens.emplace_back(i, str_tokens[i], false, str_tokens[i].size(), 0);
+                }
+                value_tokens.back().is_prefix_searched = true;
+
+                filter_result_iterator_t filter_result_it(nullptr, 0);
+                std::vector<sort_by> sort_fields;
+                std::vector<std::vector<art_leaf*>> searched_filters;
+                tsl::htrie_map<char, token_leaf> qtoken_set;
+                Topster* topster = nullptr;
+                spp::sparse_hash_map<uint64_t, uint32_t> groups_processed;
+                uint32_t* all_result_ids = nullptr;
+                size_t all_result_ids_len = 0;
+                std::vector<std::string> group_by_fields;
+                std::set<uint64> query_hashes;
+                size_t typo_tokens_threshold = 0;
+                size_t max_candidates = 4;
+                size_t min_len_1typo = 0;
+                size_t min_len_2typo = 0;
+                std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values{};
+                const std::vector<size_t> geopoint_indices;
+
+                auto fuzzy_search_fields_op = index->fuzzy_search_fields(fq_fields, value_tokens, {}, text_match_type_t::max_score,
+                                                                         nullptr, 0, &filter_result_it, {}, {}, sort_fields,
+                                                                         {0}, searched_filters, qtoken_set, topster,
+                                                                         groups_processed, all_result_ids, all_result_ids_len,
+                                                                         0, group_by_fields, false, false, false, false,
+                                                                         query_hashes, MAX_SCORE, {true}, typo_tokens_threshold,
+                                                                         false, max_candidates, min_len_1typo, min_len_2typo,
+                                                                         0, nullptr, field_values, geopoint_indices, "", false);
+                delete[] all_result_ids;
+                if(!fuzzy_search_fields_op.ok()) {
+                    continue;
+                }
+
+                // Searching for `Chris P.*` will return `Chris Parnell` and `Chris Pine`.
+                for (const auto& searched_filter_value: searched_filters) {
+                    raw_posting_lists.clear();
+                    approx_filter_value_match = UINT32_MAX;
+
+                    for (const auto& leaf: searched_filter_value) {
+                        if (leaf == nullptr) {
+                            continue;
+                        }
+
+                        // Tokens of a filter value get AND.
+                        approx_filter_value_match = std::min(posting_t::num_ids(leaf->values), approx_filter_value_match);
+                        raw_posting_lists.push_back(leaf->values);
+                    }
+
+                    if (raw_posting_lists.size() != str_tokens.size()) {
+                        continue;
+                    }
+
+                    std::vector<posting_list_t*> plists;
+                    posting_t::to_expanded_plists(raw_posting_lists, plists, expanded_plists);
+                    if (plists.empty()) {
+                        continue;
+                    }
+
+                    posting_lists.push_back(plists);
+                    posting_list_iterators.emplace_back(std::vector<posting_list_t::iterator_t>());
+                    for (auto const& plist: plists) {
+                        posting_list_iterators.back().push_back(plist->new_iterator());
+                    }
+
+                    // Multiple filter values get OR.
+                    approx_filter_ids_length += approx_filter_value_match;
+                }
+                continue;
             }
 
             if (raw_posting_lists.size() != str_tokens.size()) {
@@ -1067,55 +1212,65 @@ void filter_result_iterator_t::init() {
 
             std::vector<posting_list_t*> plists;
             posting_t::to_expanded_plists(raw_posting_lists, plists, expanded_plists);
+            if (plists.empty()) {
+                continue;
+            }
 
             posting_lists.push_back(plists);
             posting_list_iterators.emplace_back(std::vector<posting_list_t::iterator_t>());
             for (auto const& plist: plists) {
                 posting_list_iterators.back().push_back(plist->new_iterator());
             }
+
+            // Multiple filter values get OR.
+            approx_filter_ids_length += approx_filter_value_match;
         }
 
-        if (a_filter.apply_not_equals && approx_filter_ids_length == 0) {
-            approx_filter_ids_length = index->seq_ids->num_ids();
+        if (a_filter.values.size() > 10) {
+            compute_iterators();
+            return;
         }
 
-        get_string_filter_first_match(f.is_array());
+        if (a_filter.apply_not_equals) {
+            auto const& num_ids = index->seq_ids->num_ids();
+            approx_filter_ids_length = approx_filter_ids_length >= num_ids ? num_ids : (num_ids - approx_filter_ids_length);
+
+            if (approx_filter_ids_length < string_filter_ids_threshold) {
+                // Since there are very few matches, and we have to apply not equals, iteration will be inefficient.
+                compute_iterators();
+                return;
+            } else {
+                is_not_equals_iterator = true;
+            }
+        } else if (approx_filter_ids_length < string_filter_ids_threshold) {
+            compute_iterators();
+            return;
+        }
+
+        get_string_filter_next_match(f.is_array());
+        if (is_not_equals_iterator) {
+            seq_id = 0;
+            last_valid_id = index->seq_ids->last_id();
+        }
+
         return;
     }
 }
 
 void filter_result_iterator_t::skip_to(uint32_t id) {
-    if (!is_valid) {
-        return;
-    }
-
-    // No need to traverse iterator tree if there's only one filter or compute_result() has been called.
     if (is_filter_result_initialized) {
         ArrayUtils::skip_index_to_id(result_index, filter_result.docs, filter_result.count, id);
 
         if (result_index >= filter_result.count) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
         seq_id = filter_result.docs[result_index];
         reference.clear();
-        for (auto const& item: filter_result.reference_filter_results) {
-            reference[item.first] = item.second[result_index];
-        }
-
-        return;
-    }
-
-    if (filter_node->isOperator) {
-        // Skip the subtrees to id and then apply operators to arrive at the next valid doc.
-        left_it->skip_to(id);
-        right_it->skip_to(id);
-
-        if (filter_node->filter_operator == AND) {
-            and_filter_iterators();
-        } else {
-            or_filter_iterators();
+        if (filter_result.coll_to_references != nullptr) {
+            auto& ref = filter_result.coll_to_references[result_index];
+            reference.insert(ref.begin(), ref.end());
         }
 
         return;
@@ -1124,63 +1279,22 @@ void filter_result_iterator_t::skip_to(uint32_t id) {
     const filter a_filter = filter_node->filter_exp;
 
     if (!index->field_is_indexed(a_filter.field_name)) {
-        is_valid = false;
+        validity = invalid;
         return;
     }
 
     field f = index->search_schema.at(a_filter.field_name);
 
-    if (f.is_string()) {
-        if (filter_node->filter_exp.apply_not_equals) {
-            if (id < seq_id) {
-                return;
-            }
-
-            if (id < result_index) {
-                seq_id = id;
-                return;
-            }
-
-            seq_id = result_index;
-            uint32_t previous_match;
-
-            // Keep ignoring the found gaps till they cannot contain id.
-            do {
-                do {
-                    previous_match = seq_id;
-                    advance_string_filter_token_iterators();
-                    get_string_filter_next_match(f.is_array());
-                } while (is_valid && previous_match + 1 == seq_id);
-            } while (is_valid && seq_id <= id);
-
-            if (!is_valid) {
-                // filter matched all the ids in the index. So for not equals, there's no match.
-                if (previous_match >= index->seq_ids->last_id()) {
-                    return;
-                }
-
-                is_valid = true;
-                seq_id = previous_match + 1;
-                result_index = index->seq_ids->last_id() + 1;
-
-                // Skip to id, if possible.
-                if (seq_id < id && id < result_index) {
-                    seq_id = id;
-                }
-
-                return;
-            }
-
-            result_index = seq_id;
-            seq_id = previous_match + 1;
-
-            if (seq_id < id && id < result_index) {
-                seq_id = id;
-            }
-
+    if (f.is_bool()) {
+        bool_iterator.skip_to(id);
+        if (!bool_iterator.is_valid) {
+            validity = invalid;
             return;
         }
 
+        seq_id = bool_iterator.seq_id;
+        return;
+    } else if (f.is_string()) {
         // Skip all the token iterators and find a new match.
         for (auto& filter_value_tokens : posting_list_iterators) {
             for (auto& token: filter_value_tokens) {
@@ -1198,75 +1312,113 @@ void filter_result_iterator_t::skip_to(uint32_t id) {
     }
 }
 
-int filter_result_iterator_t::valid(uint32_t id) {
-    if (!is_valid) {
+int filter_result_iterator_t::is_valid(uint32_t id, const bool& override_timeout) {
+    if (validity == invalid || (!override_timeout && timeout_info != nullptr && is_timed_out())) {
         return -1;
     }
 
-    // No need to traverse iterator tree if there's only one filter or compute_result() has been called.
+    // No need to traverse iterator tree if there's only one filter or compute_iterators() has been called.
     if (is_filter_result_initialized) {
         skip_to(id);
-        return is_valid ? (seq_id == id ? 1 : 0) : -1;
+        return validity ? (seq_id == id ? 1 : 0) : -1;
     }
 
     if (filter_node->isOperator) {
-        auto left_valid = left_it->valid(id), right_valid = right_it->valid(id);
+        // We only need to consider only valid/invalid state since child nodes can never time out.
+        auto left_validity = left_it->is_valid(id), right_validity = right_it->is_valid(id);
 
         if (filter_node->filter_operator == AND) {
-            is_valid = left_it->is_valid && right_it->is_valid;
+            validity = (left_it->validity == valid && right_it->validity == valid) ? valid : invalid;
 
-            if (left_valid < 1 || right_valid < 1) {
-                if (left_valid == -1 || right_valid == -1) {
+            if (left_validity < 1 || right_validity < 1) {
+                if (left_validity == -1 || right_validity == -1) {
                     return -1;
                 }
 
-                // id did not match the filter but both of the sub-iterators are still valid.
-                // Updating seq_id to the next potential match.
-                if (left_valid == 0 && right_valid == 0) {
-                    seq_id = std::max(left_it->seq_id, right_it->seq_id);
-                } else if (left_valid == 0) {
-                    seq_id = left_it->seq_id;
-                } else {
-                    seq_id = right_it->seq_id;
-                }
-
+                seq_id = std::max(left_it->seq_id, right_it->seq_id);
                 return 0;
             }
 
             seq_id = id;
+
+            reference.clear();
+            for (const auto& item: left_it->reference) {
+                reference[item.first] = item.second;
+            }
+            for (const auto& item: right_it->reference) {
+                reference[item.first] = item.second;
+            }
             return 1;
         } else {
-            is_valid = left_it->is_valid || right_it->is_valid;
+            validity = (left_it->validity == valid || right_it->validity == valid) ? valid : invalid;
 
-            if (left_valid < 1 && right_valid < 1) {
-                if (left_valid == -1 && right_valid == -1) {
+            if (left_validity < 1 && right_validity < 1) {
+                if (left_validity == -1 && right_validity == -1) {
                     return -1;
-                }
-
-                // id did not match the filter; both of the sub-iterators or one of them might be valid.
-                // Updating seq_id to the next match.
-                if (left_valid == 0 && right_valid == 0) {
-                    seq_id = std::min(left_it->seq_id, right_it->seq_id);
-                } else if (left_valid == 0) {
-                    seq_id = left_it->seq_id;
-                } else {
+                } else if (left_validity == -1) {
                     seq_id = right_it->seq_id;
+                    return 0;
+                } else if (right_validity == -1) {
+                    seq_id = left_it->seq_id;
+                    return 0;
                 }
 
+                seq_id = std::min(left_it->seq_id, right_it->seq_id);
                 return 0;
             }
 
             seq_id = id;
+
+            reference.clear();
+            if (left_validity == 1) {
+                for (const auto& item: left_it->reference) {
+                    reference[item.first] = item.second;
+                }
+            }
+            if (right_validity == 1) {
+                for (const auto& item: right_it->reference) {
+                    reference[item.first] = item.second;
+                }
+            }
             return 1;
         }
     }
 
+    if (is_not_equals_iterator) {
+        if (id > last_valid_id) {
+            validity = invalid;
+            return -1;
+        }
+
+        validity = valid;
+        seq_id = id + 1;
+
+        if (!is_equals_iterator_valid || id < equals_iterator_id) {
+            return 1;
+        } else if (id == equals_iterator_id) {
+            return 0;
+        }
+    }
+
     skip_to(id);
-    return is_valid ? (seq_id == id ? 1 : 0) : -1;
+
+    if (is_not_equals_iterator) {
+        validity = valid;
+        seq_id = id + 1;
+
+        if (id == equals_iterator_id) {
+            return 0;
+        }
+        return 1;
+    }
+
+    return validity ? (seq_id == id ? 1 : 0) : -1;
 }
 
 Option<bool> filter_result_iterator_t::init_status() {
-    if (filter_node != nullptr && filter_node->isOperator) {
+    if (is_filter_result_initialized) {
+        return status;
+    } else if (filter_node != nullptr && filter_node->isOperator) {
         auto left_status = left_it->init_status();
 
         return !left_status.ok() ? left_status : right_it->init_status();
@@ -1276,40 +1428,66 @@ Option<bool> filter_result_iterator_t::init_status() {
 }
 
 bool filter_result_iterator_t::contains_atleast_one(const void *obj) {
+    if (validity != valid) {
+        return false;
+    }
+
     if(IS_COMPACT_POSTING(obj)) {
         compact_posting_list_t* list = COMPACT_POSTING_PTR(obj);
+        if (list->length == 0) {
+            return false;
+        }
 
         size_t i = 0;
-        while(i < list->length && is_valid) {
-            size_t num_existing_offsets = list->id_offsets[i];
-            size_t existing_id = list->id_offsets[i + num_existing_offsets + 1];
+        size_t num_existing_offsets = list->id_offsets[i];
+        size_t existing_id = list->id_offsets[i + num_existing_offsets + 1];
 
-            if (existing_id == seq_id) {
-                return true;
-            }
-
-            // advance smallest value
+        while (true) {
             if (existing_id < seq_id) {
                 i += num_existing_offsets + 2;
+
+                if (i >= list->length) {
+                    return false;
+                }
+
+                num_existing_offsets = list->id_offsets[i];
+                existing_id = list->id_offsets[i + num_existing_offsets + 1];
+            } else if (existing_id > seq_id) {
+                auto const& result = is_valid(existing_id);
+
+                if (result == 1) {
+                    return true;
+                } else if (result == -1) {
+                    return false;
+                }
             } else {
-                skip_to(existing_id);
+                return true;
             }
         }
     } else {
         auto list = (posting_list_t*)(obj);
         posting_list_t::iterator_t it = list->new_iterator();
+        if (!it.valid()) {
+            return false;
+        }
 
-        while(it.valid() && is_valid) {
-            uint32_t id = it.id();
-
-            if(id == seq_id) {
-                return true;
-            }
-
-            if(id < seq_id) {
+        while (true) {
+            if (it.id() < seq_id) {
                 it.skip_to(seq_id);
+
+                if (!it.valid()) {
+                    return false;
+                }
+            } else if (it.id() > seq_id) {
+                auto const& result = is_valid(it.id());
+
+                if (result == 1) {
+                    return true;
+                } else if (result == -1) {
+                    return false;
+                }
             } else {
-                skip_to(id);
+                return true;
             }
         }
     }
@@ -1317,15 +1495,19 @@ bool filter_result_iterator_t::contains_atleast_one(const void *obj) {
     return false;
 }
 
-void filter_result_iterator_t::reset() {
+void filter_result_iterator_t::reset(const bool& override_timeout) {
     if (filter_node == nullptr) {
         return;
     }
 
-    // No need to traverse iterator tree if there's only one filter or compute_result() has been called.
+    if (!override_timeout && timeout_info != nullptr && is_timed_out()) {
+        return;
+    }
+
+    // No need to traverse iterator tree if there's only one filter or compute_iterators() has been called.
     if (is_filter_result_initialized) {
         if (filter_result.count == 0) {
-            is_valid = false;
+            validity = invalid;
             return;
         }
 
@@ -1333,11 +1515,12 @@ void filter_result_iterator_t::reset() {
         seq_id = filter_result.docs[result_index];
 
         reference.clear();
-        for (auto const& item: filter_result.reference_filter_results) {
-            reference[item.first] = item.second[result_index];
+        if (filter_result.coll_to_references != nullptr) {
+            auto& ref = filter_result.coll_to_references[result_index];
+            reference.insert(ref.begin(), ref.end());
         }
 
-        is_valid = true;
+        validity = valid;
         return;
     }
 
@@ -1345,7 +1528,7 @@ void filter_result_iterator_t::reset() {
         // Reset the subtrees then apply operators to arrive at the first valid doc.
         left_it->reset();
         right_it->reset();
-        is_valid = true;
+        validity = valid;
 
         if (filter_node->filter_operator == AND) {
             and_filter_iterators();
@@ -1364,7 +1547,18 @@ void filter_result_iterator_t::reset() {
 
     field f = index->search_schema.at(a_filter.field_name);
 
-    if (f.is_string()) {
+    if (f.is_bool()) {
+        auto num_tree = index->numerical_index.at(a_filter.field_name);
+        bool_iterator = num_tree_t::iterator_t(num_tree, EQUALS, (a_filter.values[0] == "1" ? 1 : 0));
+        if (!bool_iterator.is_valid) {
+            validity = invalid;
+            return;
+        }
+
+        seq_id = bool_iterator.seq_id;
+        validity = valid;
+        return;
+    } else if (f.is_string()) {
         for (uint32_t i = 0; i < posting_lists.size(); i++) {
             auto const& plists = posting_lists[i];
 
@@ -1374,36 +1568,27 @@ void filter_result_iterator_t::reset() {
             }
         }
 
-        get_string_filter_first_match(f.is_array());
+        get_string_filter_next_match(f.is_array());
+        if (is_not_equals_iterator) {
+            seq_id = 0;
+        }
+
         return;
     }
 }
 
 uint32_t filter_result_iterator_t::to_filter_id_array(uint32_t*& filter_array) {
-    if (!is_valid) {
+    if (!is_filter_result_initialized) {
         return 0;
     }
 
-    if (is_filter_result_initialized) {
-        filter_array = new uint32_t[filter_result.count];
-        std::copy(filter_result.docs, filter_result.docs + filter_result.count, filter_array);
-        return filter_result.count;
-    }
-
-    std::vector<uint32_t> filter_ids;
-    do {
-        filter_ids.push_back(seq_id);
-        next();
-    } while (is_valid);
-
-    filter_array = new uint32_t[filter_ids.size()];
-    std::copy(filter_ids.begin(), filter_ids.end(), filter_array);
-
-    return filter_ids.size();
+    filter_array = new uint32_t[filter_result.count];
+    std::copy(filter_result.docs, filter_result.docs + filter_result.count, filter_array);
+    return filter_result.count;
 }
 
 uint32_t filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t& lenA, uint32_t*& results) {
-    if (!is_valid) {
+    if (validity != valid) {
         return 0;
     }
 
@@ -1413,14 +1598,13 @@ uint32_t filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t&
 
     std::vector<uint32_t> filter_ids;
     for (uint32_t i = 0; i < lenA; i++) {
-        auto result = valid(A[i]);
-
-        if (result == -1) {
-            break;
-        }
+        auto const& id = A[i];
+        auto const& result = is_valid(id);
 
         if (result == 1) {
-            filter_ids.push_back(A[i]);
+            filter_ids.push_back(id);
+        } else if (result == -1) {
+            break;
         }
     }
 
@@ -1435,11 +1619,11 @@ uint32_t filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t&
 }
 
 void filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t& lenA, filter_result_t& result) {
-    if (!is_valid) {
+    if (validity != valid) {
         return;
     }
 
-    if (filter_result.reference_filter_results.empty()) {
+    if (filter_result.coll_to_references == nullptr) {
         if (is_filter_result_initialized) {
             result.count = ArrayUtils::and_scalar(A, lenA, filter_result.docs, filter_result.count, &result.docs);
             return;
@@ -1447,14 +1631,13 @@ void filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t& len
 
         std::vector<uint32_t> filter_ids;
         for (uint32_t i = 0; i < lenA; i++) {
-            auto _result = valid(A[i]);
-
-            if (_result == -1) {
-                break;
-            }
+            auto const& id = A[i];
+            auto const& _result = is_valid(id);
 
             if (_result == 1) {
-                filter_ids.push_back(A[i]);
+                filter_ids.push_back(id);
+            } else if (_result == -1) {
+                break;
             }
         }
 
@@ -1469,56 +1652,68 @@ void filter_result_iterator_t::and_scalar(const uint32_t* A, const uint32_t& len
     }
 
     if (!is_filter_result_initialized) {
-        compute_result();
+        compute_iterators();
     }
 
     std::vector<uint32_t> match_indexes;
     for (uint32_t i = 0; i < lenA; i++) {
-        auto _result = valid(A[i]);
-
-        if (_result == -1) {
-            break;
-        }
+        auto _result = is_valid(A[i]);
 
         if (_result == 1) {
             match_indexes.push_back(result_index);
+        } else if (_result == -1) {
+            break;
         }
     }
 
     result.count = match_indexes.size();
     result.docs = new uint32_t[match_indexes.size()];
-    for (auto const& item: filter_result.reference_filter_results) {
-        result.reference_filter_results[item.first] = new reference_filter_result_t[match_indexes.size()];
-    }
+    result.coll_to_references = new std::map<std::string, reference_filter_result_t>[match_indexes.size()] {};
 
     for (uint32_t i = 0; i < match_indexes.size(); i++) {
         auto const& match_index = match_indexes[i];
         result.docs[i] = filter_result.docs[match_index];
-        for (auto const& item: filter_result.reference_filter_results) {
-            result.reference_filter_results[item.first][i] = item.second[match_index];
-        }
+
+        auto& result_reference = result.coll_to_references[i];
+        result_reference.insert(filter_result.coll_to_references[match_index].begin(),
+                                 filter_result.coll_to_references[match_index].end());
     }
 }
 
-filter_result_iterator_t::filter_result_iterator_t(const std::string collection_name, const Index *const index,
-                                                   const filter_node_t *const filter_node)  :
+filter_result_iterator_t::filter_result_iterator_t(const std::string& collection_name, const Index *const index,
+                                                   const filter_node_t *const filter_node,
+                                                   uint64_t search_begin, uint64_t search_stop)  :
         collection_name(collection_name),
         index(index),
         filter_node(filter_node) {
     if (filter_node == nullptr) {
-        is_valid = false;
+        validity = invalid;
         return;
+    }
+
+    // Only initialize timeout_info in the root node. We won't pass search_begin/search_stop parameters to the sub-nodes.
+    if (search_stop != UINT64_MAX) {
+        timeout_info = std::make_unique<filter_result_iterator_timeout_info>(search_begin, search_stop);
     }
 
     // Generate the iterator tree and then initialize each node.
     if (filter_node->isOperator) {
         left_it = new filter_result_iterator_t(collection_name, index, filter_node->left);
+        // If left subtree of && operator is invalid, we don't have to evaluate its right subtree.
+        if (filter_node->filter_operator == AND && left_it->validity == invalid) {
+            validity = invalid;
+            is_filter_result_initialized = true;
+            delete left_it;
+            left_it = nullptr;
+            return;
+        }
+
         right_it = new filter_result_iterator_t(collection_name, index, filter_node->right);
     }
 
     init();
 
-    if (!is_valid) {
+    if (!validity) {
         this->approx_filter_ids_length = 0;
     }
 }
@@ -1537,9 +1732,10 @@ filter_result_iterator_t::~filter_result_iterator_t() {
     delete right_it;
 }
 
-filter_result_iterator_t &filter_result_iterator_t::operator=(filter_result_iterator_t &&obj) noexcept {
-    if (&obj == this)
+filter_result_iterator_t& filter_result_iterator_t::operator=(filter_result_iterator_t&& obj) noexcept {
+    if (&obj == this) {
         return *this;
+    }
 
     // In case the filter was on string field.
     for(auto expanded_plist: expanded_plists) {
@@ -1565,7 +1761,7 @@ filter_result_iterator_t &filter_result_iterator_t::operator=(filter_result_iter
     posting_list_iterators = std::move(obj.posting_list_iterators);
     expanded_plists = std::move(obj.expanded_plists);
 
-    is_valid = obj.is_valid;
+    validity = obj.validity;
 
     seq_id = obj.seq_id;
     reference = std::move(obj.reference);
@@ -1577,39 +1773,75 @@ filter_result_iterator_t &filter_result_iterator_t::operator=(filter_result_iter
     return *this;
 }
 
-void filter_result_iterator_t::get_n_ids(const uint32_t& n, filter_result_t& result) {
+void filter_result_iterator_t::get_n_ids(const uint32_t& n, filter_result_t*& result, const bool& override_timeout) {
     if (!is_filter_result_initialized) {
         return;
     }
 
-    auto result_length = result.count = std::min(n, filter_result.count - result_index);
-    result.docs = new uint32_t[result_length];
-    for (const auto &item: filter_result.reference_filter_results) {
-        result.reference_filter_results[item.first] = new reference_filter_result_t[result_length];
-    }
-
-    for (uint32_t i = 0; i < result_length; i++, result_index++) {
-        result.docs[i] = filter_result.docs[result_index];
-        for (const auto &item: filter_result.reference_filter_results) {
-            result.reference_filter_results[item.first][i] = item.second[result_index];
+    if (override_timeout) {
+        result_index = 0;
+    } else if (timeout_info != nullptr) {
+        // In Index::search_wildcard number of calls to get_n_ids will be min(number of threads, filter match ids).
+        // Therefore, `timeout_info->function_call_counter` won't reach `function_call_modulo` if only incremented on
+        // function call.
+        if (n > function_call_modulo) {
+            timeout_info->function_call_counter = function_call_modulo - 1;
+        }
+        if (is_timed_out()) {
+            return;
         }
     }
 
-    is_valid = result_index < filter_result.count;
+    auto result_length = result->count = std::min(n, filter_result.count - result_index);
+    result->docs = new uint32_t[result_length];
+    if (filter_result.coll_to_references != nullptr) {
+        result->coll_to_references = new std::map<std::string, reference_filter_result_t>[result_length] {};
+    }
+
+    for (uint32_t i = 0; i < result_length; i++, result_index++) {
+        result->docs[i] = filter_result.docs[result_index];
+
+        if (filter_result.coll_to_references == nullptr) {
+            continue;
+        }
+
+        auto& result_reference = result->coll_to_references[i];
+        // Moving references since get_n_ids is only called in wildcard search flow and filter_result_iterator is
+        // not used afterwards.
+        result_reference = std::move(filter_result.coll_to_references[result_index]);
+    }
+
+    if (!override_timeout) {
+        validity = result_index < filter_result.count ? valid : invalid;
+    }
 }
 
 void filter_result_iterator_t::get_n_ids(const uint32_t& n,
                                          uint32_t& excluded_result_index,
                                          uint32_t const* const excluded_result_ids, const size_t& excluded_result_ids_size,
-                                         filter_result_t& result) {
+                                         filter_result_t*& result, const bool& override_timeout) {
     if (excluded_result_ids == nullptr || excluded_result_ids_size == 0 ||
         excluded_result_index >= excluded_result_ids_size) {
-        return get_n_ids(n, result);
+        return get_n_ids(n, result, override_timeout);
     }
 
-    // This method is only called in Index::search_wildcard after filter_result_iterator_t::compute_result.
+    // This method is only called in Index::search_wildcard after filter_result_iterator_t::compute_iterators.
     if (!is_filter_result_initialized) {
         return;
+    }
+
+    if (override_timeout) {
+        result_index = 0;
+    } else if (timeout_info != nullptr) {
+        // In Index::search_wildcard number of calls to get_n_ids will be min(number of threads, filter match ids).
+        // Therefore, `timeout_info->function_call_counter` won't reach `function_call_modulo` if only incremented on
+        // function call.
+        if (n > function_call_modulo) {
+            timeout_info->function_call_counter = function_call_modulo - 1;
+        }
+        if (is_timed_out()) {
+            return;
+        }
     }
 
     std::vector<uint32_t> match_indexes;
@@ -1622,21 +1854,29 @@ void filter_result_iterator_t::get_n_ids(const uint32_t& n,
         }
     }
 
-    result.count = match_indexes.size();
-    result.docs = new uint32_t[match_indexes.size()];
-    for (auto const& item: filter_result.reference_filter_results) {
-        result.reference_filter_results[item.first] = new reference_filter_result_t[match_indexes.size()];
+    result->count = match_indexes.size();
+    result->docs = new uint32_t[match_indexes.size()];
+    if (filter_result.coll_to_references != nullptr) {
+        result->coll_to_references = new std::map<std::string, reference_filter_result_t>[match_indexes.size()] {};
     }
 
     for (uint32_t i = 0; i < match_indexes.size(); i++) {
         auto const& match_index = match_indexes[i];
-        result.docs[i] = filter_result.docs[match_index];
-        for (auto const& item: filter_result.reference_filter_results) {
-            result.reference_filter_results[item.first][i] = item.second[match_index];
+        result->docs[i] = filter_result.docs[match_index];
+
+        if (filter_result.coll_to_references == nullptr) {
+            continue;
         }
+
+        auto& result_reference = result->coll_to_references[i];
+        // Moving references since get_n_ids is only called in wildcard search flow and filter_result_iterator is
+        // not used afterwards.
+        result_reference = std::move(filter_result.coll_to_references[match_index]);
     }
 
-    is_valid = result_index < filter_result.count;
+    if (!override_timeout) {
+        validity = result_index < filter_result.count ? valid : invalid;
+    }
 }
 
 filter_result_iterator_t::filter_result_iterator_t(uint32_t approx_filter_ids_length) :
@@ -1645,52 +1885,56 @@ filter_result_iterator_t::filter_result_iterator_t(uint32_t approx_filter_ids_le
     delete_filter_node = true;
 }
 
-filter_result_iterator_t::filter_result_iterator_t(uint32_t* ids, const uint32_t& ids_count) {
+filter_result_iterator_t::filter_result_iterator_t(uint32_t* ids, const uint32_t& ids_count,
+                                                   uint64_t search_begin, uint64_t search_stop) {
     filter_result.count = approx_filter_ids_length = ids_count;
     filter_result.docs = ids;
-    is_valid = ids_count > 0;
+    validity = ids_count > 0 ? valid : invalid;
 
-    if (is_valid) {
+    if (validity) {
         seq_id = filter_result.docs[result_index];
         is_filter_result_initialized = true;
-        filter_node = new filter_node_t({"dummy", {}, {}});
+        filter_node = new filter_node_t(filter{"dummy", {}, {}});
         delete_filter_node = true;
-    }
-}
 
-void filter_result_iterator_t::add_phrase_ids(filter_result_iterator_t*& filter_result_iterator,
-                                              uint32_t* phrase_result_ids, const uint32_t& phrase_result_count) {
-    auto root_iterator = new filter_result_iterator_t(std::min(phrase_result_count, filter_result_iterator->approx_filter_ids_length));
-    root_iterator->left_it = new filter_result_iterator_t(phrase_result_ids, phrase_result_count);
-    root_iterator->right_it = filter_result_iterator;
-
-    auto& left_it = root_iterator->left_it;
-    auto& right_it = root_iterator->right_it;
-
-    while (left_it->is_valid && right_it->is_valid && left_it->seq_id != right_it->seq_id) {
-        if (left_it->seq_id < right_it->seq_id) {
-            left_it->skip_to(right_it->seq_id);
-        } else {
-            right_it->skip_to(left_it->seq_id);
+        if (search_stop != UINT64_MAX) {
+            timeout_info = std::make_unique<filter_result_iterator_timeout_info>(search_begin, search_stop);
         }
     }
-
-    root_iterator->is_valid = left_it->is_valid && right_it->is_valid;
-    root_iterator->seq_id = left_it->seq_id;
-    filter_result_iterator = root_iterator;
 }
 
-void filter_result_iterator_t::compute_result() {
+void filter_result_iterator_t::add_phrase_ids(filter_result_iterator_t*& fit,
+                                              uint32_t* phrase_result_ids, const uint32_t& phrase_result_count) {
+    fit->reset();
+
+    auto root_iterator = new filter_result_iterator_t(std::min(phrase_result_count, fit->approx_filter_ids_length));
+    root_iterator->left_it = new filter_result_iterator_t(phrase_result_ids, phrase_result_count);
+    root_iterator->right_it = fit;
+    root_iterator->timeout_info = std::move(fit->timeout_info);
+
+    root_iterator->and_filter_iterators();
+
+    fit = root_iterator;
+}
+
+void filter_result_iterator_t::compute_iterators() {
     if (filter_node == nullptr) {
-        is_valid = false;
+        validity = invalid;
         is_filter_result_initialized = false;
-        LOG(ERROR) << "filter_node is null";
+        return;
+    }
+
+    if (timeout_info != nullptr && is_timed_out()) {
+        return;
+    }
+
+    if (is_filter_result_initialized) {
         return;
     }
 
     if (filter_node->isOperator) {
-        left_it->compute_result();
-        right_it->compute_result();
+        left_it->compute_iterators();
+        right_it->compute_iterators();
 
         if (filter_node->filter_operator == AND) {
             filter_result_t::and_filter_results(left_it->filter_result, right_it->filter_result, filter_result);
@@ -1698,6 +1942,15 @@ void filter_result_iterator_t::compute_result() {
             filter_result_t::or_filter_results(left_it->filter_result, right_it->filter_result, filter_result);
         }
 
+        // In a complex filter query a sub-expression might not match any document while the full expression does match
+        // at least one document. If the full expression doesn't match any document, we return early in the search.
+        if (filter_result.count == 0) {
+            validity = invalid;
+            is_filter_result_initialized = true;
+            return;
+        }
+
+        result_index = 0;;
         seq_id = filter_result.docs[result_index];
         is_filter_result_initialized = true;
         approx_filter_ids_length = filter_result.count;
@@ -1710,67 +1963,86 @@ void filter_result_iterator_t::compute_result() {
         return;
     }
 
-    // Only string field filter needs to be evaluated.
-    if (is_filter_result_initialized || index->search_index.count(filter_node->filter_exp.field_name) == 0) {
+    if (index->search_schema.count(filter_node->filter_exp.field_name) == 0) {
         return;
     }
 
-    // Resetting posting_list_iterators.
-    for (uint32_t i = 0; i < posting_lists.size(); i++) {
-        auto const& plists = posting_lists[i];
+    const filter a_filter = filter_node->filter_exp;
+    field f = index->search_schema.at(a_filter.field_name);
 
-        posting_list_iterators[i].clear();
-        for (auto const& plist: plists) {
-            posting_list_iterators[i].push_back(plist->new_iterator());
-        }
-    }
+    if (f.is_bool()) {
+        auto num_tree = index->numerical_index.at(a_filter.field_name);
 
-    auto const& a_filter = filter_node->filter_exp;
-    auto const& f = index->search_schema.at(a_filter.field_name);
+        int64_t bool_int64 = (a_filter.values[0] == "1") ? 1 : 0;
+        size_t result_size = 0;
+        num_tree->search(a_filter.comparators[0], bool_int64, &filter_result.docs, result_size);
+        filter_result.count = result_size;
+    } else if (f.is_string()) {
+        // Resetting posting_list_iterators.
+        for (uint32_t i = 0; i < posting_lists.size(); i++) {
+            auto const& plists = posting_lists[i];
 
-    uint32_t* or_ids = nullptr;
-    size_t or_ids_size = 0;
-
-    // aggregates IDs across array of filter values and reduces excessive ORing
-    std::vector<uint32_t> f_id_buff;
-
-    for (uint32_t i = 0; i < posting_lists.size(); i++) {
-        auto& p_list = posting_lists[i];
-        if (a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS) {
-            // needs intersection + exact matching (unlike CONTAINS)
-            std::vector<uint32_t> result_id_vec;
-            posting_list_t::intersect(p_list, result_id_vec);
-
-            if (result_id_vec.empty()) {
-                continue;
-            }
-
-            // need to do exact match
-            uint32_t* exact_str_ids = new uint32_t[result_id_vec.size()];
-            size_t exact_str_ids_size = 0;
-            std::unique_ptr<uint32_t[]> exact_str_ids_guard(exact_str_ids);
-
-            posting_list_t::get_exact_matches(posting_list_iterators[i], f.is_array(),
-                                              result_id_vec.data(), result_id_vec.size(),
-                                              exact_str_ids, exact_str_ids_size);
-
-            if (exact_str_ids_size == 0) {
-                continue;
-            }
-
-            for (size_t ei = 0; ei < exact_str_ids_size; ei++) {
-                f_id_buff.push_back(exact_str_ids[ei]);
-            }
-        } else {
-            // CONTAINS
-            size_t before_size = f_id_buff.size();
-            posting_list_t::intersect(p_list, f_id_buff);
-            if (f_id_buff.size() == before_size) {
-                continue;
+            posting_list_iterators[i].clear();
+            for (auto const& plist: plists) {
+                posting_list_iterators[i].push_back(plist->new_iterator());
             }
         }
 
-        if (f_id_buff.size() > 100000 || a_filter.values.size() == 1) {
+        uint32_t* or_ids = nullptr;
+        size_t or_ids_size = 0;
+
+        // aggregates IDs across array of filter values and reduces excessive ORing
+        std::vector<uint32_t> f_id_buff;
+
+        for (uint32_t i = 0; i < posting_lists.size(); i++) {
+            auto& p_list = posting_lists[i];
+            if (a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS) {
+                // needs intersection + exact matching (unlike CONTAINS)
+                std::vector<uint32_t> result_id_vec;
+                posting_list_t::intersect(p_list, result_id_vec);
+
+                if (result_id_vec.empty()) {
+                    continue;
+                }
+
+                // need to do exact match
+                uint32_t* exact_str_ids = new uint32_t[result_id_vec.size()];
+                size_t exact_str_ids_size = 0;
+                std::unique_ptr<uint32_t[]> exact_str_ids_guard(exact_str_ids);
+
+                posting_list_t::get_exact_matches(posting_list_iterators[i], f.is_array(),
+                                                  result_id_vec.data(), result_id_vec.size(),
+                                                  exact_str_ids, exact_str_ids_size);
+
+                if (exact_str_ids_size == 0) {
+                    continue;
+                }
+
+                for (size_t ei = 0; ei < exact_str_ids_size; ei++) {
+                    f_id_buff.push_back(exact_str_ids[ei]);
+                }
+            } else {
+                // CONTAINS
+                size_t before_size = f_id_buff.size();
+                posting_list_t::intersect(p_list, f_id_buff);
+                if (f_id_buff.size() == before_size) {
+                    continue;
+                }
+            }
+
+            if (f_id_buff.size() > 100000 || a_filter.values.size() == 1) {
+                gfx::timsort(f_id_buff.begin(), f_id_buff.end());
+                f_id_buff.erase(std::unique( f_id_buff.begin(), f_id_buff.end() ), f_id_buff.end());
+
+                uint32_t* out = nullptr;
+                or_ids_size = ArrayUtils::or_scalar(or_ids, or_ids_size, f_id_buff.data(), f_id_buff.size(), &out);
+                delete[] or_ids;
+                or_ids = out;
+                std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
+            }
+        }
+
+        if (!f_id_buff.empty()) {
             gfx::timsort(f_id_buff.begin(), f_id_buff.end());
             f_id_buff.erase(std::unique( f_id_buff.begin(), f_id_buff.end() ), f_id_buff.end());
 
@@ -1780,28 +2052,17 @@ void filter_result_iterator_t::compute_result() {
             or_ids = out;
             std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
         }
-    }
 
-    if (!f_id_buff.empty()) {
-        gfx::timsort(f_id_buff.begin(), f_id_buff.end());
-        f_id_buff.erase(std::unique( f_id_buff.begin(), f_id_buff.end() ), f_id_buff.end());
+        filter_result.docs = or_ids;
+        filter_result.count = or_ids_size;
 
-        uint32_t* out = nullptr;
-        or_ids_size = ArrayUtils::or_scalar(or_ids, or_ids_size, f_id_buff.data(), f_id_buff.size(), &out);
-        delete[] or_ids;
-        or_ids = out;
-        std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
-    }
-
-    filter_result.docs = or_ids;
-    filter_result.count = or_ids_size;
-
-    if (a_filter.apply_not_equals) {
-        apply_not_equals(index->seq_ids->uncompress(), index->seq_ids->num_ids(), filter_result.docs, filter_result.count);
+        if (a_filter.apply_not_equals) {
+            apply_not_equals(index->seq_ids->uncompress(), index->seq_ids->num_ids(), filter_result.docs, filter_result.count);
+        }
     }
 
     if (filter_result.count == 0) {
-        is_valid = false;
+        validity = invalid;
         return;
     }
 
@@ -1810,3 +2071,18 @@ void filter_result_iterator_t::compute_result() {
     is_filter_result_initialized = true;
     approx_filter_ids_length = filter_result.count;
 }
+
+bool filter_result_iterator_t::is_timed_out() {
+    if (validity == timed_out ||
+        (++(timeout_info->function_call_counter) % function_call_modulo == 0 && (std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() - timeout_info->search_begin_us) > timeout_info->search_stop_us)) {
+        validity = timed_out;
+        return true;
+    }
+    return false;
+}
+
+filter_result_iterator_timeout_info::filter_result_iterator_timeout_info(uint64_t search_begin,
+                                                                         uint64_t search_stop) :
+                                                                         search_begin_us(search_begin),
+                                                                         search_stop_us(search_stop) {}

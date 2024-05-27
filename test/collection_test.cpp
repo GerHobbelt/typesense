@@ -8,7 +8,7 @@
 #include <collection_manager.h>
 #include <validator.h>
 #include "collection.h"
-#include "text_embedder_manager.h"
+#include "embedder_manager.h"
 #include "http_client.h"
 
 class CollectionTest : public ::testing::Test {
@@ -589,6 +589,17 @@ TEST_F(CollectionTest, WildcardQuery) {
     results_op = collection->search("the", {}, "", {}, sort_fields, {0}, 3, 1, FREQUENCY, {false});
     ASSERT_FALSE(results_op.ok());
     ASSERT_STREQ("No search fields specified for the query.", results_op.error().c_str());
+
+    Collection* empty_coll;
+    std::vector<field> fields = {field("title", field_types::STRING, false)};
+
+    empty_coll = collectionManager.get_collection("empty_coll").get();
+    if(empty_coll == nullptr) {
+        empty_coll = collectionManager.create_collection("empty_coll", 1, fields).get();
+    }
+    results = empty_coll->search("*", {}, "title:!= foo", {}, {}, {0}, 3, 1).get();
+    ASSERT_EQ(0, results["hits"].size());
+    ASSERT_EQ(0, results["found"]);
 }
 
 TEST_F(CollectionTest, PrefixSearching) {
@@ -3265,9 +3276,10 @@ TEST_F(CollectionTest, MultiFieldRelevance2) {
 
     ASSERT_EQ(2, results["found"].get<size_t>());
     ASSERT_EQ(2, results["hits"].size());
-
     ASSERT_STREQ("1", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("0", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     // changing weights to favor artist still favors title because it contains all tokens of the query
 
@@ -3278,7 +3290,9 @@ TEST_F(CollectionTest, MultiFieldRelevance2) {
                             "<mark>", "</mark>", {1, 4}).get();
 
     ASSERT_STREQ("1", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("0", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     // use same weights
 
@@ -3289,7 +3303,10 @@ TEST_F(CollectionTest, MultiFieldRelevance2) {
                             "<mark>", "</mark>", {1, 1}).get();
 
     ASSERT_STREQ("1", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("0", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
+
 
     // add weights to favor artist without all tokens in a query being found in a field
 
@@ -3300,7 +3317,9 @@ TEST_F(CollectionTest, MultiFieldRelevance2) {
                             "<mark>", "</mark>", {1, 4}).get();
 
     ASSERT_STREQ("0", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("1", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     collectionManager.drop_collection("coll1");
 }
@@ -3389,7 +3408,9 @@ TEST_F(CollectionTest, MultiFieldRelevance3) {
     ASSERT_EQ(2, results["hits"].size());
 
     ASSERT_STREQ("1", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("0", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(1, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     results = coll1->search("swift",
                             {"title", "artist"}, "", {}, {}, {0}, 10, 1, FREQUENCY,
@@ -3401,7 +3422,9 @@ TEST_F(CollectionTest, MultiFieldRelevance3) {
     ASSERT_EQ(2, results["hits"].size());
 
     ASSERT_STREQ("0", results["hits"][0]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_STREQ("1", results["hits"][1]["document"]["id"].get<std::string>().c_str());
+    ASSERT_EQ(0, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     collectionManager.drop_collection("coll1");
 }
@@ -4607,7 +4630,7 @@ TEST_F(CollectionTest, SemanticSearchTest) {
                             ]
                         })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4641,7 +4664,7 @@ TEST_F(CollectionTest, InvalidSemanticSearch) {
                             ]
                         })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     LOG(INFO) << "op.error(): " << op.error();
@@ -4670,7 +4693,7 @@ TEST_F(CollectionTest, HybridSearch) {
                             ]
                         })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4703,7 +4726,7 @@ TEST_F(CollectionTest, HybridSearch) {
 //                             ]
 //                         })"_json;
     
-//     TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+//     EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 //
 
 //     auto op = collectionManager.create_collection(schema);
@@ -4731,7 +4754,7 @@ TEST_F(CollectionTest, HybridSearchRankFusionTest) {
                             ]
                         })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4804,7 +4827,7 @@ TEST_F(CollectionTest, WildcardSearchWithEmbeddingField) {
                         ]
                     })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4819,7 +4842,7 @@ TEST_F(CollectionTest, WildcardSearchWithEmbeddingField) {
 TEST_F(CollectionTest, CreateModelDirIfNotExists) {
     system("mkdir -p /tmp/typesense_test/new_models_dir");
     system("rm -rf /tmp/typesense_test/new_models_dir");
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/new_models_dir");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/new_models_dir");
 
     // check if model dir is created
     ASSERT_TRUE(std::filesystem::exists("/tmp/typesense_test/new_models_dir"));
@@ -4834,7 +4857,7 @@ TEST_F(CollectionTest, EmbedStringArrayField) {
                     ]
                 })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4859,7 +4882,7 @@ TEST_F(CollectionTest, MissingFieldForEmbedding) {
                     ]
                 })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4883,7 +4906,7 @@ TEST_F(CollectionTest, WrongTypeInEmbedFrom) {
             ]
         })"_json;
 
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_FALSE(op.ok());
@@ -4899,7 +4922,7 @@ TEST_F(CollectionTest, WrongTypeForEmbedding) {
                 ]
             })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4922,7 +4945,7 @@ TEST_F(CollectionTest, WrongTypeOfElementForEmbeddingInStringArray) {
             ]
         })"_json;
 
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4945,7 +4968,7 @@ TEST_F(CollectionTest, UpdateEmbeddingsForUpdatedDocument) {
                     ]
                 })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -4998,7 +5021,7 @@ TEST_F(CollectionTest, CreateCollectionWithOpenAI) {
 
     auto api_key = std::string(std::getenv("api_key"));
     schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
 
@@ -5031,7 +5054,7 @@ TEST_F(CollectionTest, CreateOpenAIEmbeddingField) {
 
     auto api_key = std::string(std::getenv("api_key"));
     schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
     auto summary = op.get()->get_summary_json();
@@ -5062,7 +5085,7 @@ TEST_F(CollectionTest, HideOpenAIApiKey) {
 
     auto api_key = std::string(std::getenv("api_key"));
     schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
     auto summary = op.get()->get_summary_json();
@@ -5086,7 +5109,7 @@ TEST_F(CollectionTest, PrefixSearchDisabledForOpenAI) {
 
     auto api_key = std::string(std::getenv("api_key"));
     schema["fields"][1]["embed"]["model_config"]["api_key"] = api_key;
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
 
@@ -5118,7 +5141,7 @@ TEST_F(CollectionTest, MoreThanOneEmbeddingField) {
                 ]
             })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -5151,7 +5174,7 @@ TEST_F(CollectionTest, EmbeddingFieldEmptyArrayInDocument) {
                 ]
             })"_json;
     
-    TextEmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
 
     auto op = collectionManager.create_collection(schema);
     ASSERT_TRUE(op.ok());
@@ -5220,7 +5243,7 @@ TEST_F(CollectionTest, CatchPartialResponseFromRemoteEmbedding) {
         ]
     })"_json;
 
-    OpenAIEmbedder embedder("", "");
+    OpenAIEmbedder embedder("", "", 0, false, "");
 
     auto res = embedder.get_error_json(req_body, 200, partial_json);
 

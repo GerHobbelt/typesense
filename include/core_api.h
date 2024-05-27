@@ -9,6 +9,10 @@ bool handle_authentication(std::map<std::string, std::string>& req_params,
                            const std::string& body, const route_path& rpath,
                            const std::string& req_auth_key);
 
+void set_alter_in_progress(bool in_progress);
+
+bool get_alter_in_progress();
+
 // Collections
 
 bool get_collections(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
@@ -109,6 +113,8 @@ bool get_debug(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_
 
 bool get_health(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
+bool get_health_with_resource_usage(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
 bool post_health(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 bool get_metrics_json(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
@@ -174,6 +180,10 @@ void get_collections_for_auth(std::map<std::string, std::string>& req_params, co
 
 bool is_doc_import_route(uint64_t route_hash);
 
+bool is_coll_create_route(uint64_t route_hash);
+
+bool is_drop_collection_route(uint64_t route_hash);
+
 bool is_doc_write_route(uint64_t route_hash);
 
 bool is_doc_del_route(uint64_t route_hash);
@@ -184,3 +194,23 @@ void init_api(uint32_t cache_num_entries);
 
 
 bool post_proxy(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+
+bool get_conversations(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool put_conversation(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+
+bool post_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_conversation_models(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool put_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);

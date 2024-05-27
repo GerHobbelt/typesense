@@ -3,9 +3,19 @@
 #include <string>
 #include <map>
 #include <tsl/htrie_map.h>
-#include <art.h>
 #include <json.hpp>
 #include "store.h"
+
+enum NUM_COMPARATOR {
+    LESS_THAN,
+    LESS_THAN_EQUALS,
+    EQUALS,
+    NOT_EQUALS,
+    CONTAINS,
+    GREATER_THAN,
+    GREATER_THAN_EQUALS,
+    RANGE_INCLUSIVE
+};
 
 enum FILTER_OPERATOR {
     AND,
@@ -62,12 +72,15 @@ struct filter {
 
 struct filter_node_t {
     filter filter_exp;
-    FILTER_OPERATOR filter_operator;
-    bool isOperator;
+    FILTER_OPERATOR filter_operator = AND;
+    bool isOperator = false;
     filter_node_t* left = nullptr;
     filter_node_t* right = nullptr;
+    std::string filter_query;
 
-    filter_node_t(filter filter_exp)
+    filter_node_t() = default;
+
+    explicit filter_node_t(filter filter_exp)
             : filter_exp(std::move(filter_exp)),
               isOperator(false),
               left(nullptr),
@@ -84,5 +97,26 @@ struct filter_node_t {
     ~filter_node_t() {
         delete left;
         delete right;
+    }
+
+    filter_node_t& operator=(filter_node_t&& obj) noexcept {
+        if (&obj == this) {
+            return *this;
+        }
+
+        if (obj.isOperator) {
+            isOperator = true;
+            filter_operator = obj.filter_operator;
+            left = obj.left;
+            right = obj.right;
+
+            obj.left = nullptr;
+            obj.right = nullptr;
+        } else {
+            isOperator = false;
+            filter_exp = obj.filter_exp;
+        }
+
+        return *this;
     }
 };

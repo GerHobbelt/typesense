@@ -86,6 +86,7 @@ void master_server_routes() {
     server->get("/stats.json", get_stats_json);
     server->get("/debug", get_debug);
     server->get("/health", get_health);
+    server->get("/health_with_rusage", get_health_with_resource_usage);
     server->post("/health", post_health);
     server->get("/status", get_status);
 
@@ -94,6 +95,16 @@ void master_server_routes() {
     server->post("/operations/cache/clear", post_clear_cache, false, false);
     server->post("/operations/db/compact", post_compact_db, false, false);
     server->post("/operations/reset_peers", post_reset_peers, false, false);
+    
+    server->post("/conversations/models", post_conversation_model);
+    server->get("/conversations/models", get_conversation_models);
+    server->get("/conversations/models/:id", get_conversation_model);
+    server->del("/conversations/models/:id", del_conversation_model);
+
+    server->get("/conversations", get_conversations);
+    server->get("/conversations/:id", get_conversation);
+    server->del("/conversations/:id", del_conversation);
+    server->put("/conversations/:id", put_conversation);
 
     server->get("/limits", get_rate_limits);
     server->get("/limits/active", get_active_throttles);

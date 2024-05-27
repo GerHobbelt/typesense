@@ -5,8 +5,14 @@
 #include "filter.h"
 
 Option<bool> filter::validate_numerical_filter_value(field _field, const string &raw_value) {
-    if(_field.is_int32() && !StringUtils::is_int32_t(raw_value)) {
-        return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int32.");
+    if(_field.is_int32()) {
+        if (!StringUtils::is_integer(raw_value)) {
+            return Option<bool>(400, "Error with filter field `" + _field.name + "`: Not an int32.");
+        } else if (!StringUtils::is_int32_t(raw_value)) {
+            return Option<bool>(400, "Error with filter field `" + _field.name +
+                                                        "`: `" + raw_value + "` exceeds the range of an int32.");
+        }
+        return Option<bool>(true);
     }
 
     else if(_field.is_int64() && !StringUtils::is_int64_t(raw_value)) {
@@ -418,7 +424,11 @@ Option<bool> toFilter(const std::string expression,
         filter_exp = {field_name, {}, {}};
         NUM_COMPARATOR id_comparator = EQUALS;
         size_t filter_value_index = 0;
-        if (raw_value[0] == '=') {
+        if (raw_value == "*") { // Match all.
+            // NOT_EQUALS comparator with no id match will get all the ids.
+            id_comparator = NOT_EQUALS;
+            filter_exp.apply_not_equals = true;
+        } else if (raw_value[0] == '=') {
             id_comparator = EQUALS;
             while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
         } else if (raw_value.size() >= 2 && raw_value[0] == '!' && raw_value[1] == '=') {
@@ -603,13 +613,18 @@ Option<bool> toFilter(const std::string expression,
     } else if (_field.is_string()) {
         size_t filter_value_index = 0;
         NUM_COMPARATOR str_comparator = CONTAINS;
+        auto apply_not_equals = false;
         if (raw_value[0] == '=') {
             // string filter should be evaluated in strict "equals" mode
             str_comparator = EQUALS;
             while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        } else if (raw_value.size() >= 2 && raw_value[0] == '!' && raw_value[1] == '=') {
-            str_comparator = NOT_EQUALS;
-            filter_value_index++;
+        } else if (raw_value.size() >= 2 && raw_value[0] == '!') {
+            if (raw_value[1] == '=') {
+                str_comparator = NOT_EQUALS;
+                filter_value_index++;
+            }
+
+            apply_not_equals = true;
             while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
         }
         if (filter_value_index == raw_value.size()) {
@@ -620,12 +635,17 @@ Option<bool> toFilter(const std::string expression,
             std::vector<std::string> filter_values;
             StringUtils::split_to_values(
                     raw_value.substr(filter_value_index + 1, raw_value.size() - filter_value_index - 2), filter_values);
+            if (filter_values.empty()) {
+                return Option<bool>(400, "Error with filter field `" + _field.name +
+                                         "`: Filter value array cannot be empty.");
+            }
+
             filter_exp = {field_name, filter_values, {str_comparator}};
         } else {
             filter_exp = {field_name, {raw_value.substr(filter_value_index)}, {str_comparator}};
         }
 
-        filter_exp.apply_not_equals = (str_comparator == NOT_EQUALS);
+        filter_exp.apply_not_equals = apply_not_equals;
     } else {
         return Option<bool>(400, "Error with filter field `" + _field.name +
                                  "`: Unidentified field data type, see docs for supported data types.");
@@ -668,6 +688,7 @@ Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
             nodeStack.pop();
 
             filter_node = new filter_node_t(expression == "&&" ? AND : OR, operandA, operandB);
+            filter_node->filter_query = operandA->filter_query + " " + expression + " " + operandB->filter_query;
         } else {
             filter filter_exp;
 
@@ -697,6 +718,7 @@ Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
             }
 
             filter_node = new filter_node_t(filter_exp);
+            filter_node->filter_query = expression;
         }
 
         nodeStack.push(filter_node);
@@ -743,8 +765,9 @@ Option<bool> filter::parse_filter_query(const std::string& filter_query,
         return toPostfix_op;
     }
 
-    if (postfix.size() > 100) {
-        return Option<bool>(400, "`filter_by` has too many operations.");
+    auto const& max_ops = CollectionManager::get_instance().filter_by_max_ops;
+    if (postfix.size() > max_ops) {
+        return Option<bool>(400, "`filter_by` has too many operations. Maximum allowed: " + std::to_string(max_ops));
     }
 
     Option<bool> toParseTree_op = toParseTree(postfix,
@@ -756,5 +779,6 @@ Option<bool> filter::parse_filter_query(const std::string& filter_query,
         return toParseTree_op;
     }
 
+    root->filter_query = filter_query;
     return Option<bool>(true);
 }

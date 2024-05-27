@@ -9,6 +9,7 @@
 #include "logger.h"
 #include "magic_enum.hpp"
 #include "stopwords_manager.h"
+#include "conversation_model.h"
 #include "field.h"
 
 constexpr const size_t CollectionManager::DEFAULT_NUM_MEMORY_SHARDS;
@@ -20,7 +21,8 @@ CollectionManager::CollectionManager() {
 Collection* CollectionManager::init_collection(const nlohmann::json & collection_meta,
                                                const uint32_t collection_next_seq_id,
                                                Store* store,
-                                               float max_memory_ratio) {
+                                               float max_memory_ratio,
+                                               spp::sparse_hash_map<std::string, std::string>& referenced_in) {
     std::string this_collection_name = collection_meta[Collection::COLLECTION_NAME_KEY].get<std::string>();
 
     std::vector<field> fields;
@@ -69,6 +71,25 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
         if(field_obj.count(fields::model_config) == 0) {
             field_obj[fields::model_config] = nlohmann::json::object();
         }
+
+        if(field_obj.count(fields::hnsw_params) == 0) {
+            field_obj[fields::hnsw_params] = nlohmann::json::object();
+            field_obj[fields::hnsw_params]["ef_construction"] = 200;
+            field_obj[fields::hnsw_params]["M"] = 16;
+        }
+
+        if(field_obj.count(fields::stem) == 0) {
+            field_obj[fields::stem] = false;
+        }
+
+        if(field_obj.count(fields::range_index) == 0) {
+            field_obj[fields::range_index] = false;
+        }
+
+        if(field_obj.count(fields::store) == 0) {
+            field_obj[fields::store] = true;
+        }
+
         vector_distance_type_t vec_dist_type = vector_distance_type_t::cosine;
 
         if(field_obj.count(fields::vec_dist) != 0) {
@@ -82,7 +103,7 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
             size_t num_dim = 0;
             auto& model_config = field_obj[fields::embed][fields::model_config];
 
-            auto res = TextEmbedderManager::get_instance().validate_and_init_model(model_config, num_dim);
+            auto res = EmbedderManager::get_instance().validate_and_init_model(model_config, num_dim);
             if(!res.ok()) {
                 const std::string& model_name = model_config["model_name"].get<std::string>();
                 LOG(ERROR) << "Error initializing model: " << model_name << ", error: " << res.error();
@@ -96,7 +117,7 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
         field f(field_obj[fields::name], field_obj[fields::type], field_obj[fields::facet],
                 field_obj[fields::optional], field_obj[fields::index], field_obj[fields::locale],
                 -1, field_obj[fields::infix], field_obj[fields::nested], field_obj[fields::nested_array],
-                field_obj[fields::num_dim], vec_dist_type, field_obj[fields::reference], field_obj[fields::embed]);
+                field_obj[fields::num_dim], vec_dist_type, field_obj[fields::reference], field_obj[fields::embed], field_obj[fields::range_index], field_obj[fields::store], field_obj[fields::stem], field_obj[fields::hnsw_params]);
 
         // value of `sort` depends on field type
         if(field_obj.count(fields::sort) == 0) {
@@ -137,6 +158,30 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
     }
 
     LOG(INFO) << "Found collection " << this_collection_name << " with " << num_memory_shards << " memory shards.";
+    std::shared_ptr<VQModel> model = nullptr;
+    if(collection_meta.count(Collection::COLLECTION_VOICE_QUERY_MODEL) != 0) {
+        const nlohmann::json& voice_query_model = collection_meta[Collection::COLLECTION_VOICE_QUERY_MODEL];
+
+        if(!voice_query_model.is_object()) {
+            LOG(ERROR) << "Parameter `voice_query_model` must be an object.";
+        }
+
+        if(voice_query_model.count("model_name") == 0) {
+            LOG(ERROR) << "Parameter `voice_query_model.model_name` is missing.";
+        }
+
+        if(!voice_query_model["model_name"].is_string() || voice_query_model["model_name"].get<std::string>().empty()) {
+            LOG(ERROR) << "Parameter `voice_query_model.model_name` is invalid.";
+        }
+
+        std::string model_name = voice_query_model["model_name"].get<std::string>();
+        auto model_res = VQModelManager::get_instance().validate_and_init_model(model_name);
+        if(!model_res.ok()) {
+            LOG(ERROR) << "Error while loading voice query model: " << model_res.error();
+        } else {
+            model = model_res.get();
+        }
+    }
 
     Collection* collection = new Collection(this_collection_name,
                                             collection_meta[Collection::COLLECTION_ID_KEY].get<uint32_t>(),
@@ -149,7 +194,7 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
                                             fallback_field_type,
                                             symbols_to_index,
                                             token_separators,
-                                            enable_nested_fields);
+                                            enable_nested_fields, model, std::move(referenced_in));
 
     return collection;
 }
@@ -166,7 +211,7 @@ void CollectionManager::init(Store *store, ThreadPool* thread_pool,
                              const float max_memory_ratio,
                              const std::string & auth_key,
                              std::atomic<bool>& quit,
-                             BatchedIndexer* batch_indexer) {
+                             const uint16_t& filter_by_max_operations) {
     std::unique_lock lock(mutex);
 
     this->store = store;
@@ -174,14 +219,46 @@ void CollectionManager::init(Store *store, ThreadPool* thread_pool,
     this->bootstrap_auth_key = auth_key;
     this->max_memory_ratio = max_memory_ratio;
     this->quit = &quit;
-    this->batch_indexer = batch_indexer;
+    this->filter_by_max_ops = filter_by_max_operations;
 }
 
 // used only in tests!
 void CollectionManager::init(Store *store, const float max_memory_ratio, const std::string & auth_key,
-                             std::atomic<bool>& quit) {
+                             std::atomic<bool>& quit,
+                             const uint16_t& filter_by_max_operations) {
     ThreadPool* thread_pool = new ThreadPool(8);
-    init(store, thread_pool, max_memory_ratio, auth_key, quit, nullptr);
+    init(store, thread_pool, max_memory_ratio, auth_key, quit, filter_by_max_operations);
+}
+
+void CollectionManager::_populate_referenced_ins(const std::string& collection_meta_json,
+                                                 std::map<std::string, spp::sparse_hash_map<std::string, std::string>>& referenced_ins) {
+    auto const& obj = nlohmann::json::parse(collection_meta_json, nullptr, false);
+
+    if (!obj.is_discarded() && obj.is_object() && obj.contains("name") && obj["name"].is_string() &&
+        obj.contains("fields")) {
+        auto const& collection_name = obj["name"];
+
+        for (const auto &field: obj["fields"]) {
+            if (!field.contains("name") || !field.contains("reference")) {
+                continue;
+            }
+            auto field_name = std::string(field["name"]) + fields::REFERENCE_HELPER_FIELD_SUFFIX;
+            std::vector<std::string> split_result;
+            StringUtils::split(field["reference"], split_result, ".");
+            auto ref_coll_name = split_result.front();
+
+            // Resolves alias if used in schema.
+            auto actual_ref_coll_it = CollectionManager::get_instance().collection_symlinks.find(ref_coll_name);
+            if (actual_ref_coll_it != CollectionManager::get_instance().collection_symlinks.end()) {
+                ref_coll_name = actual_ref_coll_it->second;
+            }
+            if (referenced_ins.count(ref_coll_name) == 0) {
+                referenced_ins.emplace(ref_coll_name, spp::sparse_hash_map<std::string, std::string>());
+            }
+
+            referenced_ins[ref_coll_name].emplace(collection_name, field_name);
+        }
+    }
 }
 
 Option<bool> CollectionManager::load(const size_t collection_batch_size, const size_t document_batch_size) {
@@ -206,6 +283,22 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
         next_collection_id = 0;
     }
 
+    // load aliases
+
+    std::string symlink_prefix_key = std::string(SYMLINK_PREFIX) + "_";
+    std::string upper_bound_key = std::string(SYMLINK_PREFIX) + "`";  // cannot inline this
+    rocksdb::Slice upper_bound(upper_bound_key);
+
+    rocksdb::Iterator* iter = store->scan(symlink_prefix_key, &upper_bound);
+    while(iter->Valid() && iter->key().starts_with(symlink_prefix_key)) {
+        std::vector<std::string> parts;
+        StringUtils::split(iter->key().ToString(), parts, symlink_prefix_key);
+        LOG(INFO) << "Loading symlink " << parts[0] << " to " << iter->value().ToString();
+        collection_symlinks[parts[0]] = iter->value().ToString();
+        iter->Next();
+    }
+    delete iter;
+
     LOG(INFO) << "Loading upto " << collection_batch_size << " collections in parallel, "
               << document_batch_size << " documents at a time.";
 
@@ -219,11 +312,16 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
 
     ThreadPool loading_pool(collection_batch_size);
 
+    // Collection name -> Ref collection name -> Ref field name
+    std::map<std::string, spp::sparse_hash_map<std::string, std::string>> referenced_ins;
+    for (const auto &collection_meta_json: collection_meta_jsons) {
+        _populate_referenced_ins(collection_meta_json, referenced_ins);
+    }
+
     size_t num_processed = 0;
-    // Collection name -> Referenced in
-    std::map<std::string, std::set<reference_pair>> referenced_ins = {};
     std::mutex m_process;
     std::condition_variable cv_process;
+    std::string collection_name;
 
     for(size_t coll_index = 0; coll_index < num_collections; coll_index++) {
         const auto& collection_meta_json = collection_meta_jsons[coll_index];
@@ -233,13 +331,22 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
             return Option<bool>(500, "Error while parsing collection meta.");
         }
 
+        collection_name = collection_meta[Collection::COLLECTION_NAME_KEY].get<std::string>();
+
         auto captured_store = store;
         loading_pool.enqueue([captured_store, num_collections, collection_meta, document_batch_size,
                               &m_process, &cv_process, &num_processed, &next_coll_id_status, quit = quit,
-                              &referenced_ins]() {
+                                     &referenced_ins, collection_name]() {
+
+            spp::sparse_hash_map<std::string, std::string> referenced_in;
+            auto const& it = referenced_ins.find(collection_name);
+            if (it != referenced_ins.end()) {
+                referenced_in = it->second;
+            }
 
             //auto begin = std::chrono::high_resolution_clock::now();
-            Option<bool> res = load_collection(collection_meta, document_batch_size, next_coll_id_status, *quit);
+            Option<bool> res = load_collection(collection_meta, document_batch_size, next_coll_id_status, *quit,
+                                               referenced_in);
             /*long long int timeMillis =
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin).count();
             LOG(INFO) << "Time taken for indexing: " << timeMillis << "ms";*/
@@ -255,18 +362,6 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
             num_processed++;
 
             auto& cm = CollectionManager::get_instance();
-            auto const& collection_name = collection_meta.at("name");
-            auto collection = cm.get_collection(collection_name);
-            if (collection != nullptr) {
-                for (const auto &item: collection->get_reference_fields()) {
-                    auto const& ref_coll_name = item.second.collection;
-                    if (referenced_ins.count(ref_coll_name) == 0) {
-                        referenced_ins[ref_coll_name] = {};
-                    }
-                    auto const field_name = item.first + Collection::REFERENCE_HELPER_FIELD_SUFFIX;
-                    referenced_ins.at(ref_coll_name).insert(reference_pair{collection_name, field_name});
-                }
-            }
             cv_process.notify_one();
 
             size_t progress_modulo = std::max<size_t>(1, (num_collections / 10));  // every 10%
@@ -281,32 +376,6 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
     cv_process.wait(lock_process, [&](){
         return num_processed == num_collections;
     });
-
-    // Initialize references
-    for (const auto &item: referenced_ins) {
-        auto& cm = CollectionManager::get_instance();
-        auto collection = cm.get_collection(item.first);
-        if (collection != nullptr) {
-            for (const auto &reference_pair: item.second) {
-                collection->add_referenced_in(reference_pair);
-            }
-        }
-    }
-
-    // load aliases
-
-    std::string symlink_prefix_key = std::string(SYMLINK_PREFIX) + "_";
-    std::string upper_bound_key = std::string(SYMLINK_PREFIX) + "`";  // cannot inline this
-    rocksdb::Slice upper_bound(upper_bound_key);
-
-    rocksdb::Iterator* iter = store->scan(symlink_prefix_key, &upper_bound);
-    while(iter->Valid() && iter->key().starts_with(symlink_prefix_key)) {
-        std::vector<std::string> parts;
-        StringUtils::split(iter->key().ToString(), parts, symlink_prefix_key);
-        collection_symlinks[parts[0]] = iter->value().ToString();
-        iter->Next();
-    }
-    delete iter;
 
     // load presets
 
@@ -366,16 +435,6 @@ Option<bool> CollectionManager::load(const size_t collection_batch_size, const s
 
     loading_pool.shutdown();
 
-    LOG(INFO) << "Initializing batched indexer from snapshot state...";
-    if(batch_indexer != nullptr) {
-        std::string batched_indexer_state_str;
-        StoreStatus s = store->get(BATCHED_INDEXER_STATE_KEY, batched_indexer_state_str);
-        if(s == FOUND) {
-            nlohmann::json batch_indexer_state = nlohmann::json::parse(batched_indexer_state_str);
-            batch_indexer->load_state(batch_indexer_state);
-        }
-    }
-
     return Option<bool>(true);
 }
 
@@ -417,8 +476,9 @@ Option<Collection*> CollectionManager::create_collection(const std::string& name
                                                          const std::string& fallback_field_type,
                                                          const std::vector<std::string>& symbols_to_index,
                                                          const std::vector<std::string>& token_separators,
-                                                         const bool enable_nested_fields) {
-    std::unique_lock lock(coll_create_mutex);
+                                                         const bool enable_nested_fields, std::shared_ptr<VQModel> model,
+                                                         const nlohmann::json& metadata) {
+    std::unique_lock lock(mutex);
 
     if(store->contains(Collection::get_meta_key(name))) {
         return Option<Collection*>(409, std::string("A collection with name `") + name + "` already exists.");
@@ -440,9 +500,12 @@ Option<Collection*> CollectionManager::create_collection(const std::string& name
         return Option<Collection*>(fields_json_op.code(), fields_json_op.error());
     }
 
+    uint32_t new_coll_id = next_collection_id;
+    next_collection_id++;
+
     nlohmann::json collection_meta;
     collection_meta[Collection::COLLECTION_NAME_KEY] = name;
-    collection_meta[Collection::COLLECTION_ID_KEY] = next_collection_id.load();
+    collection_meta[Collection::COLLECTION_ID_KEY] = new_coll_id;
     collection_meta[Collection::COLLECTION_SEARCH_FIELDS_KEY] = fields_json;
     collection_meta[Collection::COLLECTION_DEFAULT_SORTING_FIELD_KEY] = default_sorting_field;
     collection_meta[Collection::COLLECTION_CREATED] = created_at;
@@ -452,12 +515,14 @@ Option<Collection*> CollectionManager::create_collection(const std::string& name
     collection_meta[Collection::COLLECTION_SEPARATORS] = token_separators;
     collection_meta[Collection::COLLECTION_ENABLE_NESTED_FIELDS] = enable_nested_fields;
 
-    Collection* new_collection = new Collection(name, next_collection_id, created_at, 0, store, fields,
-                                                default_sorting_field,
-                                                this->max_memory_ratio, fallback_field_type,
-                                                symbols_to_index, token_separators,
-                                                enable_nested_fields);
-    next_collection_id++;
+    if(model != nullptr) {
+        collection_meta[Collection::COLLECTION_VOICE_QUERY_MODEL] = nlohmann::json::object();
+        collection_meta[Collection::COLLECTION_VOICE_QUERY_MODEL]["model_name"] = model->get_model_name();
+    }
+
+    if(!metadata.empty()) {
+        collection_meta[Collection::COLLECTION_METADATA] = metadata;
+    }
 
     rocksdb::WriteBatch batch;
     batch.Put(Collection::get_next_seq_id_key(name), StringUtils::serialize_uint32_t(0));
@@ -469,7 +534,17 @@ Option<Collection*> CollectionManager::create_collection(const std::string& name
         return Option<Collection*>(500, "Could not write to on-disk storage.");
     }
 
+    lock.unlock();
+
+    Collection* new_collection = new Collection(name, new_coll_id, created_at, 0, store, fields,
+                                                default_sorting_field,
+                                                this->max_memory_ratio, fallback_field_type,
+                                                symbols_to_index, token_separators,
+                                                enable_nested_fields, model);
+
     add_to_collections(new_collection);
+
+    lock.lock();
 
     if (referenced_in_backlog.count(name) > 0) {
         new_collection->add_referenced_ins(referenced_in_backlog.at(name));
@@ -498,7 +573,8 @@ Collection* CollectionManager::get_collection_unsafe(const std::string & collect
 locked_resource_view_t<Collection> CollectionManager::get_collection(const std::string & collection_name) const {
     std::shared_lock lock(mutex);
     Collection* coll = get_collection_unsafe(collection_name);
-    return locked_resource_view_t<Collection>(mutex, coll);
+    return coll != nullptr ? locked_resource_view_t<Collection>(coll->get_lifecycle_mutex(), coll) :
+           locked_resource_view_t<Collection>(noop_coll_mutex, coll);
 }
 
 locked_resource_view_t<Collection> CollectionManager::get_collection_with_id(uint32_t collection_id) const {
@@ -511,23 +587,60 @@ locked_resource_view_t<Collection> CollectionManager::get_collection_with_id(uin
     return locked_resource_view_t<Collection>(mutex, nullptr);
 }
 
-std::vector<Collection*> CollectionManager::get_collections() const {
+Option<std::vector<Collection*>> CollectionManager::get_collections(uint32_t limit, uint32_t offset,
+                                                                    const std::vector<std::string>& api_key_collections) const {
+
     std::shared_lock lock(mutex);
 
     std::vector<Collection*> collection_vec;
-    for(const auto& kv: collections) {
-        collection_vec.push_back(kv.second);
+    auto collections_it = collections.begin();
+
+    if(offset > 0) {
+        if(offset >= collections.size()) {
+            return Option<std::vector<Collection*>>(400, "Invalid offset param.");
+        }
+
+        std::advance(collections_it, offset);
     }
 
-    std::sort(std::begin(collection_vec), std::end(collection_vec),
-              [] (Collection* lhs, Collection* rhs) {
-                  return lhs->get_collection_id()  > rhs->get_collection_id();
-              });
+    auto collections_end = collections.end();
+
+    if(limit > 0 && (offset + limit < collections.size())) {
+        collections_end = collections_it;
+        std::advance(collections_end, limit);
+    }
+
+    for (collections_it; collections_it != collections_end; ++collections_it) {
+        if(is_valid_api_key_collection(api_key_collections, collections_it->second)) {
+            collection_vec.push_back(collections_it->second);
+        }
+    }
+
+
+    if(offset == 0 && limit == 0) { //dont sort for paginated requests
+        std::sort(std::begin(collection_vec), std::end(collection_vec),
+                  [](Collection *lhs, Collection *rhs) {
+                      return lhs->get_collection_id() > rhs->get_collection_id();
+                  });
+    }
+
+    return Option<std::vector<Collection*>>(collection_vec);
+}
+
+std::vector<std::string> CollectionManager::get_collection_names() const {
+    std::shared_lock lock(mutex);
+
+    std::vector<std::string> collection_vec;
+    for(const auto& kv: collections) {
+        collection_vec.push_back(kv.first);
+    }
 
     return collection_vec;
 }
 
-Option<nlohmann::json> CollectionManager::drop_collection(const std::string& collection_name, const bool remove_from_store) {
+Option<nlohmann::json> CollectionManager::drop_collection(const std::string& collection_name,
+                                                          const bool remove_from_store,
+                                                          const bool compact_store) {
     std::shared_lock s_lock(mutex);
     auto collection = get_collection_unsafe(collection_name);
 
@@ -544,8 +657,11 @@ Option<nlohmann::json> CollectionManager::drop_collection(const std::string& col
         const std::string& del_key_prefix = std::to_string(collection->get_collection_id()) + "_";
         const std::string& del_end_prefix = std::to_string(collection->get_collection_id()) + "`";
         store->delete_range(del_key_prefix, del_end_prefix);
-        store->flush();
-        store->compact_range(del_key_prefix, del_end_prefix);
+
+        if(compact_store) {
+            store->flush();
+            store->compact_range(del_key_prefix, del_end_prefix);
+        }
 
         // delete overrides
         const std::string& del_override_prefix =
@@ -585,7 +701,15 @@ Option<nlohmann::json> CollectionManager::drop_collection(const std::string& col
     std::unique_lock u_lock(mutex);
     collections.erase(actual_coll_name);
     collection_id_names.erase(collection->get_collection_id());
+
+    const auto& embedding_fields = collection->get_embedding_fields();
+
     u_lock.unlock();
+    for(const auto& embedding_field : embedding_fields) {
+        const auto& model_name = embedding_field.embed[fields::model_config]["model_name"].get<std::string>();
+        process_embedding_field_delete(model_name);
+    }
+
 
     // don't hold any collection manager locks here, since this can take some time
     delete collection;
@@ -652,11 +776,120 @@ AuthManager& CollectionManager::getAuthManager() {
     return auth_manager;
 }
 
+bool parse_multi_eval(const std::string& sort_by_str, uint32_t& index, std::vector<sort_by>& sort_fields) {
+    // FORMAT:
+    // _eval([ (<expr_1>): <score_1>, (<expr_2>): <score_2> ]):<order>
+
+    std::vector<std::string> eval_expressions;
+    std::vector<std::int64_t> scores;
+    while (true) {
+        if (index >= sort_by_str.size()) {
+            return false;
+        } else if (sort_by_str[index] == ']') {
+            break;
+        }
+
+        auto open_paren_pos = sort_by_str.find('(', index);
+        if (open_paren_pos == std::string::npos) {
+            return false;
+        }
+        index = open_paren_pos;
+        std::string eval_expr = "(";
+        int paren_count = 1;
+        while (++index < sort_by_str.size() && paren_count > 0) {
+            if (sort_by_str[index] == '(') {
+                paren_count++;
+            } else if (sort_by_str[index] == ')') {
+                paren_count--;
+            }
+            eval_expr += sort_by_str[index];
+        }
+
+        // Removing outer parenthesis.
+        eval_expr = eval_expr.substr(1, eval_expr.size() - 2);
+        if (paren_count != 0 || index >= sort_by_str.size()) {
+            return false;
+        }
+
+        while (sort_by_str[index] != ':' && ++index < sort_by_str.size());
+        if (index >= sort_by_str.size()) {
+            return false;
+        }
+
+        std::string score;
+        while (++index < sort_by_str.size() && !(sort_by_str[index] == ',' || sort_by_str[index] == ']')) {
+            score += sort_by_str[index];
+        }
+        StringUtils::trim(score);
+        if (!StringUtils::is_int64_t(score)) {
+            return false;
+        }
+
+        eval_expressions.emplace_back(eval_expr);
+        scores.emplace_back(std::stoll(score));
+    }
+
+    while (++index < sort_by_str.size() && sort_by_str[index] != ':');
+    if (index >= sort_by_str.size()) {
+        return false;
+    }
+
+    std::string order_str;
+    while (++index < sort_by_str.size() && sort_by_str[index] != ',') {
+        order_str += sort_by_str[index];
+    }
+    StringUtils::trim(order_str);
+    StringUtils::toupper(order_str);
+
+    sort_fields.emplace_back(eval_expressions, scores, order_str);
+    return true;
+}
+
+bool parse_eval(const std::string& sort_by_str, uint32_t& index, std::vector<sort_by>& sort_fields) {
+    // FORMAT:
+    // _eval(<expr>):<order>
+    std::string eval_expr = "(";
+    int paren_count = 1;
+    while (++index < sort_by_str.size() && paren_count > 0) {
+        if (sort_by_str[index] == '(') {
+            paren_count++;
+        } else if (sort_by_str[index] == ')') {
+            paren_count--;
+        }
+        eval_expr += sort_by_str[index];
+    }
+
+    // Removing outer parenthesis.
+    eval_expr = eval_expr.substr(1, eval_expr.size() - 2);
+
+    if (paren_count != 0 || index >= sort_by_str.size()) {
+        return false;
+    }
+
+    while (sort_by_str[index] != ':' && ++index < sort_by_str.size());
+    if (index >= sort_by_str.size()) {
+        return false;
+    }
+
+    std::string order_str;
+    while (++index < sort_by_str.size() && sort_by_str[index] != ',') {
+        order_str += sort_by_str[index];
+    }
+    StringUtils::trim(order_str);
+    StringUtils::toupper(order_str);
+
+    std::vector<std::string> eval_expressions = {eval_expr};
+    std::vector<int64_t> scores = {1};
+    sort_fields.emplace_back(eval_expressions, scores, order_str);
+
+    return true;
+}
+
 bool CollectionManager::parse_sort_by_str(std::string sort_by_str, std::vector<sort_by>& sort_fields) {
     std::string sort_field_expr;
     char prev_non_space_char = 'a';
 
-    for(size_t i=0; i < sort_by_str.size(); i++) {
+    for(uint32_t i=0; i < sort_by_str.size(); i++) {
         if (sort_field_expr.empty()) {
             if (sort_by_str[i] == '$') {
                 // Sort by reference field
@@ -689,36 +922,15 @@ bool CollectionManager::parse_sort_by_str(std::string sort_by_str, std::vector<s
                 if (open_paren_pos == std::string::npos) {
                     return false;
                 }
-                sort_field_expr = sort_field_const::eval + "(";
 
                 i = open_paren_pos;
-                int paren_count = 1;
-                while (++i < sort_by_str.size() && paren_count > 0) {
-                    if (sort_by_str[i] == '(') {
-                        paren_count++;
-                    } else if (sort_by_str[i] == ')') {
-                        paren_count--;
-                    }
-                    sort_field_expr += sort_by_str[i];
-                }
-                if (paren_count != 0 || i >= sort_by_str.size()) {
+                while(sort_by_str[++i] == ' ');
+
+                auto result = sort_by_str[i] == '[' ? parse_multi_eval(sort_by_str, i, sort_fields) :
+                                                        parse_eval(sort_by_str, --i, sort_fields);
+                if (!result) {
                     return false;
                 }
-
-                while (sort_by_str[i] != ':' && ++i < sort_by_str.size());
-                if (i >= sort_by_str.size()) {
-                    return false;
-                }
-
-                std::string order_str;
-                while (++i < sort_by_str.size() && sort_by_str[i] != ',') {
-                    order_str += sort_by_str[i];
-                }
-                StringUtils::trim(order_str);
-                StringUtils::toupper(order_str);
-
-                sort_fields.emplace_back(sort_field_expr, order_str);
-                sort_field_expr = "";
                 continue;
             }
         }
@@ -768,7 +980,7 @@ Option<bool> add_unsigned_int_param(const std::string& param_name, const std::st
         return Option<bool>(400, "Parameter `" + std::string(param_name) + "` must be an unsigned integer.");
     }
 
-    *int_val = std::stoi(str_val);
+    *int_val = std::stoul(str_val);
     return Option<bool>(true);
 }
 
@@ -780,7 +992,7 @@ Option<bool> add_unsigned_int_list_param(const std::string& param_name, const st
 
     for(auto& str : str_vals) {
         if(StringUtils::is_uint32_t(str)) {
-            int_vals->push_back((uint32_t)std::stoi(str));
+            int_vals->push_back((uint32_t)std::stoul(str));
         } else {
             return Option<bool>(400, "Parameter `" + param_name + "` is malformed.");
         }
@@ -790,26 +1002,35 @@ Option<bool> add_unsigned_int_list_param(const std::string& param_name, const st
 }
 
 void CollectionManager::_get_reference_collection_names(const std::string& filter_query,
-                                                        std::set<std::string>& reference_collection_names) {
+                                                        ref_include_collection_names_t*& ref_include) {
+    if (ref_include == nullptr) {
+        ref_include = new ref_include_collection_names_t();
+    }
+
     auto size = filter_query.size();
     for (uint32_t i = 0; i < size;) {
         auto c = filter_query[i];
         if (c == ' ' || c == '(' || c == ')') {
             i++;
         } else if (c == '&' || c == '|') {
+            if (i + 1 >= size || (c == '&' && filter_query[i+1] != '&') || (c == '|' && filter_query[i+1] != '|')) {
+                ref_include->collection_names.clear();
+                return;
+            }
             i += 2;
         } else {
             // Reference filter would start with $ symbol.
             if (c == '$') {
                 auto open_paren_pos = filter_query.find('(', ++i);
                 if (open_paren_pos == std::string::npos) {
+                    ref_include->collection_names.clear();
                     return;
                 }
 
                 auto reference_collection_name = filter_query.substr(i, open_paren_pos - i);
                 StringUtils::trim(reference_collection_name);
                 if (!reference_collection_name.empty()) {
-                    reference_collection_names.insert(reference_collection_name);
+                    ref_include->collection_names.insert(reference_collection_name);
                 }
 
                 i = open_paren_pos;
@@ -821,8 +1042,24 @@ void CollectionManager::_get_reference_collection_names(const std::string& filte
                         parenthesis_count--;
                     }
                 }
+
+                if (parenthesis_count != 0) {
+                    ref_include->collection_names.clear();
+                    return;
+                }
+
+                // Need to process the filter expression inside parenthesis in case of nested join.
+                auto sub_filter_query = filter_query.substr(open_paren_pos + 1, i - open_paren_pos - 2);
+                if (sub_filter_query.find('$') != std::string::npos) {
+                    _get_reference_collection_names(sub_filter_query, ref_include->nested_include);
+                }
             } else {
-                while (filter_query[++i] != ':');
+                while (i + 1 < size && filter_query[++i] != ':');
+                if (i >= size) {
+                    ref_include->collection_names.clear();
+                    return;
+                }
+
                 bool in_backtick = false;
                 do {
                     c = filter_query[++i];
@@ -837,15 +1074,196 @@ void CollectionManager::_get_reference_collection_names(const std::string& filte
     }
 }
 
-// Separate out the reference includes into `ref_include_fields_vec`.
-void initialize_ref_include_fields_vec(const std::string& filter_query, std::vector<std::string>& include_fields_vec,
-                                       std::vector<ref_include_fields>& ref_include_fields_vec) {
-    std::set<std::string> reference_collection_names;
-    CollectionManager::_get_reference_collection_names(filter_query, reference_collection_names);
+Option<bool> parse_nested_exclude(const std::string& exclude_field_exp,
+                                  std::unordered_map<std::string, std::string>& ref_excludes) {
+    // Format: $ref_collection_name(field_1, field_2, $nested_ref_coll(nested_field_1))
+    size_t index = 0;
+    while (index < exclude_field_exp.size()) {
+        auto parenthesis_index = exclude_field_exp.find('(');
+        auto ref_collection_name = exclude_field_exp.substr(index + 1, parenthesis_index - index - 1);
+        std::string ref_fields;
+
+        index = parenthesis_index + 1;
+        auto nested_exclude_pos = exclude_field_exp.find('$', parenthesis_index);
+        auto closing_parenthesis_pos = exclude_field_exp.find(')', parenthesis_index);
+        size_t comma_pos;
+        if (nested_exclude_pos < closing_parenthesis_pos) {
+            // Nested reference exclude.
+            // "... $product_variants(title, $inventory(qty)) ..."
+            do {
+                ref_fields += exclude_field_exp.substr(index, nested_exclude_pos - index);
+                StringUtils::trim(ref_fields);
+                index = nested_exclude_pos;
+                std::string nested_exclude_field_exp;
+                auto split_op = StringUtils::split_reference_include_exclude_fields(exclude_field_exp, index,
+                                                                                    nested_exclude_field_exp);
+                if (!split_op.ok()) {
+                    return split_op;
+                }
+
+                auto parse_op = parse_nested_exclude(nested_exclude_field_exp, ref_excludes);
+                if (!parse_op.ok()) {
+                    return parse_op;
+                }
+
+                nested_exclude_pos = exclude_field_exp.find('$', index);
+                closing_parenthesis_pos = exclude_field_exp.find(')', index);
+                comma_pos = exclude_field_exp.find(',', index);
+                index = std::min(closing_parenthesis_pos, comma_pos) + 1;
+            } while (index < exclude_field_exp.size() && nested_exclude_pos < closing_parenthesis_pos);
+        }
+
+        // ... $inventory(qty) ...
+        if (index < closing_parenthesis_pos) {
+            ref_fields += exclude_field_exp.substr(index, closing_parenthesis_pos - index);
+        }
+        StringUtils::trim(ref_fields);
+
+        ref_excludes[ref_collection_name] = ref_fields;
+        index = closing_parenthesis_pos + 1;
+    }
+
+    return Option<bool>(true);
+}
+
+Option<bool> parse_ref_include_parameters(const std::string& include_field_exp, const std::string& parameters,
+                                          ref_include::strategy_enum& strategy_enum) {
+    std::vector<std::string> parameters_map;
+    StringUtils::split(parameters, parameters_map, ",");
+    for (const auto &item: parameters_map) {
+        std::vector<std::string> parameter_pair;
+        StringUtils::split(item, parameter_pair, ":");
+        if (parameter_pair.size() != 2) {
+            continue;
+        }
+        auto const& key = StringUtils::trim(parameter_pair[0]);
+        if (key == ref_include::strategy_key) {
+            auto const& include_strategy = StringUtils::trim(parameter_pair[1]);
+
+            auto string_to_enum_op = ref_include::string_to_enum(include_strategy);
+            if (!string_to_enum_op.ok()) {
+                return Option<bool>(400, "Error parsing `" + include_field_exp + "`: " + string_to_enum_op.error());
+            }
+            strategy_enum = string_to_enum_op.get();
+        } else {
+            return Option<bool>(400, "Unknown reference `include_fields` parameter: `" + key + "`.");
+        }
+    }
+
+    return Option<bool>(true);
+}
+
+Option<bool> parse_nested_include(const std::string& include_field_exp,
+                                  CollectionManager::ref_include_collection_names_t* const ref_include_coll_names,
+                                  std::vector<ref_include_exclude_fields>& ref_include_exclude_fields_vec) {
+    // Format: $ref_collection_name(field_1, field_2, $nested_ref_coll(nested_field_1, strategy: nested_include_strategy) as nested_ref_alias, strategy: include_strategy) as ref_alias
+    size_t index = 0;
+    while (index < include_field_exp.size()) {
+        auto parenthesis_index = include_field_exp.find('(');
+        auto ref_collection_name = include_field_exp.substr(index + 1, parenthesis_index - index - 1);
+        bool nest_ref_doc = true;
+        std::string ref_fields, ref_alias;
+
+        index = parenthesis_index + 1;
+        auto nested_include_pos = include_field_exp.find('$', parenthesis_index);
+        auto closing_parenthesis_pos = include_field_exp.find(')', parenthesis_index);
+        auto colon_pos = include_field_exp.find(':', index);
+        size_t comma_pos;
+        std::vector<ref_include_exclude_fields> nested_ref_include_exclude_fields_vec;
+        if (nested_include_pos < closing_parenthesis_pos) {
+            // Nested reference include.
+            // "... $product_variants(title, $inventory(qty, strategy:merge) as inventory, strategy :nest) as variants ..."
+            do {
+                ref_fields += include_field_exp.substr(index, nested_include_pos - index);
+                StringUtils::trim(ref_fields);
+                index = nested_include_pos;
+                std::string nested_include_field_exp;
+                auto split_op = StringUtils::split_reference_include_exclude_fields(include_field_exp, index,
+                                                                                    nested_include_field_exp);
+                if (!split_op.ok()) {
+                    return split_op;
+                }
+
+                auto parse_op = parse_nested_include(nested_include_field_exp,
+                                                     ref_include_coll_names == nullptr ? nullptr : ref_include_coll_names->nested_include,
+                                                     nested_ref_include_exclude_fields_vec);
+                if (!parse_op.ok()) {
+                    return parse_op;
+                }
+
+                nested_include_pos = include_field_exp.find('$', index);
+                closing_parenthesis_pos = include_field_exp.find(')', index);
+                colon_pos = include_field_exp.find(':', index);
+                comma_pos = include_field_exp.find(',', index);
+                index = std::min(std::min(closing_parenthesis_pos, colon_pos), comma_pos) + 1;
+            } while(index < include_field_exp.size() && nested_include_pos < closing_parenthesis_pos);
+        }
+
+        if (index < closing_parenthesis_pos) {
+            ref_fields += include_field_exp.substr(index, closing_parenthesis_pos - index);
+        }
+        index = closing_parenthesis_pos;
+
+        // ... $inventory(qty, strategy:merge) as inventory
+        auto strategy_enum = ref_include::nest;
+        if (colon_pos < closing_parenthesis_pos) {
+            auto const& parameters_start = ref_fields.rfind(',', colon_pos);
+            std::string parameters;
+            if (parameters_start == std::string::npos) {
+                parameters = ref_fields;
+                ref_fields.clear();
+            } else {
+                parameters = ref_fields.substr(parameters_start + 1);
+                ref_fields = ref_fields.substr(0, parameters_start);
+            }
+
+            auto parse_params_op = parse_ref_include_parameters(include_field_exp, parameters, strategy_enum);
+            if (!parse_params_op.ok()) {
+                return parse_params_op;
+            }
+        }
+        StringUtils::trim(ref_fields);
+
+        auto as_pos = include_field_exp.find(" as ", index);
+        comma_pos = include_field_exp.find(',', index);
+        if (as_pos != std::string::npos && as_pos < comma_pos) {
+            ref_alias = include_field_exp.substr(as_pos + 4, comma_pos - as_pos - 4);
+        }
+
+        // For an alias `foo`,
+        // In case of "merge" reference doc, we need append `foo.` to all the top level keys of reference doc.
+        // In case of "nest" reference doc, `foo` becomes the key with reference doc as value.
+        nest_ref_doc = strategy_enum == ref_include::nest || strategy_enum == ref_include::nest_array;
+        ref_alias = !ref_alias.empty() ? (StringUtils::trim(ref_alias) + (nest_ref_doc ? "" : ".")) : "";
+
+        ref_include_exclude_fields_vec.emplace_back(ref_include_exclude_fields{ref_collection_name, ref_fields, "",
+                                                                               ref_alias, strategy_enum});
+        ref_include_exclude_fields_vec.back().nested_join_includes = std::move(nested_ref_include_exclude_fields_vec);
+
+        // Referenced collection in filter_by is already mentioned in include_fields.
+        if (ref_include_coll_names != nullptr) {
+            ref_include_coll_names->collection_names.erase(ref_collection_name);
+        }
+        if (comma_pos == std::string::npos) {
+            break;
+        }
+        index = comma_pos + 1;
+    }
+
+    return Option<bool>(true);
+}
+
+Option<bool> CollectionManager::_initialize_ref_include_exclude_fields_vec(const std::string& filter_query,
+                                                                           std::vector<std::string>& include_fields_vec,
+                                                                           std::vector<std::string>& exclude_fields_vec,
+                                                                           std::vector<ref_include_exclude_fields>& ref_include_exclude_fields_vec) {
+    ref_include_collection_names_t* ref_include_coll_names = nullptr;
+    CollectionManager::_get_reference_collection_names(filter_query, ref_include_coll_names);
+    std::unique_ptr<CollectionManager::ref_include_collection_names_t> guard(ref_include_coll_names);
 
     std::vector<std::string> result_include_fields_vec;
     auto wildcard_include_all = true;
-    for (auto include_field_exp: include_fields_vec) {
+    for (auto const& include_field_exp: include_fields_vec) {
         if (include_field_exp[0] != '$') {
             if (include_field_exp == "*") {
                 continue;
@@ -856,41 +1274,122 @@ void initialize_ref_include_fields_vec(const std::string& filter_query, std::vec
             continue;
         }
 
+        // Nested reference include.
+        if (include_field_exp.find('$', 1) != std::string::npos) {
+            auto parse_op = parse_nested_include(include_field_exp, ref_include_coll_names, ref_include_exclude_fields_vec);
+            if (!parse_op.ok()) {
+                return parse_op;
+            }
+            continue;
+        }
+
+        // Format: $ref_collection_name(field_1, field_2: include_strategy) as ref_alias
         auto as_pos = include_field_exp.find(" as ");
-        auto ref_include = include_field_exp.substr(0, as_pos),
-                alias = (as_pos == std::string::npos) ? "" :
+        auto ref_include = include_field_exp.substr(0, as_pos);
+        auto alias = (as_pos == std::string::npos) ? "" :
                         include_field_exp.substr(as_pos + 4, include_field_exp.size() - (as_pos + 4));
 
-        // For an alias `foo`, we need append `foo.` to all the top level keys of reference doc.
-        ref_include_fields_vec.emplace_back(ref_include_fields{ref_include, alias.empty() ? alias :
-                                                                                StringUtils::trim(alias) + "."});
+        auto parenthesis_index = ref_include.find('(');
+        auto ref_collection_name = ref_include.substr(1, parenthesis_index - 1);
+        auto ref_fields = ref_include.substr(parenthesis_index + 1, ref_include.size() - parenthesis_index - 2);
 
-        auto open_paren_pos = include_field_exp.find('(');
-        if (open_paren_pos == std::string::npos) {
+        auto strategy_enum = ref_include::nest;
+        auto colon_pos = ref_fields.find(':');
+        if (colon_pos != std::string::npos) {
+            auto const& parameters_start = ref_fields.rfind(',', colon_pos);
+            std::string parameters;
+            if (parameters_start == std::string::npos) {
+                parameters = ref_fields;
+                ref_fields.clear();
+            } else {
+                parameters = ref_fields.substr(parameters_start + 1);
+                ref_fields = ref_fields.substr(0, parameters_start);
+            }
+
+            auto parse_params_op = parse_ref_include_parameters(include_field_exp, parameters, strategy_enum);
+            if (!parse_params_op.ok()) {
+                return parse_params_op;
+            }
+        }
+
+        // For an alias `foo`,
+        // In case of "merge" reference doc, we need append `foo.` to all the top level keys of reference doc.
+        // In case of "nest" reference doc, `foo` becomes the key with reference doc as value.
+        auto const& nest_ref_doc = strategy_enum == ref_include::nest || strategy_enum == ref_include::nest_array;
+        auto ref_alias = !alias.empty() ? (StringUtils::trim(alias) + (nest_ref_doc ? "" : ".")) : "";
+        ref_include_exclude_fields_vec.emplace_back(ref_include_exclude_fields{ref_collection_name, ref_fields, "",
+                                                                               ref_alias, strategy_enum});
+
+        // Referenced collection in filter_by is already mentioned in include_fields.
+        if (ref_include_coll_names != nullptr) {
+            ref_include_coll_names->collection_names.erase(ref_collection_name);
+        }
+    }
+
+    // Get all the fields of the referenced collection mentioned in the filter_by but not in include_fields.
+    auto references = std::ref(ref_include_exclude_fields_vec);
+    while (ref_include_coll_names != nullptr) {
+        for (const auto &reference_collection_name: ref_include_coll_names->collection_names) {
+            references.get().emplace_back(ref_include_exclude_fields{reference_collection_name, "", "", ""});
+        }
+
+        ref_include_coll_names = ref_include_coll_names->nested_include;
+        if (references.get().empty()) {
+            break;
+        }
+        references = std::ref(references.get().front().nested_join_includes);
+    }
+
+    std::unordered_map<std::string, std::string> ref_excludes;
+    std::vector<std::string> result_exclude_fields_vec;
+    for (const auto& exclude_field_exp: exclude_fields_vec) {
+        if (exclude_field_exp[0] != '$') {
+            result_exclude_fields_vec.emplace_back(exclude_field_exp);
             continue;
         }
 
-        auto reference_collection_name = include_field_exp.substr(1, open_paren_pos - 1);
-        StringUtils::trim(reference_collection_name);
-        if (reference_collection_name.empty()) {
+        // Nested reference exclude.
+        if (exclude_field_exp.find('$', 1) != std::string::npos) {
+            auto parse_op = parse_nested_exclude(exclude_field_exp, ref_excludes);
+            if (!parse_op.ok()) {
+                return parse_op;
+            }
             continue;
         }
 
-        // Referenced collection in filter_query is already mentioned in ref_include_fields.
-        reference_collection_names.erase(reference_collection_name);
+        // Format: $ref_collection_name(field_1, field_2)
+        auto parenthesis_index = exclude_field_exp.find('(');
+        auto ref_collection_name = exclude_field_exp.substr(1, parenthesis_index - 1);
+        auto ref_fields = exclude_field_exp.substr(parenthesis_index + 1, exclude_field_exp.size() - parenthesis_index - 2);
+        if (!ref_fields.empty()) {
+            ref_excludes[ref_collection_name] = ref_fields;
+        }
     }
 
-    // Get all the fields of the referenced collection in the filter but not mentioned in include_fields.
-    for (const auto &reference_collection_name: reference_collection_names) {
-        ref_include_fields_vec.emplace_back(ref_include_fields{"$" + reference_collection_name + "(*)", ""});
+    if (!ref_excludes.empty()) {
+        references = std::ref(ref_include_exclude_fields_vec);
+        while (!references.get().empty()) {
+            for (auto& ref_include_exclude: references.get()) {
+                if (ref_excludes.count(ref_include_exclude.collection_name) == 0) {
+                    continue;
+                }
+
+                ref_include_exclude.exclude_fields = ref_excludes[ref_include_exclude.collection_name];
+            }
+
+            references = std::ref(references.get().front().nested_join_includes);
+        }
     }
 
-    // Since no field of the collection is mentioned in include_fields, get all the fields.
+    // Since no field of the collection being searched is mentioned in include_fields, include all the fields.
     if (wildcard_include_all) {
         result_include_fields_vec.clear();
     }
 
     include_fields_vec = std::move(result_include_fields_vec);
+    exclude_fields_vec = std::move(result_exclude_fields_vec);
+
+    return Option<bool>(true);
 }
 
 Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& req_params,
@@ -927,6 +1426,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     const char *GROUP_BY = "group_by";
     const char *GROUP_LIMIT = "group_limit";
+    const char *GROUP_MISSING_VALUES = "group_missing_values";
 
     const char *LIMIT_HITS = "limit_hits";
     const char *PER_PAGE = "per_page";
@@ -941,6 +1441,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     const char *HIDDEN_HITS = "hidden_hits";
     const char *ENABLE_OVERRIDES = "enable_overrides";
     const char *FILTER_CURATED_HITS = "filter_curated_hits";
+    const char *ENABLE_SYNONYMS = "enable_synonyms";
 
     const char *MAX_CANDIDATES = "max_candidates";
 
@@ -975,6 +1476,24 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     const char *FACET_SAMPLE_PERCENT = "facet_sample_percent";
     const char *FACET_SAMPLE_THRESHOLD = "facet_sample_threshold";
+
+    const char *CONVERSATION = "conversation";
+    const char *CONVERSATION_ID = "conversation_id";
+    const char *SYSTEM_PROMPT = "system_prompt";
+    const char *CONVERSATION_MODEL_ID = "conversation_model_id";
+
+    const char *DROP_TOKENS_MODE = "drop_tokens_mode";
+    const char *PRIORITIZE_NUM_MATCHING_FIELDS = "prioritize_num_matching_fields";
+    const char *OVERRIDE_TAGS = "override_tags";
+
+    const char *VOICE_QUERY = "voice_query";
+
+    const char *ENABLE_TYPOS_FOR_NUMERICAL_TOKENS = "enable_typos_for_numerical_tokens";
+    const char *ENABLE_TYPOS_FOR_ALPHA_NUMERICAL_TOKENS = "enable_typos_for_alpha_numerical_tokens";
+    const char *ENABLE_LAZY_FILTER = "enable_lazy_filter";
+
+    const char *SYNONYM_PREFIX = "synonym_prefix";
+    const char *SYNONYM_NUM_TYPOS = "synonym_num_typos";
 
     // enrich params with values from embedded params
     for(auto& item: embedded_params.items()) {
@@ -1015,6 +1534,10 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     if(stopword_it != req_params.end()) {
         stopwords_set = stopword_it->second;
+
+        if(!StopwordsManager::get_instance().stopword_exists(stopwords_set)) {
+            return Option<bool>(404, "Could not find the stopword set named `" + stopwords_set + "`.");
+        }
     }
 
     CollectionManager & collectionManager = CollectionManager::get_instance();
@@ -1027,7 +1550,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     // check presence of mandatory params here
 
-    if(req_params.count(QUERY) == 0) {
+    if(req_params.count(QUERY) == 0 && req_params.count(VOICE_QUERY) == 0) {
         return Option<bool>(400, std::string("Parameter `") + QUERY + "` is required.");
     }
 
@@ -1056,7 +1579,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
 
     std::vector<std::string> include_fields_vec;
     std::vector<std::string> exclude_fields_vec;
-    std::vector<ref_include_fields> ref_include_fields_vec;
+    std::vector<ref_include_exclude_fields> ref_include_exclude_fields_vec;
     spp::sparse_hash_set<std::string> include_fields;
     spp::sparse_hash_set<std::string> exclude_fields;
 
@@ -1070,6 +1593,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     std::string hidden_hits_str;
     std::vector<std::string> group_by_fields;
     size_t group_limit = 3;
+    bool group_missing_values = true;
     std::string highlight_start_tag = "<mark>";
     std::string highlight_end_tag = "</mark>";
     std::vector<uint32_t> query_by_weights;
@@ -1078,6 +1602,10 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     bool prioritize_token_position = false;
     bool pre_segmented_query = false;
     bool enable_overrides = true;
+    bool enable_synonyms = true;
+    bool synonym_prefix = false;
+    size_t synonym_num_typos = 0;
+
     size_t filter_curated_hits_option = 2;
     std::string highlight_fields;
     bool exhaustive_search = false;
@@ -1089,12 +1617,26 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     size_t max_extra_suffix = INT16_MAX;
     bool enable_highlight_v1 = true;
     text_match_type_t match_type = max_score;
+    bool enable_typos_for_numerical_tokens = true;
+    bool enable_typos_for_alpha_numerical_tokens = true;
+    bool enable_lazy_filter = Config::get_instance().get_enable_lazy_filter();
 
     size_t remote_embedding_timeout_ms = 5000;
     size_t remote_embedding_num_tries = 2;
-
+    
     size_t facet_sample_percent = 100;
     size_t facet_sample_threshold = 0;
+
+    bool conversation = false;
+    std::string conversation_id;
+    std::string conversation_model_id;
+
+    std::string drop_tokens_mode_str = "right_to_left";
+    bool prioritize_num_matching_fields = true;
+    std::string override_tags;
+
+    std::string voice_query;
+
 
     std::unordered_map<std::string, size_t*> unsigned_int_values = {
         {MIN_LEN_1TYPO, &min_len_1typo},
@@ -1120,6 +1662,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {FACET_SAMPLE_THRESHOLD, &facet_sample_threshold},
         {REMOTE_EMBEDDING_TIMEOUT_MS, &remote_embedding_timeout_ms},
         {REMOTE_EMBEDDING_NUM_TRIES, &remote_embedding_num_tries},
+        {SYNONYM_NUM_TYPOS, &synonym_num_typos},
     };
 
     std::unordered_map<std::string, std::string*> str_values = {
@@ -1132,6 +1675,11 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {HIGHLIGHT_END_TAG, &highlight_end_tag},
         {PINNED_HITS, &pinned_hits_str},
         {HIDDEN_HITS, &hidden_hits_str},
+        {CONVERSATION_ID, &conversation_id},
+        {DROP_TOKENS_MODE, &drop_tokens_mode_str},
+        {OVERRIDE_TAGS, &override_tags},
+        {CONVERSATION_MODEL_ID, &conversation_model_id},
+        {VOICE_QUERY, &voice_query},
     };
 
     std::unordered_map<std::string, bool*> bool_values = {
@@ -1141,6 +1689,14 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {EXHAUSTIVE_SEARCH, &exhaustive_search},
         {ENABLE_OVERRIDES, &enable_overrides},
         {ENABLE_HIGHLIGHT_V1, &enable_highlight_v1},
+        {CONVERSATION, &conversation},
+        {PRIORITIZE_NUM_MATCHING_FIELDS, &prioritize_num_matching_fields},
+        {GROUP_MISSING_VALUES, &group_missing_values},
+        {ENABLE_TYPOS_FOR_NUMERICAL_TOKENS, &enable_typos_for_numerical_tokens},
+        {ENABLE_SYNONYMS, &enable_synonyms},
+        {SYNONYM_PREFIX, &synonym_prefix},
+        {ENABLE_LAZY_FILTER, &enable_lazy_filter},
+        {ENABLE_TYPOS_FOR_ALPHA_NUMERICAL_TOKENS, &enable_typos_for_alpha_numerical_tokens},
     };
 
     std::unordered_map<std::string, std::vector<std::string>*> str_list_values = {
@@ -1223,8 +1779,8 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
                 if(key == FACET_BY){
                     StringUtils::split_facet(val, *find_str_list_it->second);
                 }
-                else if(key == INCLUDE_FIELDS){
-                    auto op = StringUtils::split_include_fields(val, *find_str_list_it->second);
+                else if(key == INCLUDE_FIELDS || key == EXCLUDE_FIELDS){
+                    auto op = StringUtils::split_include_exclude_fields(val, *find_str_list_it->second);
                     if (!op.ok()) {
                         return op;
                     }
@@ -1249,7 +1805,11 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         per_page = 0;
     }
 
-    initialize_ref_include_fields_vec(filter_query, include_fields_vec, ref_include_fields_vec);
+    auto initialize_op = _initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec, exclude_fields_vec,
+                                                                    ref_include_exclude_fields_vec);
+    if (!initialize_op.ok()) {
+        return initialize_op;
+    }
 
     include_fields.insert(include_fields_vec.begin(), include_fields_vec.end());
     exclude_fields.insert(exclude_fields_vec.begin(), exclude_fields_vec.end());
@@ -1292,6 +1852,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
                          (collection->get_num_documents() < 500000 ? Index::NUM_CANDIDATES_DEFAULT_MAX :
                           Index::NUM_CANDIDATES_DEFAULT_MIN);
     }
+
 
     Option<nlohmann::json> result_op = collection->search(raw_query, search_fields, filter_query, facet_fields,
                                                           sort_fields, num_typos,
@@ -1341,7 +1902,21 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
                                                           remote_embedding_num_tries,
                                                           stopwords_set,
                                                           facet_return_parent,
-                                                          ref_include_fields_vec);
+                                                          ref_include_exclude_fields_vec,
+                                                          drop_tokens_mode_str,
+                                                          prioritize_num_matching_fields,
+                                                          group_missing_values,
+                                                          conversation,
+                                                          conversation_model_id,
+                                                          conversation_id,
+                                                          override_tags,
+                                                          voice_query,
+                                                          enable_typos_for_numerical_tokens,
+                                                          enable_synonyms,
+                                                          synonym_prefix,
+                                                          synonym_num_typos,
+                                                          enable_lazy_filter,
+                                                          enable_typos_for_alpha_numerical_tokens);
 
     uint64_t timeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - begin).count();
@@ -1356,10 +1931,17 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     nlohmann::json result = result_op.get();
 
     if(Config::get_instance().get_enable_search_analytics()) {
-        if(result.count("found") != 0 && result["found"].get<size_t>() != 0) {
+        if(result.contains("found")) {
             std::string analytics_query = Tokenizer::normalize_ascii_no_spaces(raw_query);
-            AnalyticsManager::get_instance().add_suggestion(orig_coll_name, analytics_query,
-                                                            true, req_params["x-typesense-user-id"]);
+            if(result["found"].get<size_t>() != 0) {
+                const std::string& expanded_query = Tokenizer::normalize_ascii_no_spaces(
+                        result["request_params"]["first_q"].get<std::string>());
+                AnalyticsManager::get_instance().add_suggestion(orig_coll_name, analytics_query, expanded_query,
+                                                                true, req_params["x-typesense-user-id"]);
+            } else {
+                AnalyticsManager::get_instance().add_nohits_query(orig_coll_name, analytics_query,
+                                                                  true, req_params["x-typesense-user-id"]);
+            }
         }
     }
 
@@ -1384,10 +1966,17 @@ ThreadPool* CollectionManager::get_thread_pool() const {
     return thread_pool;
 }
 
-nlohmann::json CollectionManager::get_collection_summaries() const {
+Option<nlohmann::json> CollectionManager::get_collection_summaries(uint32_t limit, uint32_t offset,
+                                                                   const std::vector<std::string>& api_key_collections) const {
     std::shared_lock lock(mutex);
 
-    std::vector<Collection*> colls = get_collections();
+    auto collections_op = get_collections(limit, offset, api_key_collections);
+    if(!collections_op.ok()) {
+        return Option<nlohmann::json>(collections_op.code(), collections_op.error());
+    }
+
+    std::vector<Collection*> colls = collections_op.get();
+
     nlohmann::json json_summaries = nlohmann::json::array();
 
     for(Collection* collection: colls) {
@@ -1395,7 +1984,7 @@ nlohmann::json CollectionManager::get_collection_summaries() const {
         json_summaries.push_back(collection_json);
     }
 
-    return json_summaries;
+    return Option<nlohmann::json>(json_summaries);
 }
 
 Option<Collection*> CollectionManager::create_collection(nlohmann::json& req_json) {
@@ -1404,6 +1993,7 @@ Option<Collection*> CollectionManager::create_collection(nlohmann::json& req_jso
     const char* TOKEN_SEPARATORS = "token_separators";
     const char* ENABLE_NESTED_FIELDS = "enable_nested_fields";
     const char* DEFAULT_SORTING_FIELD = "default_sorting_field";
+    const char* METADATA = "metadata";
 
     // validate presence of mandatory fields
 
@@ -1484,6 +2074,14 @@ Option<Collection*> CollectionManager::create_collection(nlohmann::json& req_jso
                      "`name`, `type` and optionally, `facet` properties.");
     }
 
+    if(req_json.count(METADATA) != 0) {
+        if(!req_json[METADATA].is_object()) {
+            return Option<Collection *>(400, "The `metadata` value should be an object.");
+        }
+    } else {
+        req_json[METADATA] = {};
+    }
+
     const std::string& default_sorting_field = req_json[DEFAULT_SORTING_FIELD].get<std::string>();
 
     if(default_sorting_field == "id") {
@@ -1499,6 +2097,33 @@ Option<Collection*> CollectionManager::create_collection(nlohmann::json& req_jso
         return Option<Collection*>(parse_op.code(), parse_op.error());
     }
 
+    std::shared_ptr<VQModel> model = nullptr;
+    if(req_json.count(Collection::COLLECTION_VOICE_QUERY_MODEL) != 0) {
+        const nlohmann::json& voice_query_model = req_json[Collection::COLLECTION_VOICE_QUERY_MODEL];
+
+        if(!voice_query_model.is_object()) {
+            return Option<Collection*>(400, "Parameter `voice_query_model` must be an object.");
+        }
+
+        if(voice_query_model.count("model_name") == 0) {
+            return Option<Collection*>(400, "Parameter `voice_query_model.model_name` is required.");
+        }
+
+        if(!voice_query_model["model_name"].is_string() || voice_query_model["model_name"].get<std::string>().empty()) {
+            return Option<Collection*>(400, "Parameter `voice_query_model.model_name` must be a non-empty string.");
+        }
+
+        const std::string& model_name = voice_query_model["model_name"].get<std::string>();
+        auto model_res = VQModelManager::get_instance().validate_and_init_model(model_name);
+        if(!model_res.ok()) {
+            LOG(ERROR) << "Error while loading voice query model: " << model_res.error();
+            return Option<Collection*>(model_res.code(), model_res.error());
+        } else {
+            model = model_res.get();
+        }
+    }
+
+
     const auto created_at = static_cast<uint64_t>(std::time(nullptr));
 
     return CollectionManager::get_instance().create_collection(req_json["name"], num_memory_shards,
@@ -1506,13 +2131,15 @@ Option<Collection*> CollectionManager::create_collection(nlohmann::json& req_jso
                                                                 fallback_field_type,
                                                                 req_json[SYMBOLS_TO_INDEX],
                                                                 req_json[TOKEN_SEPARATORS],
-                                                                req_json[ENABLE_NESTED_FIELDS]);
+                                                                req_json[ENABLE_NESTED_FIELDS],
+                                                                model, req_json[METADATA]);
 }
 
 Option<bool> CollectionManager::load_collection(const nlohmann::json &collection_meta,
                                                 const size_t batch_size,
                                                 const StoreStatus& next_coll_id_status,
-                                                const std::atomic<bool>& quit) {
+                                                const std::atomic<bool>& quit,
+                                                spp::sparse_hash_map<std::string, std::string>& referenced_in) {
 
     auto& cm = CollectionManager::get_instance();
 
@@ -1558,7 +2185,7 @@ Option<bool> CollectionManager::load_collection(const nlohmann::json &collection
         }
     }
 
-    Collection* collection = init_collection(collection_meta, collection_next_seq_id, cm.store, 1.0f);
+    Collection* collection = init_collection(collection_meta, collection_next_seq_id, cm.store, 1.0f, referenced_in);
 
     LOG(INFO) << "Loading collection " << collection->get_name();
 
@@ -1646,7 +2273,7 @@ Option<bool> CollectionManager::load_collection(const nlohmann::json &collection
         // batch must match atleast the number of shards
          if(exceeds_batch_mem_threshold || (num_valid_docs % batch_size == 0) || last_record) {
             size_t num_records = index_records.size();
-            size_t num_indexed = collection->batch_index_in_memory(index_records, 200, false);
+            size_t num_indexed = collection->batch_index_in_memory(index_records, 200, 60000, 2, false);
             batch_doc_str_size = 0;
 
             if(num_indexed != num_records) {
@@ -1764,7 +2391,7 @@ Option<Collection*> CollectionManager::clone_collection(const string& existing_n
     auto coll_create_op = create_collection(new_name, DEFAULT_NUM_MEMORY_SHARDS, existing_coll->get_fields(),
                               existing_coll->get_default_sorting_field(), static_cast<uint64_t>(std::time(nullptr)),
                               existing_coll->get_fallback_field_type(), symbols_to_index, token_separators,
-                              existing_coll->get_enable_nested_fields());
+                              existing_coll->get_enable_nested_fields(), existing_coll->get_vq_model());
 
     lock.lock();
 
@@ -1775,15 +2402,15 @@ Option<Collection*> CollectionManager::clone_collection(const string& existing_n
     Collection* new_coll = coll_create_op.get();
 
     // copy synonyms
-    auto synonyms = existing_coll->get_synonyms();
+    auto synonyms = existing_coll->get_synonyms().get();
     for(const auto& synonym: synonyms) {
-        new_coll->get_synonym_index()->add_synonym(new_name, synonym.second);
+        new_coll->get_synonym_index()->add_synonym(new_name, *synonym.second);
     }
 
     // copy overrides
-    auto overrides = existing_coll->get_overrides();
-    for(const auto& override: overrides) {
-        new_coll->add_override(override.second);
+    auto overrides = existing_coll->get_overrides().get();
+    for(const auto& kv: overrides) {
+        new_coll->add_override(*kv.second);
     }
 
     return Option<Collection*>(new_coll);
@@ -1797,4 +2424,61 @@ void CollectionManager::add_referenced_in_backlog(const std::string& collection_
 std::map<std::string, std::set<reference_pair>> CollectionManager::_get_referenced_in_backlog() const {
     std::shared_lock lock(mutex);
     return referenced_in_backlog;
+}
+
+void CollectionManager::process_embedding_field_delete(const std::string& model_name) {
+    std::shared_lock lock(mutex);
+    bool found = false;
+
+    for(const auto& collection: collections) {
+        // will be deadlock if we try to acquire lock on collection here
+        // caller of this function should have already acquired lock on collection
+        const auto& embedding_fields = collection.second->get_embedding_fields_unsafe();
+
+        for(const auto& embedding_field: embedding_fields) {
+            if(embedding_field.embed.count(fields::model_config) != 0) {
+                const auto& model_config = embedding_field.embed[fields::model_config];
+                if(model_config["model_name"].get<std::string>() == model_name) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if(!found) {
+        LOG(INFO) << "Deleting text embedder: " << model_name;
+        EmbedderManager::get_instance().delete_text_embedder(model_name);
+        EmbedderManager::get_instance().delete_image_embedder(model_name);
+    }
+}
+
+std::unordered_set<std::string> CollectionManager::get_collection_references(const std::string& coll_name) {
+    std::shared_lock lock(mutex);
+
+    std::unordered_set<std::string> references;
+    auto it = collections.find(coll_name);
+    if (it == collections.end()) {
+        return references;
+    }
+
+    for (const auto& item: it->second->get_reference_fields()) {
+        const auto& ref_pair = item.second;
+        references.insert(ref_pair.collection);
+    }
+    return references;
+}
+
+bool CollectionManager::is_valid_api_key_collection(const std::vector<std::string>& api_collections, Collection* coll) const {
+    for(const auto& api_collection : api_collections) {
+        if(api_collection == "*") {
+            return true;
+        }
+
+        const std::regex pattern(api_collection);
+        if(std::regex_match(coll->get_name(), pattern)) {
+            return true;
+        }
+    }
+    return api_collections.size() > 0 ? false : true;
 }
