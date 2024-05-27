@@ -183,6 +183,12 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
         }
     }
 
+    nlohmann::json metadata;
+
+    if(collection_meta.count(Collection::COLLECTION_METADATA) != 0) {
+        metadata = collection_meta[Collection::COLLECTION_METADATA];
+    }
+
     Collection* collection = new Collection(this_collection_name,
                                             collection_meta[Collection::COLLECTION_ID_KEY].get<uint32_t>(),
                                             created_at,
@@ -194,7 +200,8 @@ Collection* CollectionManager::init_collection(const nlohmann::json & collection
                                             fallback_field_type,
                                             symbols_to_index,
                                             token_separators,
-                                            enable_nested_fields, model, std::move(referenced_in));
+                                            enable_nested_fields, model, std::move(referenced_in),
+                                            metadata);
 
     return collection;
 }
@@ -540,7 +547,9 @@ Option<Collection*> CollectionManager::create_collection(const std::string& name
                                                 default_sorting_field,
                                                 this->max_memory_ratio, fallback_field_type,
                                                 symbols_to_index, token_separators,
-                                                enable_nested_fields, model);
+                                                enable_nested_fields, model,
+                                                spp::sparse_hash_map<std::string, std::string>(),
+                                                metadata);
 
     add_to_collections(new_collection);
 
@@ -915,6 +924,11 @@ bool CollectionManager::parse_sort_by_str(std::string sort_by_str, std::vector<s
 
                 sort_fields.emplace_back(sort_field_expr, "");
                 sort_field_expr = "";
+
+                // Skip the space in between the sort_by expressions.
+                while (i + 1 < sort_by_str.size() && sort_by_str[i + 1] == ' ') {
+                    i++;
+                }
                 continue;
             } else if (sort_by_str.substr(i, 5) == sort_field_const::eval) {
                 // Optional filtering
@@ -930,6 +944,11 @@ bool CollectionManager::parse_sort_by_str(std::string sort_by_str, std::vector<s
                                                         parse_eval(sort_by_str, --i, sort_fields);
                 if (!result) {
                     return false;
+                }
+
+                // Skip the space in between the sort_by expressions.
+                while (i + 1 < sort_by_str.size() && sort_by_str[i + 1] == ' ') {
+                    i++;
                 }
                 continue;
             }
@@ -963,6 +982,11 @@ bool CollectionManager::parse_sort_by_str(std::string sort_by_str, std::vector<s
 
             sort_fields.emplace_back(field_name, order_str);
             sort_field_expr = "";
+
+            // Skip the space in between the sort_by expressions.
+            while (i + 1 < sort_by_str.size() && sort_by_str[i + 1] == ' ') {
+                i++;
+            }
         } else {
             sort_field_expr += sort_by_str[i];
         }
@@ -1416,6 +1440,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     const char *FACET_QUERY = "facet_query";
     const char *FACET_QUERY_NUM_TYPOS = "facet_query_num_typos";
     const char *MAX_FACET_VALUES = "max_facet_values";
+    const char *FACET_STRATEGY = "facet_strategy";
 
     const char *FACET_RETURN_PARENT = "facet_return_parent";
 
@@ -1606,7 +1631,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     bool synonym_prefix = false;
     size_t synonym_num_typos = 0;
 
-    size_t filter_curated_hits_option = 2;
+    bool filter_curated_hits_option = false;
     std::string highlight_fields;
     bool exhaustive_search = false;
     size_t search_cutoff_ms = 30 * 1000;
@@ -1620,6 +1645,8 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
     bool enable_typos_for_numerical_tokens = true;
     bool enable_typos_for_alpha_numerical_tokens = true;
     bool enable_lazy_filter = Config::get_instance().get_enable_lazy_filter();
+
+    std::string facet_strategy = "automatic";
 
     size_t remote_embedding_timeout_ms = 5000;
     size_t remote_embedding_num_tries = 2;
@@ -1657,7 +1684,6 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {MAX_EXTRA_SUFFIX, &max_extra_suffix},
         {MAX_CANDIDATES, &max_candidates},
         {FACET_QUERY_NUM_TYPOS, &facet_query_num_typos},
-        {FILTER_CURATED_HITS, &filter_curated_hits_option},
         {FACET_SAMPLE_PERCENT, &facet_sample_percent},
         {FACET_SAMPLE_THRESHOLD, &facet_sample_threshold},
         {REMOTE_EMBEDDING_TIMEOUT_MS, &remote_embedding_timeout_ms},
@@ -1680,6 +1706,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {OVERRIDE_TAGS, &override_tags},
         {CONVERSATION_MODEL_ID, &conversation_model_id},
         {VOICE_QUERY, &voice_query},
+        {FACET_STRATEGY, &facet_strategy},
     };
 
     std::unordered_map<std::string, bool*> bool_values = {
@@ -1697,6 +1724,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
         {SYNONYM_PREFIX, &synonym_prefix},
         {ENABLE_LAZY_FILTER, &enable_lazy_filter},
         {ENABLE_TYPOS_FOR_ALPHA_NUMERICAL_TOKENS, &enable_typos_for_alpha_numerical_tokens},
+        {FILTER_CURATED_HITS, &filter_curated_hits_option},
     };
 
     std::unordered_map<std::string, std::vector<std::string>*> str_list_values = {
@@ -1897,7 +1925,7 @@ Option<bool> CollectionManager::do_search(std::map<std::string, std::string>& re
                                                           facet_sample_percent,
                                                           facet_sample_threshold,
                                                           offset,
-                                                          HASH,
+                                                          facet_strategy,
                                                           remote_embedding_timeout_ms,
                                                           remote_embedding_num_tries,
                                                           stopwords_set,

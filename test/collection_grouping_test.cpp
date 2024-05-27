@@ -461,7 +461,7 @@ TEST_F(CollectionGroupingTest, GroupingWithArrayFieldAndOverride) {
                                   "", 10,
                                   {}, {}, {"colors"}, 2).get();
 
-    ASSERT_EQ(9, res["found_docs"].get<size_t>());
+    ASSERT_EQ(10, res["found_docs"].get<size_t>());
     ASSERT_EQ(4, res["found"].get<size_t>());
     ASSERT_EQ(4, res["grouped_hits"].size());
 
@@ -671,7 +671,7 @@ TEST_F(CollectionGroupingTest, ControlMissingValues) {
                              {}, {}, {"brand"}, 2,
                              "<mark>", "</mark>", {3,3}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                              4, {off}, 0, 0, 0, 2, false, "", true, 0, max_score,
-                             100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, false).get();
+                             100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, false).get();
 
     ASSERT_EQ(3, res["grouped_hits"].size());
     ASSERT_EQ("Omega", res["grouped_hits"][0]["group_key"][0].get<std::string>());
@@ -694,7 +694,7 @@ TEST_F(CollectionGroupingTest, ControlMissingValues) {
                         {}, {}, {"brand"}, 2,
                         "<mark>", "</mark>", {3,3}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                         4, {off}, 0, 0, 0, 2, false, "", true, 0, max_score,
-                        100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, true).get();
+                        100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, true).get();
 
     ASSERT_EQ(2, res["grouped_hits"].size());
 
@@ -755,147 +755,54 @@ TEST_F(CollectionGroupingTest, SortingOnGroupCount) {
     ASSERT_EQ(7, res2["grouped_hits"][2]["found"].get<int32_t>());
 }
 
-TEST_F(CollectionGroupingTest, SortingMoreThanMaxTopsterSize) {
-
-    std::vector<field> fields = {
-            field("title", field_types::STRING, false),
-            field("brand", field_types::STRING, true, true),
-            field("size", field_types::INT32, true, false),
-            field("colors", field_types::STRING, true, false),
-            field("rating", field_types::FLOAT, true, false)
-    };
-
-    Collection* coll3 = collectionManager.get_collection("coll3").get();
-    if(coll3 == nullptr) {
-        coll3 = collectionManager.create_collection("coll3", 4, fields, "rating").get();
-    }
-
-    for(auto i = 0; i < 150; i++) {
-        auto group_id = i;
-        for(auto j = 0; j < 4; j++) {
-            nlohmann::json doc;
-            doc["title"] = "Omega Casual Poplin Shirt";
-            doc["brand"] = "Omega";
-            doc["size"] = group_id;
-            doc["colors"] = "blue";
-            doc["rating"] = 4.5;
-
-            ASSERT_TRUE(coll3->add(doc.dump()).ok());
-        } 
-    }
-
-    for(auto i = 150; i < 250; i++) {
-        auto group_id = i;
-        for(auto j = 0; j < 3; j++) {
-            nlohmann::json doc;
-            doc["title"] = "Beta Casual Poplin Shirt";
-            doc["brand"] = "Beta";
-            doc["size"] = group_id;
-            doc["colors"] = "white";
-            doc["rating"] = 4.3;
-
-            ASSERT_TRUE(coll3->add(doc.dump()).ok());
-        } 
-    }
-
-    for(auto i = 250; i < 300; i++) {
-        auto group_id = i;
-        for(auto j = 0; j < 2; j++) {
-            nlohmann::json doc;
-            doc["title"] = "Zeta Casual Poplin Shirt";
-            doc["brand"] = "Zeta";
-            doc["size"] = group_id;
-            doc["colors"] = "red";
-            doc["rating"] = 4.6;
-
-            ASSERT_TRUE(coll3->add(doc.dump()).ok());
-        } 
-    }
-
+TEST_F(CollectionGroupingTest, SortingByGroupCount) {
     //first search in desc order
     std::vector<sort_by> sort_fields = {sort_by("_group_found", "DESC")};
     
-    auto res = coll3->search("*", {}, "", {"brand"}, sort_fields, {0}, 100, 2, FREQUENCY,
+    auto res = coll_group->search("shirt", {"title"}, "", {"brand"}, sort_fields, {0}, 10, 1, FREQUENCY,
                                    {false}, Index::DROP_TOKENS_THRESHOLD,
                                    spp::sparse_hash_set<std::string>(),
                                    spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
                                    "", 10,
-                                   {}, {}, {"size"}, 2).get();
+                                   {}, {}, {"brand"}, 10).get();
+    ASSERT_EQ(12, res["found_docs"].get<size_t>());
+    ASSERT_EQ(5, res["found"].get<size_t>());
+    ASSERT_EQ(5, res["grouped_hits"].size());
 
-    ASSERT_EQ(1000, res["found_docs"].get<size_t>());
-    ASSERT_EQ(300, res["found"].get<size_t>());
-    ASSERT_EQ(100, res["grouped_hits"].size());
+    ASSERT_EQ(4, res["grouped_hits"][0]["found"].get<int32_t>());
 
-    ASSERT_EQ(4, res["grouped_hits"][4]["found"].get<int32_t>());
+    ASSERT_EQ(3, res["grouped_hits"][1]["found"].get<int32_t>());
 
-    ASSERT_EQ(4, res["grouped_hits"][4]["found"].get<int32_t>());
+    ASSERT_EQ(2, res["grouped_hits"][2]["found"].get<int32_t>());
 
-    ASSERT_EQ(3, res["grouped_hits"][50]["found"].get<int32_t>());
+    ASSERT_EQ(2, res["grouped_hits"][3]["found"].get<int32_t>());
 
-    ASSERT_EQ(3, res["grouped_hits"][99]["found"].get<int32_t>());
-
-
-    res = coll3->search("*", {}, "", {"brand"}, sort_fields, {0}, 100, 3, FREQUENCY,
-                                   {false}, Index::DROP_TOKENS_THRESHOLD,
-                                   spp::sparse_hash_set<std::string>(),
-                                   spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
-                                   "", 10,
-                                   {}, {}, {"size"}, 2).get();
-
-    ASSERT_EQ(1000, res["found_docs"].get<size_t>());
-    ASSERT_EQ(300, res["found"].get<size_t>());
-    ASSERT_EQ(100, res["grouped_hits"].size());
-
-    ASSERT_EQ(3, res["grouped_hits"][4]["found"].get<int32_t>());
-
-    ASSERT_EQ(3, res["grouped_hits"][4]["found"].get<int32_t>());
-
-    ASSERT_EQ(2, res["grouped_hits"][50]["found"].get<int32_t>());
-
-    ASSERT_EQ(2, res["grouped_hits"][99]["found"].get<int32_t>());
-
+    ASSERT_EQ(1, res["grouped_hits"][4]["found"].get<int32_t>());
 
     //search in asc order
 
     std::vector<sort_by> sort_fields2 = {sort_by("_group_found", "ASC")};
     
-    auto res2 = coll3->search("*", {}, "", {"brand"}, sort_fields2, {0}, 100, 1, FREQUENCY,
+    auto res2 = coll_group->search("shirt", {"title"}, "", {"brand"}, sort_fields2, {0}, 10, 1, FREQUENCY,
                                    {false}, Index::DROP_TOKENS_THRESHOLD,
                                    spp::sparse_hash_set<std::string>(),
                                    spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
                                    "", 10,
-                                   {}, {}, {"size"}, 2).get();
+                                   {}, {}, {"brand"}, 10).get();
 
-    ASSERT_EQ(1000, res2["found_docs"].get<size_t>());
-    ASSERT_EQ(300, res2["found"].get<size_t>());
-    ASSERT_EQ(100, res2["grouped_hits"].size());
+    ASSERT_EQ(12, res2["found_docs"].get<size_t>());
+    ASSERT_EQ(5, res2["found"].get<size_t>());
+    ASSERT_EQ(5, res2["grouped_hits"].size());
 
-    ASSERT_EQ(2, res2["grouped_hits"][0]["found"].get<int32_t>());
+    ASSERT_EQ(1, res2["grouped_hits"][0]["found"].get<int32_t>());
 
     ASSERT_EQ(2, res2["grouped_hits"][1]["found"].get<int32_t>());
 
-    ASSERT_EQ(3, res2["grouped_hits"][50]["found"].get<int32_t>());
+    ASSERT_EQ(2, res2["grouped_hits"][2]["found"].get<int32_t>());
 
-    ASSERT_EQ(3, res2["grouped_hits"][99]["found"].get<int32_t>());
+    ASSERT_EQ(3, res2["grouped_hits"][3]["found"].get<int32_t>());
 
-    res2 = coll3->search("*", {}, "", {"brand"}, sort_fields2, {0}, 100, 2, FREQUENCY,
-                                   {false}, Index::DROP_TOKENS_THRESHOLD,
-                                   spp::sparse_hash_set<std::string>(),
-                                   spp::sparse_hash_set<std::string>(), 10, "", 30, 5,
-                                   "", 10,
-                                   {}, {}, {"size"}, 2).get();
-
-    ASSERT_EQ(1000, res2["found_docs"].get<size_t>());
-    ASSERT_EQ(300, res2["found"].get<size_t>());
-    ASSERT_EQ(100, res2["grouped_hits"].size());
-
-    ASSERT_EQ(3, res2["grouped_hits"][0]["found"].get<int32_t>());
-
-    ASSERT_EQ(3, res2["grouped_hits"][1]["found"].get<int32_t>());
-
-    ASSERT_EQ(4, res2["grouped_hits"][50]["found"].get<int32_t>());
-
-    ASSERT_EQ(4, res2["grouped_hits"][99]["found"].get<int32_t>());
+    ASSERT_EQ(4, res2["grouped_hits"][4]["found"].get<int32_t>());
 }
 
 TEST_F(CollectionGroupingTest, GroupSortingWithoutGroupingFields) {
@@ -937,7 +844,7 @@ TEST_F(CollectionGroupingTest, SkipToReverseGroupBy) {
                              {}, {}, {"brand"}, 2,
                              "<mark>", "</mark>", {3,3}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                              4, {off}, 0, 0, 0, 2, false, "", true, 0, max_score,
-                             100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, false).get();
+                             100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, false).get();
 
     ASSERT_EQ(1, res["grouped_hits"].size());
 
@@ -970,7 +877,7 @@ TEST_F(CollectionGroupingTest, SkipToReverseGroupBy) {
                              {}, {}, {"brand"}, 2,
                              "<mark>", "</mark>", {3,3}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                              4, {off}, 0, 0, 0, 2, false, "", true, 0, max_score,
-                             100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, false).get();
+                             100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, false).get();
 
     ASSERT_EQ(5, res["grouped_hits"].size());
 
@@ -999,7 +906,7 @@ TEST_F(CollectionGroupingTest, SkipToReverseGroupBy) {
                              {}, {}, {"brand"}, 2,
                              "<mark>", "</mark>", {3,3}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
                              4, {off}, 0, 0, 0, 2, false, "", true, 0, max_score,
-                             100, 0, 0, HASH, 30000, 2, "", {}, {}, "right_to_left", true, true).get();
+                             100, 0, 0, "exhaustive", 30000, 2, "", {}, {}, "right_to_left", true, true).get();
 
     ASSERT_EQ(4, res["grouped_hits"].size());
 
@@ -1132,7 +1039,7 @@ TEST_F(CollectionGroupingTest, GroupByMultipleFacetFieldsWithPinning) {
                                   "", 10,
                                   {"3:1,4:2"}, {}, {"size"}, 2).get();
 
-    ASSERT_EQ(5, res["found_docs"].get<size_t>());
+    ASSERT_EQ(7, res["found_docs"].get<size_t>());
     ASSERT_EQ(4, res["found"].get<size_t>());
     ASSERT_EQ(4, res["grouped_hits"].size());
 
@@ -1245,4 +1152,123 @@ TEST_F(CollectionGroupingTest, GroupByPinnedHitsOrder) {
     ASSERT_EQ(10, res["grouped_hits"][2]["group_key"][0].get<size_t>());
     ASSERT_EQ(1, res["grouped_hits"][2]["hits"].size());
     ASSERT_EQ("0", res["grouped_hits"][2]["hits"][0]["document"]["id"]);
+}
+
+TEST_F(CollectionGroupingTest, GroupByPerPage) {
+    std::vector<field> fields = {
+            field("name", field_types::STRING, false, false),
+            field("id", field_types::STRING, true, true),
+    };
+
+    Collection* fabric = collectionManager.get_collection("fabric").get();
+    if(fabric == nullptr) {
+        fabric = collectionManager.create_collection("fabric", 1, fields).get();
+    }
+
+
+    nlohmann::json doc;
+
+    doc["id"] = "1001";
+    doc["name"] = "Cotton";
+    ASSERT_TRUE(fabric->add(doc.dump()).ok());
+
+    doc["id"] = "1002";
+    doc["name"] = "Nylon";
+    ASSERT_TRUE(fabric->add(doc.dump()).ok());
+
+    doc["id"] = "1003";
+    doc["name"] = "Polyester";
+    ASSERT_TRUE(fabric->add(doc.dump()).ok());
+
+    doc["id"] = "1004";
+    doc["name"] = "Linen";
+    ASSERT_TRUE(fabric->add(doc.dump()).ok());
+
+    doc["id"] = "1005";
+    doc["name"] = "Silk";
+    ASSERT_TRUE(fabric->add(doc.dump()).ok());
+
+    fields = {
+            field("name", field_types::STRING, false, false),
+            field("fabric_id", field_types::STRING, true, false, true,
+            "", -1, -1, false, 0, 0, cosine, "fabric.id"),
+            field("size", field_types::STRING, false, false),
+    };
+
+    Collection* garments = collectionManager.get_collection("garments").get();
+    if(garments == nullptr) {
+        garments = collectionManager.create_collection("garments", 1, fields).get();
+    }
+
+    nlohmann::json doc2;
+
+    doc2["name"] = "Tshirt";
+    doc2["fabric_id"] = "1001";
+    doc2["size"] = "Medium";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Tshirt";
+    doc2["fabric_id"] = "1003";
+    doc2["size"] = "Large";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Shirt";
+    doc2["fabric_id"] = "1004";
+    doc2["size"] = "Xtra Large";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Trouser";
+    doc2["fabric_id"] = "1002";
+    doc2["size"] = "Small";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Veshti";
+    doc2["fabric_id"] = "1005";
+    doc2["size"] = "Free";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Shorts";
+    doc2["fabric_id"] = "1002";
+    doc2["size"] = "Medium";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    doc2["name"] = "Shirt";
+    doc2["fabric_id"] = "1005";
+    doc2["size"] = "Large";
+    ASSERT_TRUE(garments->add(doc2.dump()).ok());
+
+    //limit per page to 4
+    auto res = garments->search("*", {"name"}, "", {}, {}, {0}, 4, 1, NOT_SET,
+                             {false}, Index::DROP_TOKENS_THRESHOLD,
+                             spp::sparse_hash_set<std::string>(),
+                             spp::sparse_hash_set<std::string>(), 10, "", 30, 4,
+                             "", 1,
+                             {}, {}, {"fabric_id"}, 1).get();
+
+    ASSERT_EQ(4, res["found"].get<size_t>());
+    ASSERT_EQ(4, res["grouped_hits"].size());
+    ASSERT_EQ(7, res["found_docs"].get<size_t>());
+
+    ASSERT_EQ("1005", res["grouped_hits"][0]["group_key"][0]);
+    ASSERT_EQ("1002", res["grouped_hits"][1]["group_key"][0]);
+    ASSERT_EQ("1004", res["grouped_hits"][2]["group_key"][0]);
+    ASSERT_EQ("1003", res["grouped_hits"][3]["group_key"][0]);
+
+    //per page 10
+    res = garments->search("*", {"name"}, "", {}, {}, {0}, 10, 1, NOT_SET,
+                                {false}, Index::DROP_TOKENS_THRESHOLD,
+                                spp::sparse_hash_set<std::string>(),
+                                spp::sparse_hash_set<std::string>(), 10, "", 30, 4,
+                                "", 1,
+                                {}, {}, {"fabric_id"}, 1).get();
+
+    ASSERT_EQ(5, res["found"].get<size_t>());
+    ASSERT_EQ(5, res["grouped_hits"].size());
+    ASSERT_EQ(7, res["found_docs"].get<size_t>());
+
+    ASSERT_EQ("1005", res["grouped_hits"][0]["group_key"][0]);
+    ASSERT_EQ("1002", res["grouped_hits"][1]["group_key"][0]);
+    ASSERT_EQ("1004", res["grouped_hits"][2]["group_key"][0]);
+    ASSERT_EQ("1003", res["grouped_hits"][3]["group_key"][0]);
+    ASSERT_EQ("1001", res["grouped_hits"][4]["group_key"][0]);
 }

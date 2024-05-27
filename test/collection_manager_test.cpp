@@ -1268,7 +1268,7 @@ TEST_F(CollectionManagerTest, ParseSortByClause) {
     ASSERT_EQ("DESC", sort_fields[0].order);
 
     sort_fields.clear();
-    sort_by_parsed = CollectionManager::parse_sort_by_str("points:desc,loc(24.56,10.45):ASC,"
+    sort_by_parsed = CollectionManager::parse_sort_by_str("points:desc, loc(24.56,10.45):ASC, "
                                                           "$Customers(product_price:DESC)", sort_fields);
     ASSERT_TRUE(sort_by_parsed);
     ASSERT_EQ(3, sort_fields.size());
@@ -1277,6 +1277,27 @@ TEST_F(CollectionManagerTest, ParseSortByClause) {
     ASSERT_EQ("loc(24.56,10.45)", sort_fields[1].name);
     ASSERT_EQ("ASC", sort_fields[1].order);
     ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[2].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("_eval(brand:nike && foo:bar):DESC, "
+                                                          "$Customers(product_price:DESC)", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("_eval", sort_fields[0].name);
+    ASSERT_FALSE(sort_fields[0].eval_expressions.empty());
+    ASSERT_EQ("brand:nike && foo:bar", sort_fields[0].eval_expressions[0]);
+    ASSERT_EQ(1, sort_fields[0].eval.scores.size());
+    ASSERT_EQ(1, sort_fields[0].eval.scores[0]);
+    ASSERT_EQ("DESC", sort_fields[0].order);
+    ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[1].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$foo(bar:ASC), "
+                                                          "$Customers(product_price:DESC)", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("$foo(bar:ASC)", sort_fields[0].name);
+    ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[1].name);
 
     sort_fields.clear();
     sort_by_parsed = CollectionManager::parse_sort_by_str("$foo( _eval(brand:nike && foo:bar):DESC,points:desc) ",
@@ -1830,7 +1851,6 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
     ASSERT_TRUE(op.ok());
     Collection* coll1 = op.get();
 
-
     std::string collection_meta_json;
     nlohmann::json collection_meta;
     std::string next_seq_id;
@@ -1915,6 +1935,24 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
     expected_meta_json["created_at"] = actual_json["created_at"];
 
     ASSERT_EQ(expected_meta_json.dump(), actual_json.dump());
+
+    // metadata should exist as part of collection summary
+    auto coll_summary = coll1->get_summary_json();
+    ASSERT_EQ(expected_meta_json["metadata"].dump(), coll_summary["metadata"].dump());
+
+    // if no metadata is given, the key should not be present in response
+    schema2 = R"({
+        "name": "coll2",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string"}
+        ]
+    })"_json;
+
+    op = collectionManager.create_collection(schema2);
+    ASSERT_TRUE(op.ok());
+    Collection* coll2 = op.get();
+    ASSERT_EQ(0, coll2->get_summary_json().count("metadata"));
 }
 
 TEST_F(CollectionManagerTest, PopulateReferencedIns) {

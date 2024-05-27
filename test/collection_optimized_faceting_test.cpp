@@ -79,7 +79,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                                         3UL, "<mark>", "</mark>", {}, 4294967295UL, true, 
                                                         false, true, "", false, 6000000UL, 4UL, 7UL, fallback,
                                                         4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false, "", true, 
-                                                        0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();    
+                                                        0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();    
 
     ASSERT_EQ(5, results["hits"].size());
 
@@ -110,7 +110,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", "", {}, 3UL, "<mark>", "</mark>", {}, 4294967295UL, true, 
                                         false, true, "", false, 6000000UL, 4UL, 7UL, fallback, 4UL, {off}, 
                                         32767UL, 32767UL, 2UL, 2UL, false, "", true, 0UL, max_score, 100UL,
-                                        0UL, 4294967295UL, VALUE).get();  
+                                        0UL, 4294967295UL, "top_values").get();  
     
     ASSERT_EQ(5, results["hits"].size());
 
@@ -136,7 +136,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                                         3UL, "<mark>", "</mark>", {}, 4294967295UL, true, 
                                                         false, true, "", false, 6000000UL, 4UL, 7UL, fallback,
                                                         4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false, "", true, 
-                                                        0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();    
+                                                        0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();    
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(2, results["facet_counts"].size());
@@ -156,7 +156,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         3UL, "<mark>", "</mark>", {}, 4294967295UL, true, 
                                         false, true, "", false, 6000000UL, 4UL, 7UL, fallback,
                                         4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false, "", true, 
-                                        0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -170,7 +170,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["facet_counts"][0]["stats"].size());
     ASSERT_FLOAT_EQ(4.880199885368347, results["facet_counts"][0]["stats"]["avg"].get<double>());
@@ -193,7 +193,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(3, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -217,7 +217,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -233,7 +233,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -250,7 +250,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -266,7 +266,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -282,7 +282,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -304,7 +304,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
     
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -328,7 +328,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_STREQ("age", results["facet_counts"][0]["field_name"].get<std::string>().c_str());
@@ -341,7 +341,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
 
@@ -352,7 +352,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
 
@@ -364,7 +364,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -378,7 +378,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(0, results["facet_counts"].size());
@@ -390,7 +390,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(5, results["hits"].size());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -404,7 +404,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                             "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                             4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                             7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Facet query must be in the `facet_field: value` format.", res_op.error().c_str());
@@ -417,7 +417,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Could not find a facet field named `foobar` in the schema.", res_op.error().c_str());
@@ -430,7 +430,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Only prefix matching with a wildcard is allowed.", res_op.error().c_str());
@@ -443,7 +443,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Could not find a facet field for `foo*` in the schema.", res_op.error().c_str());
@@ -456,7 +456,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("The `facet_query` parameter is supplied without a `facet_by` parameter.", res_op.error().c_str());
@@ -468,7 +468,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Could not find a facet field named `` in the schema.", res_op.error().c_str());
@@ -481,7 +481,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCounts) {
                                         "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                         4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                         7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_STREQ("Facet query refers to a facet field `name_facet` that is not part of `facet_by` parameter.", res_op.error().c_str());
@@ -539,7 +539,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCountsStringArraySimple) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -599,7 +599,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCountsBool) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -641,7 +641,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCountsFloatPrecision) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -686,7 +686,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetFloatStats) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -773,7 +773,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetStatOnFloatFields) {
                                             "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                             4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                             7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     auto results = res_op.get();
 
@@ -821,7 +821,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCountOnSimilarStrings) {
                                             "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {}, 
                                             4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                             7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -836,7 +836,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetCountOnSimilarStrings) {
                             "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                             4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                             7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -884,7 +884,7 @@ TEST_F(CollectionOptimizedFacetingTest, ConcurrentValueFacetingOnMulFields) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(4, results["facet_counts"].size());
     collectionManager.drop_collection("coll1");
@@ -927,7 +927,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetByNestedIntField) {
                                  spp::sparse_hash_set<std::string>(), 10, "", 30, 4,  "", 1UL, "", "", {}, 3UL, 
                                  "<mark>", "</mark>", {}, 4294967295UL, true, false, true, "", false, 6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(2, results["found"].get<size_t>());
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -957,6 +957,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetParseTest){
             field("grade", field_types::INT32, true),
             field("rank", field_types::INT32, true),
             field("range", field_types::INT32, true),
+            field("sortindex", field_types::INT32, true),
             field("scale", field_types::INT32, false),
     };
 
@@ -1053,6 +1054,13 @@ TEST_F(CollectionOptimizedFacetingTest, FacetParseTest){
 
     ASSERT_EQ("rank", mixed_facets_ptr[2]->field_name);
     ASSERT_EQ("range", mixed_facets_ptr[1]->field_name);
+
+    //facetfield containing sort keyword should parse successfully
+    std::vector<facet> range_facets_with_sort_as_field;
+    auto facet_range = "sortindex(Top:[85, 100], Average:[60, 85])";
+
+    coll1->parse_facet(facet_range, range_facets_with_sort_as_field);
+    ASSERT_EQ(1, range_facets_with_sort_as_field.size());
 }
 
 TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
@@ -1113,7 +1121,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
  
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(1, (int) results["facet_counts"][0]["counts"][0]["count"]);
@@ -1130,7 +1138,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results2["facet_counts"][0]["counts"].size());
     ASSERT_EQ(1, results2["facet_counts"][0]["counts"][0]["count"].get<std::size_t>());
@@ -1147,7 +1155,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                              spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 10, {}, {}, {}, 0,
                              "<mark>", "</mark>", {}, 1000, true, false, true, "", true,  6000000UL, 4UL,
                              7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false, "", true, 0UL, 
-                             max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                             max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(results3.ok());
     ASSERT_EQ("Could not find a facet field named `visitorsz` in the schema.", results3.error());
@@ -1160,7 +1168,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                                   spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 10, {}, {}, {}, 0,
                                   "<mark>", "</mark>", {}, 1000, true, false, true, "", true,  6000000UL, 
                                   4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                  "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                  "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(2, results4["facet_counts"][0]["counts"].size());
     ASSERT_EQ(3, results4["facet_counts"][0]["counts"][0]["count"].get<std::size_t>());
@@ -1179,7 +1187,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(rop.ok());
     ASSERT_EQ("Range facet is restricted to only integer and float fields.", rop.error());
@@ -1194,7 +1202,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
                         "<mark>", "</mark>", {}, 1000,
                         true, false, true, "", true,  6000000UL, 
                         4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                        "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_FALSE(rop.ok());
     ASSERT_EQ("Facet range value is not valid.", rop.error());
@@ -1255,7 +1263,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetContinuity) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Ranges in range facet syntax should be continous.", results.error().c_str());
 
@@ -1268,7 +1276,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetContinuity) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Ranges in range facet syntax should be continous.", results2.error().c_str());
 
@@ -1328,7 +1336,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTypo) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Error splitting the facet range values.", results.error().c_str());
 
@@ -1341,7 +1349,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTypo) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Error splitting the facet range values.", results2.error().c_str());
 
@@ -1354,7 +1362,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTypo) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Error splitting the facet range values.", results3.error().c_str());
 
@@ -1367,7 +1375,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTypo) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Facet range value is not valid.", results4.error().c_str());
 
@@ -1380,7 +1388,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetTypo) {
                                   "<mark>", "</mark>", {}, 1000,
                                   true, false, true, "", true,  6000000UL, 
                                  4UL, 7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE);
+                                 "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values");
 
     ASSERT_STREQ("Facet range value is not valid.", results5.error().c_str());
 
@@ -1419,7 +1427,7 @@ TEST_F(CollectionOptimizedFacetingTest, SampleFacetCounts) {
                              spp::sparse_hash_set<std::string>(),
                              spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                              "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                             4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 5, 0, 4294967295UL, VALUE).get();
+                             4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 5, 0, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1000, res["found"].get<size_t>());
     ASSERT_EQ(1, res["facet_counts"].size());
@@ -1439,7 +1447,7 @@ TEST_F(CollectionOptimizedFacetingTest, SampleFacetCounts) {
                         spp::sparse_hash_set<std::string>(),
                         spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                         "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                        4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 10, 10000, 4294967295UL, VALUE).get();
+                        4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 10, 10000, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1000, res["found"].get<size_t>());
     ASSERT_EQ(1, res["facet_counts"].size());
@@ -1461,7 +1469,7 @@ TEST_F(CollectionOptimizedFacetingTest, SampleFacetCounts) {
                                 spp::sparse_hash_set<std::string>(),
                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 200, 0, 4294967295UL, VALUE);
+                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 200, 0, 4294967295UL, "top_values");
 
     ASSERT_FALSE(res_op.ok());
     ASSERT_EQ("Value of `facet_sample_percent` must be less than 100.", res_op.error());
@@ -1488,7 +1496,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetOnArrayFieldWithSpecialChars) {
                                  "", {"tags"}, {}, {2}, 10, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(4, results["facet_counts"][0]["counts"].size());
@@ -1539,7 +1547,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetTestWithDeletedDoc) {
                                  "", {"tags"}, {}, {2}, 10, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
 
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -1572,7 +1580,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryTest) {
                                  "", {"color"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 5, "color:b", 30, 4, "", 20, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
 
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -1584,7 +1592,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryTest) {
                             "", {"color"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                             spp::sparse_hash_set<std::string>(), 5, "color:xsda", 30, 4, "", 20, {}, {}, {}, 0,
                             "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                            4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                            4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(0, results["facet_counts"][0]["counts"].size());
 
@@ -1592,7 +1600,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryTest) {
                                  "", {"color"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 5, "color:green a", 30, 4, "", 20, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -1624,7 +1632,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryWithSymbols) {
                                  "", {"title"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                  spp::sparse_hash_set<std::string>(), 5, "title:article 4[", 30, 4, "", 20, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(3, results["facet_counts"][0]["counts"].size());
@@ -1671,7 +1679,7 @@ TEST_F(CollectionOptimizedFacetingTest, StringLengthTest) {
                                  "", {"tags"}, {}, {2}, 10, 1, FREQUENCY, {true}, 1, spp::sparse_hash_set<std::string>(),
                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 20, {}, {}, {}, 0,
                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7, fallback,
-                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, VALUE).get();
+                                4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL, "top_values").get();
 
 
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -1734,7 +1742,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParent) {
                                    fallback, 4, {off}, INT16_MAX, INT16_MAX,
                                    2, 2, false, "",
                                    true, 0, max_score, 100,
-                                   0, 0, VALUE, 30000,
+                                   0, 0, "top_values", 30000,
                                    2, "", {"value.color"});
 
     if(!search_op.ok()) {
@@ -1762,7 +1770,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParent) {
                               fallback, 4, {off}, INT16_MAX, INT16_MAX,
                               2, 2, false, "",
                               true, 0, max_score, 100,
-                              0, 0, VALUE, 30000,
+                              0, 0, "top_values", 30000,
                               2, "", {});
 
     if(!search_op.ok()) {
@@ -1787,7 +1795,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParent) {
                               fallback, 4, {off}, INT16_MAX, INT16_MAX,
                               2, 2, false, "",
                               true, 0, max_score, 100,
-                              0, 0, VALUE, 30000,
+                              0, 0, "top_values", 30000,
                               2, "", {"value.r"});
 
     if(!search_op.ok()) {
@@ -1820,7 +1828,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParent) {
                               fallback, 4, {off}, INT16_MAX, INT16_MAX,
                               2, 2, false, "",
                               true, 0, max_score, 100,
-                              0, 0, VALUE, 30000,
+                              0, 0, "top_values", 30000,
                               2, "", {"value.r", "value.g", "value.b"});
 
     if(!search_op.ok()) {
@@ -1904,7 +1912,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParentDeepNested) {
                                    fallback, 4, {off}, INT16_MAX, INT16_MAX,
                                    2, 2, false, "",
                                    true, 0, max_score, 100,
-                                   0, 0, VALUE, 30000,
+                                   0, 0, "top_values", 30000,
                                    2, "", {"product.specification.detail.width"});
 
     if(!search_op.ok()) {
@@ -1968,7 +1976,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParentObject) {
                                    fallback, 4, {off}, INT16_MAX, INT16_MAX,
                                    2, 2, false, "",
                                    true, 0, max_score, 100,
-                                   0, 0, VALUE, 30000,
+                                   0, 0, "top_values", 30000,
                                    2, "", {"value.color"});
 
     if(!search_op.ok()) {
@@ -2425,7 +2433,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetSortValidation) {
                               4UL,7UL, fallback, 4UL, {off}, 32767UL,
                               32767UL, 2UL, 2UL, false,
                               "", true, 0UL, max_score, 100UL,
-                              0UL, 4294967295UL, VALUE);
+                              0UL, 4294967295UL, "top_values");
 
     results = search_op.get();
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -2471,7 +2479,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryWithDifferentLocale) {
                                    4UL,7UL, fallback, 4UL, {off}, 32767UL,
                                    32767UL, 2UL, 2UL, false,
                                    "", true, 0UL, max_score, 100UL,
-                                   0UL, 4294967295UL, VALUE);
+                                   0UL, 4294967295UL, "top_values");
 
     auto results = search_op.get();
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -2490,7 +2498,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetQueryWithDifferentLocale) {
                               4UL,7UL, fallback, 4UL, {off}, 32767UL,
                               32767UL, 2UL, 2UL, false,
                               "", true, 0UL, max_score, 100UL,
-                              0UL, 4294967295UL, VALUE);
+                              0UL, 4294967295UL, "top_values");
 
     results = search_op.get();
     ASSERT_EQ(1, results["facet_counts"].size());
@@ -2552,7 +2560,7 @@ TEST_F(CollectionOptimizedFacetingTest, ValueIndexStatsMinMax) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -2602,7 +2610,7 @@ TEST_F(CollectionOptimizedFacetingTest, FacetWithPhraseSearch) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -2650,7 +2658,7 @@ TEST_F(CollectionOptimizedFacetingTest, StringFacetsCountListOrderTest) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -2705,7 +2713,7 @@ TEST_F(CollectionOptimizedFacetingTest, StringFacetsCountListRemoveTest) {
                                            "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                                            4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                                            7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                                           "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
@@ -2731,7 +2739,7 @@ TEST_F(CollectionOptimizedFacetingTest, StringFacetsCountListRemoveTest) {
                             "", 1UL, "", "", {}, 3UL, "<mark>", "</mark>", {},
                             4294967295UL, true, false, true, "", false, 6000000UL, 4UL,
                             7UL, fallback, 4UL, {off}, 32767UL, 32767UL, 2UL, 2UL, false,
-                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, VALUE).get();
+                            "", true, 0UL, max_score, 100UL, 0UL, 4294967295UL, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"].size());
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
@@ -2775,7 +2783,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetAlphanumericLabels) {
                                  spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 10, {}, {}, {}, 0,
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true, 6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(3, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(2, results["facet_counts"][0]["counts"][0]["count"]);
@@ -2820,7 +2828,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetsFloatRange) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,
                                  6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(2, (int) results["facet_counts"][0]["counts"][0]["count"]);
@@ -2835,7 +2843,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetsFloatRange) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,
                                  6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(1, (int) results["facet_counts"][0]["counts"][0]["count"]);
@@ -2876,7 +2884,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetsMinMaxRange) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,
                                  6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(2, (int) results["facet_counts"][0]["counts"][0]["count"]);
@@ -2893,7 +2901,7 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetsMinMaxRange) {
                             "<mark>", "</mark>", {}, 1000,
                             true, false, true, "", true,
                             6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                            2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                            2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(1, (int) results["facet_counts"][0]["counts"][0]["count"]);
@@ -2934,9 +2942,52 @@ TEST_F(CollectionOptimizedFacetingTest, RangeFacetRangeLabelWithSpace) {
                                  "<mark>", "</mark>", {}, 1000,
                                  true, false, true, "", true,
                                  6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
-                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, VALUE).get();
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
 
     ASSERT_EQ(1, results["facet_counts"][0]["counts"].size());
     ASSERT_EQ(1, (int) results["facet_counts"][0]["counts"][0]["count"]);
     ASSERT_EQ("small tvs with display size", results["facet_counts"][0]["counts"][0]["value"]);
+}
+
+TEST_F(CollectionOptimizedFacetingTest, RangeFacetsWithSortDisabled) {
+    std::vector<field> fields = {field("name", field_types::STRING, false, false, true, "", 1),
+                                 field("brand", field_types::STRING, true, false, true, "", -1),
+                                 field("price", field_types::FLOAT, true, false, true, "", -1)};
+
+    Collection* coll2 = collectionManager.create_collection(
+            "coll2", 1, fields, "", 0, "",
+            {},{}).get();
+
+    nlohmann::json doc;
+    doc["name"] = "keyboard";
+    doc["id"] = "pd-1";
+    doc["brand"] = "Logitech";
+    doc["price"] = 49.99;
+    ASSERT_TRUE(coll2->add(doc.dump()).ok());
+
+    doc["name"] = "mouse";
+    doc["id"] = "pd-2";
+    doc["brand"] = "Logitech";
+    doc["price"] = 29.99;
+    ASSERT_TRUE(coll2->add(doc.dump()).ok());
+
+    auto results = coll2->search("*", {},
+                                 "brand:=Logitech", {"price(Low:[0, 30], Medium:[30, 75], High:[75, ])"},
+                                 {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 10, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 10, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000,
+                                 true, false, true, "", true,
+                                 6000*1000, 4, 7, fallback, 4, {off}, INT16_MAX, INT16_MAX,
+                                 2, 2, false, "", true, 0, max_score, 100, 0, 0, "top_values").get();
+
+    //when value index is forced it works
+    ASSERT_EQ(2, results["facet_counts"][0]["counts"].size());
+
+    ASSERT_EQ(1, results["facet_counts"][0]["counts"][0]["count"]);
+    ASSERT_EQ("Low", results["facet_counts"][0]["counts"][0]["value"]);
+
+    ASSERT_EQ(1, results["facet_counts"][0]["counts"][1]["count"]);
+    ASSERT_EQ("Medium", results["facet_counts"][0]["counts"][1]["value"]);
 }

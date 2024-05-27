@@ -36,6 +36,11 @@ struct sort_fields_guard_t {
             for (auto& eval_ids: sort_by_clause.eval.eval_ids_vec) {
                 delete [] eval_ids;
             }
+
+            for (uint32_t i = 0; i < sort_by_clause.eval_expressions.size(); i++) {
+                delete sort_by_clause.eval.filter_trees[i];
+            }
+
             delete [] sort_by_clause.eval.filter_trees;
         }
     }
@@ -48,7 +53,8 @@ Collection::Collection(const std::string& name, const uint32_t collection_id, co
                        const std::vector<std::string>& symbols_to_index,
                        const std::vector<std::string>& token_separators,
                        const bool enable_nested_fields, std::shared_ptr<VQModel> vq_model,
-                       spp::sparse_hash_map<std::string, std::string> referenced_in) :
+                       spp::sparse_hash_map<std::string, std::string> referenced_in,
+                       const nlohmann::json& metadata) :
         name(name), collection_id(collection_id), created_at(created_at),
         next_seq_id(next_seq_id), store(store),
         fields(fields), default_sorting_field(default_sorting_field), enable_nested_fields(enable_nested_fields),
@@ -56,7 +62,8 @@ Collection::Collection(const std::string& name, const uint32_t collection_id, co
         fallback_field_type(fallback_field_type), dynamic_fields({}),
         symbols_to_index(to_char_array(symbols_to_index)), token_separators(to_char_array(token_separators)),
         index(init_index()), vq_model(vq_model),
-        referenced_in(std::move(referenced_in)) {
+        referenced_in(std::move(referenced_in)),
+        metadata(metadata) {
     
     if (vq_model) {
         vq_model->inc_collection_ref_count();
@@ -77,6 +84,8 @@ Collection::~Collection() {
             VQModelManager::get_instance().delete_model(vq_model->get_model_name());
         }
     }
+
+    ConversationManager::get_instance().remove_conversation_collection(name);
 }
 
 uint32_t Collection::get_next_seq_id() {
@@ -147,9 +156,57 @@ Option<bool> Collection::add_reference_helper_fields(nlohmann::json& document, c
 
         auto const reference_helper_field = field_name + fields::REFERENCE_HELPER_FIELD_SUFFIX;
 
+        bool is_object_reference_field = flat_fields.count(field_name) != 0;
+        std::string object_key;
+        bool is_object_array = false;
+        if (is_object_reference_field) {
+            object_reference_helper_fields.insert(reference_helper_field);
+
+            std::vector<std::string> tokens;
+            StringUtils::split(field_name, tokens, ".");
+            if (schema.count(tokens[0]) == 0) {
+                return Option<bool>(400, "Could not find `" + tokens[0] + "` object/object[] field in the schema.");
+            }
+            object_key = tokens[0];
+            is_object_array = schema.at(object_key).is_array();
+        }
+
         if (reference_field_name == "id") {
             auto id_field_type_error_op =  Option<bool>(400, "Field `" + field_name + "` must have string value.");
-            if (document[field_name].is_array()) {
+            if (is_object_array) {
+                if (!document[field_name].is_array()) {
+                    return Option<bool>(400, "Expected `" + field_name + "` to be an array.");
+                }
+
+                document[reference_helper_field] = nlohmann::json::array();
+                document[fields::reference_helper_fields] += reference_helper_field;
+
+                std::vector<std::string> keys;
+                StringUtils::split(field_name, keys, ".");
+                auto const& object_array = document[keys[0]];
+
+                for (uint32_t i = 0; i < object_array.size(); i++) {
+                    if (optional && object_array[i].count(keys[1]) == 0) {
+                        continue;
+                    } else if (object_array[i].count(keys[1]) == 0) {
+                        return Option<bool>(400, "Object at index `" + std::to_string(i) + "` is missing `" + field_name + "`.");
+                    } else if (!object_array[i].at(keys[1]).is_string()) {
+                        return id_field_type_error_op;
+                    }
+
+                    auto id = object_array[i].at(keys[1]).get<std::string>();
+                    auto ref_doc_id_op = ref_collection->doc_id_to_seq_id_with_lock(id);
+                    if (!ref_doc_id_op.ok()) {
+                        return Option<bool>(400, "Referenced document having `id: " + id +
+                                                 "` not found in the collection `" +
+                                                 reference_collection_name + "`." );
+                    }
+
+                    // Adding the index of the object along with referenced doc id to account for the scenario where a
+                    // reference field of an object array might be optional and missing.
+                    document[reference_helper_field] += nlohmann::json::array({i, ref_doc_id_op.get()});
+                }
+            } else if (document[field_name].is_array()) {
                 document[reference_helper_field] = nlohmann::json::array();
                 document[fields::reference_helper_fields] += reference_helper_field;
 
@@ -212,22 +269,7 @@ Option<bool> Collection::add_reference_helper_fields(nlohmann::json& document, c
                                 "` of type `" + ref_field.type + "`.");
         }
 
-        bool is_object_reference_field = flat_fields.count(field_name) != 0;
-        std::string object_key;
-        bool is_object_array;
-        if (is_object_reference_field) {
-            object_reference_helper_fields.insert(reference_helper_field);
-
-            std::vector<std::string> tokens;
-            StringUtils::split(field_name, tokens, ".");
-            if (schema.count(tokens[0]) == 0) {
-                return Option<bool>(400, "Could not find `" + tokens[0] + "` object/object[] field in the schema.");
-            }
-            object_key = tokens[0];
-            is_object_array = schema.at(object_key).is_array();
-        }
-
-        if (is_object_reference_field && is_object_array) {
+        if (is_object_array) {
             if (!document[field_name].is_array()) {
                 return Option<bool>(400, "Expected `" + field_name + "` to be an array.");
             }
@@ -504,7 +546,10 @@ nlohmann::json Collection::get_summary_json() const {
 
     json_response["fields"] = fields_arr;
     json_response["default_sorting_field"] = default_sorting_field;
-    
+    if(!metadata.empty()) {
+        json_response["metadata"] = metadata;
+    }
+
     if(vq_model) {
         json_response["voice_query_model"] = nlohmann::json::object();
         json_response["voice_query_model"]["model_name"] = vq_model->get_model_name();
@@ -1183,23 +1228,25 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
                                                                                                      is_group_by_query,
                                                                                                      remote_embedding_timeout_ms,
                                                                                                      remote_embedding_num_tries);
-            if (!sort_validation_op.ok()) {
-                return Option<bool>(sort_validation_op.code(), "Referenced collection `" + ref_collection_name + "`: " +
-                                                                sort_validation_op.error());
-            }
-
             for (auto& ref_sort_field_std: ref_sort_fields_std) {
                 ref_sort_field_std.reference_collection_name = ref_collection_name;
                 sort_fields_std.emplace_back(ref_sort_field_std);
             }
 
+            if (!sort_validation_op.ok()) {
+                return Option<bool>(sort_validation_op.code(), "Referenced collection `" + ref_collection_name + "`: " +
+                                                                sort_validation_op.error());
+            }
+
             continue;
         } else if (_sort_field.name == sort_field_const::eval) {
-            sort_by sort_field_std(sort_field_const::eval, _sort_field.order);
+            sort_fields_std.emplace_back(sort_field_const::eval, _sort_field.order);
+            auto& sort_field_std = sort_fields_std.back();
 
             auto const& count = _sort_field.eval_expressions.size();
-            sort_field_std.eval.filter_trees = new filter_node_t[count];
-            std::unique_ptr<filter_node_t []> filter_trees_guard(sort_field_std.eval.filter_trees);
+            sort_field_std.eval.filter_trees = new filter_node_t*[count]{nullptr};
+            sort_field_std.eval_expressions = _sort_field.eval_expressions;
+            sort_field_std.eval.scores = _sort_field.eval.scores;
 
             for (uint32_t j = 0; j < count; j++) {
                 auto const& filter_exp = _sort_field.eval_expressions[j];
@@ -1207,23 +1254,14 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
                     return Option<bool>(400, "The eval expression in sort_by is empty.");
                 }
 
-                filter_node_t* filter_tree_root = nullptr;
                 Option<bool> parse_filter_op = filter::parse_filter_query(filter_exp, search_schema,
-                                                                          store, "", filter_tree_root);
-                std::unique_ptr<filter_node_t> filter_tree_root_guard(filter_tree_root);
-
+                                                                          store, "", sort_field_std.eval.filter_trees[j]);
                 if (!parse_filter_op.ok()) {
                     return Option<bool>(parse_filter_op.code(), "Error parsing eval expression in sort_by clause.");
                 }
-
-                sort_field_std.eval.filter_trees[j] = std::move(*filter_tree_root);
             }
 
             eval_sort_count++;
-            sort_field_std.eval_expressions = _sort_field.eval_expressions;
-            sort_field_std.eval.scores = _sort_field.eval.scores;
-            sort_fields_std.emplace_back(sort_field_std);
-            filter_trees_guard.release();
             continue;
         }
 
@@ -1254,22 +1292,6 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
                 sort_field_std.name = actual_field_name;
                 sort_field_std.text_match_buckets = std::stoll(match_parts[1]);
 
-            } else if(actual_field_name == sort_field_const::eval) {
-                const std::string& filter_exp = sort_field_std.name.substr(paran_start + 1,
-                                                                           sort_field_std.name.size() - paran_start -
-                                                                           2);
-                if(filter_exp.empty()) {
-                    return Option<bool>(400, "The eval expression in sort_by is empty.");
-                }
-
-                Option<bool> parse_filter_op = filter::parse_filter_query(filter_exp, search_schema,
-                                                                          store, "", sort_field_std.eval.filter_trees);
-                if(!parse_filter_op.ok()) {
-                    return Option<bool>(parse_filter_op.code(), "Error parsing eval expression in sort_by clause.");
-                }
-
-                sort_field_std.name = actual_field_name;
-                num_sort_expressions++;
             } else if(actual_field_name == sort_field_const::vector_query) {
                 const std::string& vector_query_str = sort_field_std.name.substr(paran_start + 1,
                                                                               sort_field_std.name.size() - paran_start -
@@ -1736,7 +1758,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
                                   const size_t max_extra_prefix,
                                   const size_t max_extra_suffix,
                                   const size_t facet_query_num_typos,
-                                  const size_t filter_curated_hits_option,
+                                  const bool filter_curated_hits_option,
                                   const bool prioritize_token_position,
                                   const std::string& vector_query_str,
                                   const bool enable_highlight_v1,
@@ -1745,7 +1767,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
                                   const size_t facet_sample_percent,
                                   const size_t facet_sample_threshold,
                                   const size_t page_offset,
-                                  facet_index_type_t facet_index_type,
+                                  const std::string& facet_index_type,
                                   const size_t remote_embedding_timeout_ms,
                                   const size_t remote_embedding_num_tries,
                                   const std::string& stopwords_set,
@@ -1840,6 +1862,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
     size_t num_embed_fields = 0;
     std::string query = raw_query;
     std::string transcribed_query;
+    std::string conversation_standalone_query = raw_query;
     if(!voice_query.empty()) {
         if(!vq_model) {
             return Option<nlohmann::json>(400, "Voice query is not enabled. Please set `voice_query_model` for this collection.");
@@ -1884,6 +1907,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
             return Option<nlohmann::json>(400, standalone_question_op.error());
         }
         query = standalone_question_op.get();
+        conversation_standalone_query = query;
     }
 
     for(size_t i = 0; i < raw_search_fields.size(); i++) {
@@ -2084,6 +2108,37 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
         }
     }
 
+
+    std::vector<facet_index_type_t> facet_index_types;
+    std::vector<std::string> facet_index_str_types;
+    StringUtils::split(facet_index_type, facet_index_str_types, ",");
+    if(facet_index_str_types.empty()) {
+        for(size_t i = 0; i < facet_fields.size(); i++) {
+            facet_index_types.push_back(automatic);
+        }
+    } else if(facet_index_str_types.size() == 1) {
+        auto match_op = magic_enum::enum_cast<facet_index_type_t>(facet_index_str_types[0]);
+        if(!match_op.has_value()) {
+            return Option<nlohmann::json>(400, "Invalid facet index type: " + facet_index_str_types[0]);
+        }
+        for(size_t i = 0; i < facet_fields.size(); i++) {
+            facet_index_types.push_back(match_op.value());
+        }
+    } else {
+        for(const auto& facet_index_str_type: facet_index_str_types) {
+            auto match_op = magic_enum::enum_cast<facet_index_type_t>(facet_index_str_type);
+            if(match_op.has_value()) {
+                facet_index_types.push_back(match_op.value());
+            } else {
+                return Option<nlohmann::json>(400, "Invalid facet index type: " + facet_index_str_type);
+            }
+        }
+    }
+
+    if(facets.size() != facet_index_types.size()) {
+        return Option<nlohmann::json>(400, "Size of facet_index_type does not match size of facets.");
+    }
+
     // parse facet query
     facet_query_t facet_query = {"", ""};
 
@@ -2132,8 +2187,10 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
         }
     }
 
-    if(per_page > PER_PAGE_MAX) {
-        std::string message = "Only upto " + std::to_string(PER_PAGE_MAX) + " hits can be fetched per page.";
+    int per_page_max = Config::get_instance().get_max_per_page();
+
+    if(per_page > per_page_max) {
+        std::string message = "Only upto " + std::to_string(per_page_max) + " hits can be fetched per page.";
         return Option<nlohmann::json>(422, message);
     }
 
@@ -2200,7 +2257,6 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
 
     nlohmann::json override_metadata;
     std::vector<const override_t*> filter_overrides;
-    bool filter_curated_hits = false;
     std::string curated_sort_by;
     std::set<std::string> override_tag_set;
 
@@ -2210,14 +2266,13 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
         override_tag_set.insert(tag);
     }
 
+    bool filter_curated_hits_overrides = false;
+
     curate_results(query, filter_query, enable_overrides, pre_segmented_query, override_tag_set,
-                   pinned_hits, hidden_hits, included_ids, excluded_ids, filter_overrides, filter_curated_hits,
+                   pinned_hits, hidden_hits, included_ids, excluded_ids, filter_overrides, filter_curated_hits_overrides,
                    curated_sort_by, override_metadata);
 
-    if(filter_curated_hits_option == 0 || filter_curated_hits_option == 1) {
-        // When query param has explicit value set, override level configuration takes lower precedence.
-        filter_curated_hits = bool(filter_curated_hits_option);
-    }
+    bool filter_curated_hits = filter_curated_hits_option || filter_curated_hits_overrides;
 
     /*for(auto& kv: included_ids) {
         LOG(INFO) << "key: " << kv.first;
@@ -2361,7 +2416,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
 
     std::unique_ptr<search_args> search_params_guard(search_params);
 
-    auto search_op = index->run_search(search_params, name, facet_index_type,
+    auto search_op = index->run_search(search_params, name, facet_index_types,
                                        enable_typos_for_numerical_tokens, enable_synonyms, synonym_prefix,
                                        synonyms_num_typos, enable_typos_for_alpha_numerical_tokens);
 
@@ -2386,7 +2441,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
 
     // for grouping we have to aggregate group set sizes to a count value
     if(group_limit) {
-        total = search_params->groups_processed.size() + override_result_kvs.size();
+        total = search_params->topster->get_total_unique_groups() + override_result_kvs.size();
     } else {
         total = search_params->all_result_ids_len;
     }
@@ -2768,11 +2823,11 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
             return Option<nlohmann::json>(min_required_bytes_op.code(), min_required_bytes_op.error());
         }
         auto min_required_bytes = min_required_bytes_op.get();
-        if(conversation_model["max_bytes"].get<size_t>() < min_required_bytes + raw_query.size()) { 
+        if(conversation_model["max_bytes"].get<size_t>() < min_required_bytes + conversation_standalone_query.size()) { 
             return Option<nlohmann::json>(400, "`max_bytes` of the conversation model is less than the minimum required bytes(" + std::to_string(min_required_bytes) + ").");
         }
         // remove document with lowest score until total tokens is less than MAX_TOKENS
-        while(docs_array.dump(0).size() > conversation_model["max_bytes"].get<size_t>() - min_required_bytes - raw_query.size()) {
+        while(docs_array.dump(0).size() > conversation_model["max_bytes"].get<size_t>() - min_required_bytes - conversation_standalone_query.size()) {
             try {
                 if(docs_array.empty()) {
                     break;
@@ -2784,7 +2839,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
         }
 
         bool has_conversation_history = !conversation_id.empty();
-        auto qa_op = ConversationModel::get_answer(docs_array.dump(0), raw_query, conversation_model);
+        auto qa_op = ConversationModel::get_answer(docs_array.dump(0), conversation_standalone_query, conversation_model);
         if(!qa_op.ok()) {
             return Option<nlohmann::json>(qa_op.code(), qa_op.error());
         }
@@ -2803,39 +2858,24 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
             return Option<nlohmann::json>(formatted_answer_op.code(), formatted_answer_op.error());
         }
 
-        if(has_conversation_history) {
-            ConversationManager::get_instance().append_conversation(conversation_id, formatted_question_op.get());
-            ConversationManager::get_instance().append_conversation(conversation_id, formatted_answer_op.get());
-            auto get_conversation_op = ConversationManager::get_instance().get_conversation(conversation_id);
-            if(!get_conversation_op.ok()) {
-                return Option<nlohmann::json>(get_conversation_op.code(), get_conversation_op.error());
-            }
+        nlohmann::json conversation_history = nlohmann::json::array();
+        conversation_history.push_back(formatted_question_op.get());
+        conversation_history.push_back(formatted_answer_op.get());
 
-            auto conversation_history = get_conversation_op.get();
-            if(exclude_fields.count("conversation_history") == 0) {
-                result["conversation"]["conversation_history"] = conversation_history;
-            }
-            result["conversation"]["conversation_id"] = conversation_id;
-        } else {
-            nlohmann::json conversation_history = nlohmann::json::array();
-            conversation_history.push_back(formatted_question_op.get());
-            conversation_history.push_back(formatted_answer_op.get());
-
-            auto create_conversation_op = ConversationManager::get_instance().create_conversation(conversation_history);
-            if(!create_conversation_op.ok()) {
-                return Option<nlohmann::json>(create_conversation_op.code(), create_conversation_op.error());
-            }
-
-            auto get_conversation_op = ConversationManager::get_instance().get_conversation(create_conversation_op.get());
-            if(!get_conversation_op.ok()) {
-                return Option<nlohmann::json>(get_conversation_op.code(), get_conversation_op.error());
-            }
-
-            if(exclude_fields.count("conversation_history") == 0) {
-                result["conversation"]["conversation_history"] = get_conversation_op.get();
-            }
-            result["conversation"]["conversation_id"] = create_conversation_op.get();
+        auto add_conversation_op = ConversationManager::get_instance().add_conversation(conversation_history, conversation_model["conversation_collection"].get<std::string>(), conversation_id);
+        if(!add_conversation_op.ok()) {
+            return Option<nlohmann::json>(add_conversation_op.code(), add_conversation_op.error());
         }
+
+        auto get_conversation_op = ConversationManager::get_instance().get_conversation(add_conversation_op.get());
+        if(!get_conversation_op.ok()) {
+            return Option<nlohmann::json>(get_conversation_op.code(), get_conversation_op.error());
+        }
+
+        if(exclude_fields.count("conversation_history") == 0) {
+            result["conversation"]["conversation_history"] = get_conversation_op.get();
+        }
+        result["conversation"]["conversation_id"] = add_conversation_op.get();
     }
 
     result["facet_counts"] = nlohmann::json::array();
@@ -3056,7 +3096,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
             facet_result["stats"]["avg"] = (a_facet.stats.fvsum / a_facet.stats.fvcount);
         }
 
-        facet_result["stats"]["total_values"] = facet_values.size();
+        facet_result["stats"]["total_values"] = facet_counts.size();
         result["facet_counts"].push_back(facet_result);
     }
 
@@ -3590,7 +3630,7 @@ void Collection::populate_result_kvs(Topster *topster, std::vector<std::vector<K
                 if(group_count_index >= 0) {
                     const auto& itr = groups_processed.find(kv_head->distinct_key);
                     if(itr != groups_processed.end()) {
-                        kv_head->scores[group_count_index] = itr->second * group_sort_order;
+                        kv_head->scores[group_count_index] = (int)itr->second * group_sort_order;
                     }
                 }
                 gtopster.add(kv_head);
@@ -6151,13 +6191,14 @@ bool Collection::get_enable_nested_fields() {
 
 Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector<facet>& facets) const {
     const std::regex base_pattern(".+\\(.*\\)");
-    const std::regex range_pattern("[[0-9]*[a-z A-Z]+[0-9]*:\\[([+-]?([0-9]*[.])?[0-9]*)\\,\\s*([+-]?([0-9]*[.])?[0-9]*)\\]");
+    const std::regex range_pattern(
+            "[[0-9]*[a-z A-Z]+[0-9]*:\\[([+-]?([0-9]*[.])?[0-9]*)\\,\\s*([+-]?([0-9]*[.])?[0-9]*)\\]");
     const std::string _alpha = "_alpha";
 
-   if ((facet_field.find(":") != std::string::npos)
-        && (facet_field.find("sort") == std::string::npos)) { //range based facet
+    if((facet_field.find(":") != std::string::npos)
+       && (facet_field.find("sort_by") == std::string::npos)) { //range based facet
 
-       if (!std::regex_match(facet_field, base_pattern)) {
+        if(!std::regex_match(facet_field, base_pattern)) {
             std::string error = "Facet range value is not valid.";
             return Option<bool>(400, error);
         }
@@ -6170,11 +6211,22 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
             return Option<bool>(404, error);
         }
 
+        if((field_name.find("sort") == std::string::npos)
+           && (facet_field.find("sort") != std::string::npos)) {
+            //sort keyword is found in facet string but not in facet field
+            std::string error = "Invalid sort format.";
+            return Option<bool>(400, error);
+        }
+
         const field& a_field = search_schema.at(field_name);
 
-        if(!a_field.is_integer() && !a_field.is_float()){
+        if(!a_field.is_integer() && !a_field.is_float()) {
             std::string error = "Range facet is restricted to only integer and float fields.";
             return Option<bool>(400, error);
+        }
+
+        if(!a_field.sort) {
+            return Option<bool>(400, "Range facets require sort enabled for the field.");
         }
 
         facet a_facet(field_name, facets.size());
@@ -6185,32 +6237,28 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
         //split the ranges
         std::vector<std::string> result;
         startpos = 0;
-        int index=0;
+        int index = 0;
         int commaFound = 0, rangeFound = 0;
-        bool range_open=false;
-        while(index < range_string.size()){
-            if(range_string[index] == ']'){
-                if(range_open == true){
+        bool range_open = false;
+        while(index < range_string.size()) {
+            if(range_string[index] == ']') {
+                if(range_open == true) {
                     std::string range = range_string.substr(startpos, index + 1 - startpos);
-                    range=StringUtils::trim(range);
+                    range = StringUtils::trim(range);
                     result.emplace_back(range);
                     rangeFound++;
-                    range_open=false;
-                }
-                else{
+                    range_open = false;
+                } else {
                     result.clear();
                     break;
                 }
-            }
-            else if(range_string[index] == ',' && range_open == false){
-                startpos = index+1;
+            } else if(range_string[index] == ',' && range_open == false) {
+                startpos = index + 1;
                 commaFound++;
-            }
-            else if(range_string[index] == '['){
-                if((commaFound == rangeFound) && range_open==false){
-                    range_open=true;
-                }
-                else{
+            } else if(range_string[index] == '[') {
+                if((commaFound == rangeFound) && range_open == false) {
+                    range_open = true;
+                } else {
                     result.clear();
                     break;
                 }
@@ -6219,7 +6267,7 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
             index++;
         }
 
-        if((result.empty()) || (range_open==true)){
+        if((result.empty()) || (range_open == true)) {
             std::string error = "Error splitting the facet range values.";
             return Option<bool>(400, error);
         }
@@ -6228,9 +6276,9 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
 
         auto& range_map = a_facet.facet_range_map;
         range_map.clear();
-        for(const auto& range : result){
+        for(const auto& range: result) {
             //validate each range syntax
-            if(!std::regex_match(range, range_pattern)){
+            if(!std::regex_match(range, range_pattern)) {
                 std::string error = "Facet range value is not valid.";
                 return Option<bool>(400, error);
             }
@@ -6292,27 +6340,27 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
         //sort the range values so that we can check continuity
         sort(tupVec.begin(), tupVec.end());
 
-        for(const auto& tup : tupVec){
+        for(const auto& tup: tupVec) {
 
             const auto& lower_range = std::get<0>(tup);
             const auto& upper_range = std::get<1>(tup);
             const std::string& range_val = std::get<2>(tup);
             //check if ranges are continous or not
-            if((!range_map.empty()) && (range_map.find(lower_range)== range_map.end())){
+            if((!range_map.empty()) && (range_map.find(lower_range) == range_map.end())) {
                 std::string error = "Ranges in range facet syntax should be continous.";
                 return Option<bool>(400, error);
             }
 
-            range_map[upper_range] =  range_specs_t{range_val, lower_range};
+            range_map[upper_range] = range_specs_t{range_val, lower_range};
         }
 
         a_facet.is_range_query = true;
 
         facets.emplace_back(std::move(a_facet));
-    } else if (facet_field.find('*') != std::string::npos) { // Wildcard
-       if (facet_field[facet_field.size() - 1] != '*') {
-           return Option<bool>(404, "Only prefix matching with a wildcard is allowed.");
-       }
+    } else if(facet_field.find('*') != std::string::npos) { // Wildcard
+        if(facet_field[facet_field.size() - 1] != '*') {
+            return Option<bool>(404, "Only prefix matching with a wildcard is allowed.");
+        }
 
         // Trim * from the end.
         auto prefix = facet_field.substr(0, facet_field.size() - 1);
@@ -6325,80 +6373,80 @@ Option<bool> Collection::parse_facet(const std::string& facet_field, std::vector
         }
 
         // Collect the fields that match the prefix and are marked as facet.
-        for (auto field = pair.first; field != pair.second; field++) {
-            if (field->facet) {
+        for(auto field = pair.first; field != pair.second; field++) {
+            if(field->facet) {
                 facets.emplace_back(facet(field->name, facets.size()));
                 facets.back().is_wildcard_match = true;
             }
         }
     } else {
-       // normal facet
-       std::string order = "";
-       bool sort_alpha = false;
-       std::string sort_field = "";
-       std::string facet_field_copy = facet_field;
-       auto pos = facet_field_copy.find("(");
-       if(pos != std::string::npos) {
-           facet_field_copy = facet_field_copy.substr(0, pos);
-       }
+        // normal facet
+        std::string order = "";
+        bool sort_alpha = false;
+        std::string sort_field = "";
+        std::string facet_field_copy = facet_field;
+        auto pos = facet_field_copy.find("(");
+        if(pos != std::string::npos) {
+            facet_field_copy = facet_field_copy.substr(0, pos);
+        }
 
-       if (search_schema.count(facet_field_copy) == 0 || !search_schema.at(facet_field_copy).facet) {
-           std::string error = "Could not find a facet field named `" + facet_field_copy + "` in the schema.";
-           return Option<bool>(404, error);
-       }
+        if(search_schema.count(facet_field_copy) == 0 || !search_schema.at(facet_field_copy).facet) {
+            std::string error = "Could not find a facet field named `" + facet_field_copy + "` in the schema.";
+            return Option<bool>(404, error);
+        }
 
-       if (facet_field.find("sort_by") != std::string::npos) { //sort params are supplied with facet
-           std::vector<std::string> tokens;
-           StringUtils::split(facet_field, tokens, ":");
+        if(facet_field.find("sort_by") != std::string::npos) { //sort params are supplied with facet
+            std::vector<std::string> tokens;
+            StringUtils::split(facet_field, tokens, ":");
 
-           if(tokens.size() != 3) {
-               std::string error = "Invalid sort format.";
-               return Option<bool>(400, error);
-           }
+            if(tokens.size() != 3) {
+                std::string error = "Invalid sort format.";
+                return Option<bool>(400, error);
+            }
 
-           //remove possible whitespaces
-           for(auto i=0; i < 3; ++i) {
-               StringUtils::trim(tokens[i]);
-           }
+            //remove possible whitespaces
+            for(auto i = 0; i < 3; ++i) {
+                StringUtils::trim(tokens[i]);
+            }
 
-           if(tokens[1] == _alpha) {
-               const field &a_field = search_schema.at(facet_field_copy);
-               if (!a_field.is_string()) {
-                   std::string error = "Facet field should be string type to apply alpha sort.";
-                   return Option<bool>(400, error);
-               }
-               sort_alpha = true;
-           } else { //sort_field based sort
-               sort_field = tokens[1];
+            if(tokens[1] == _alpha) {
+                const field& a_field = search_schema.at(facet_field_copy);
+                if(!a_field.is_string()) {
+                    std::string error = "Facet field should be string type to apply alpha sort.";
+                    return Option<bool>(400, error);
+                }
+                sort_alpha = true;
+            } else { //sort_field based sort
+                sort_field = tokens[1];
 
-               if (search_schema.count(sort_field) == 0 || !search_schema.at(sort_field).facet) {
-                   std::string error = "Could not find a facet field named `" + sort_field + "` in the schema.";
-                   return Option<bool>(404, error);
-               }
+                if(search_schema.count(sort_field) == 0 || !search_schema.at(sort_field).facet) {
+                    std::string error = "Could not find a facet field named `" + sort_field + "` in the schema.";
+                    return Option<bool>(404, error);
+                }
 
-               const field &a_field = search_schema.at(sort_field);
-               if (a_field.is_string()) {
-                   std::string error = "Sort field should be non string type to apply sort.";
-                   return Option<bool>(400, error);
-               }
-           }
+                const field& a_field = search_schema.at(sort_field);
+                if(a_field.is_string()) {
+                    std::string error = "Sort field should be non string type to apply sort.";
+                    return Option<bool>(400, error);
+                }
+            }
 
-           if (tokens[2].find("asc") != std::string::npos) {
-               order = "asc";
-           } else if (tokens[2].find("desc") != std::string::npos) {
-               order = "desc";
-           } else {
-               std::string error = "Invalid sort param.";
-               return Option<bool>(400, error);
-           }
-       } else if (facet_field != facet_field_copy) {
-           std::string error = "Invalid sort format.";
-           return Option<bool>(400, error);
-       }
+            if(tokens[2].find("asc") != std::string::npos) {
+                order = "asc";
+            } else if(tokens[2].find("desc") != std::string::npos) {
+                order = "desc";
+            } else {
+                std::string error = "Invalid sort param.";
+                return Option<bool>(400, error);
+            }
+        } else if(facet_field != facet_field_copy) {
+            std::string error = "Invalid sort format.";
+            return Option<bool>(400, error);
+        }
 
-       facets.emplace_back(facet(facet_field_copy, facets.size(), {}, false, sort_alpha,
-                                 order, sort_field));
-   }
+        facets.emplace_back(facet(facet_field_copy, facets.size(), {}, false, sort_alpha,
+                                  order, sort_field));
+    }
 
     return Option<bool>(true);
 }

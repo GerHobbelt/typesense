@@ -116,6 +116,8 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<uint32_t>("db-compaction-interval", '\0', "Frequency of RocksDB compaction (in seconds).", false, 604800);
     options.add<uint16_t>("filter-by-max-ops", '\0', "Maximum number of operations permitted in filtery_by.", false, Config::FILTER_BY_DEFAULT_OPERATIONS);
 
+    options.add<int>("max-per-page", '\0', "Max number of hits per page", false, 250);
+
     // DEPRECATED
     options.add<std::string>("listen-address", 'h', "[DEPRECATED: use `api-address`] Address to which Typesense API service binds.", false, "0.0.0.0");
     options.add<uint32_t>("listen-port", 'p', "[DEPRECATED: use `api-port`] Port on which Typesense API service listens.", false, 8108);
@@ -451,13 +453,6 @@ int run_server(const Config & config, const std::string & version, void (*master
     }
     EmbedderManager::set_model_dir(config.get_data_dir() + "/models");
 
-    auto conversations_init = ConversationManager::get_instance().init(&store);
-
-    if(!conversations_init.ok()) {
-        LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
-    } else {
-        LOG(INFO) << "Loaded " << conversations_init.get() << "(s) conversations.";
-    }
 
     auto conversation_models_init = ConversationModelManager::init(&store);
 
@@ -475,6 +470,12 @@ int run_server(const Config & config, const std::string & version, void (*master
                                        &config,
                                        num_collections_parallel_load,
                                        config.get_num_documents_parallel_load());
+
+    auto conversations_init = ConversationManager::get_instance().init(&replication_state);
+
+    if(!conversations_init.ok()) {
+        LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
+    }
 
     std::thread raft_thread([&replication_state, &config, &state_dir,
                              &app_thread_pool, &server_thread_pool, &replication_thread_pool, batch_indexer]() {

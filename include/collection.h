@@ -155,6 +155,10 @@ private:
     // Keep index as the last field since it is initialized in the constructor via init_index(). Add a new field before it.
     Index* index;
 
+    std::shared_ptr<VQModel> vq_model = nullptr;
+
+    nlohmann::json metadata;
+
     // methods
 
     std::string get_doc_id_key(const std::string & doc_id) const;
@@ -343,13 +347,9 @@ private:
                                                      const size_t remote_embedding_num_tries,
                                                      size_t& per_page) const;
 
-    std::shared_ptr<VQModel> vq_model = nullptr;
-
 public:
 
     enum {MAX_ARRAY_MATCHES = 5};
-
-    const size_t PER_PAGE_MAX = 250;
 
     const size_t GROUP_LIMIT_MAX = 99;
 
@@ -385,7 +385,8 @@ public:
                const float max_memory_ratio, const std::string& fallback_field_type,
                const std::vector<std::string>& symbols_to_index, const std::vector<std::string>& token_separators,
                const bool enable_nested_fields, std::shared_ptr<VQModel> vq_model = nullptr,
-               spp::sparse_hash_map<std::string, std::string> referenced_in = spp::sparse_hash_map<std::string, std::string>());
+               spp::sparse_hash_map<std::string, std::string> referenced_in = spp::sparse_hash_map<std::string, std::string>(),
+               const nlohmann::json& metadata = {});
 
     ~Collection();
 
@@ -562,7 +563,7 @@ public:
                                   const size_t max_extra_prefix = INT16_MAX,
                                   const size_t max_extra_suffix = INT16_MAX,
                                   const size_t facet_query_num_typos = 2,
-                                  const size_t filter_curated_hits_option = 2,
+                                  const bool filter_curated_hits_option = false,
                                   const bool prioritize_token_position = false,
                                   const std::string& vector_query_str = "",
                                   const bool enable_highlight_v1 = true,
@@ -571,7 +572,7 @@ public:
                                   const size_t facet_sample_percent = 100,
                                   const size_t facet_sample_threshold = 0,
                                   const size_t page_offset = 0,
-                                  facet_index_type_t facet_index_type = HASH,
+                                  const std::string& facet_index_type = "exhaustive",
                                   const size_t remote_embedding_timeout_ms = 30000,
                                   const size_t remote_embedding_num_tries = 2,
                                   const std::string& stopwords_set="",
