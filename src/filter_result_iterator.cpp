@@ -985,11 +985,6 @@ void filter_result_iterator_t::init() {
 
             seq_ids = std::vector<uint32_t>(id_lists.size(), UINT32_MAX);
 
-            if (a_filter.values.size() > 10) {
-                compute_iterators();
-                return;
-            }
-
             if (a_filter.apply_not_equals) {
                 auto const& num_ids = index->seq_ids->num_ids();
                 approx_filter_ids_length = approx_filter_ids_length >= num_ids ? num_ids : (num_ids - approx_filter_ids_length);
@@ -1111,11 +1106,6 @@ void filter_result_iterator_t::init() {
             }
 
             seq_ids = std::vector<uint32_t>(id_lists.size(), UINT32_MAX);
-
-            if (a_filter.values.size() > 10) {
-                compute_iterators();
-                return;
-            }
 
             if (a_filter.apply_not_equals) {
                 auto const& num_ids = index->seq_ids->num_ids();
@@ -1509,11 +1499,6 @@ void filter_result_iterator_t::init() {
 
             // Multiple filter values get OR.
             approx_filter_ids_length += approx_filter_value_match;
-        }
-
-        if (a_filter.values.size() > 10) {
-            compute_iterators();
-            return;
         }
 
         if (a_filter.apply_not_equals) {
@@ -2424,35 +2409,35 @@ void filter_result_iterator_t::compute_iterators() {
         std::vector<uint32_t> f_id_buff;
 
         for (uint32_t i = 0; i < id_lists.size(); i++) {
-            auto& lists = id_lists[i];
+            auto const& lists = id_lists[i];
+            auto const& is_not_equals_comparator = numerical_not_iterator_index.count(i) != 0;
+
             for (const auto& list: lists) {
-                if (numerical_not_iterator_index.count(i) == 0) {
+                if (is_not_equals_comparator) {
+                    std::vector<uint32_t> equals_ids;
+                    list->uncompress(equals_ids);
+
+                    uint32_t* not_equals_ids = nullptr;
+                    auto const not_equals_ids_len = ArrayUtils::exclude_scalar(index->seq_ids->uncompress(), index->seq_ids->num_ids(),
+                                                                               &equals_ids[0], equals_ids.size(),
+                                                                               &not_equals_ids);
+
+                    std::copy(not_equals_ids, not_equals_ids + not_equals_ids_len, std::back_inserter(f_id_buff));
+                } else {
                     list->uncompress(f_id_buff);
-                    continue;
                 }
 
-                // NOT_EQUALS comparator
-                std::vector<uint32_t> equals_ids;
-                list->uncompress(equals_ids);
+                if (f_id_buff.size() >= 100'000) {
+                    gfx::timsort(f_id_buff.begin(), f_id_buff.end());
+                    f_id_buff.erase(std::unique( f_id_buff.begin(), f_id_buff.end() ), f_id_buff.end());
 
-                uint32_t* not_equals_ids = nullptr;
-                auto const not_equals_ids_len = ArrayUtils::exclude_scalar(index->seq_ids->uncompress(), index->seq_ids->num_ids(),
-                                                                           &equals_ids[0], equals_ids.size(),
-                                                                           &not_equals_ids);
-
-                std::copy(not_equals_ids, not_equals_ids + not_equals_ids_len, std::back_inserter(f_id_buff));
-            }
-
-            if (f_id_buff.size() >= 100'000) {
-                gfx::timsort(f_id_buff.begin(), f_id_buff.end());
-                f_id_buff.erase(std::unique( f_id_buff.begin(), f_id_buff.end() ), f_id_buff.end());
-
-                uint32_t* out = nullptr;
-                filter_ids_len = ArrayUtils::or_scalar(filter_ids, filter_ids_len, f_id_buff.data(), f_id_buff.size(),
-                                                       &out);
-                delete[] filter_ids;
-                filter_ids = out;
-                std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
+                    uint32_t* out = nullptr;
+                    filter_ids_len = ArrayUtils::or_scalar(filter_ids, filter_ids_len, f_id_buff.data(), f_id_buff.size(),
+                                                           &out);
+                    delete[] filter_ids;
+                    filter_ids = out;
+                    std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
+                }
             }
         }
 
