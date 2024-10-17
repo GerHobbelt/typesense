@@ -839,7 +839,7 @@ namespace sole {
 
 #include <iostream>
 
-int main() {
+int main(void) {
     sole::uuid u0 = sole::uuid0(), u1 = sole::uuid1(), u4 = sole::uuid4();
 
     std::cout << "uuid v0 string : " << u0 << std::endl;
@@ -933,7 +933,7 @@ namespace run
     }
 }
 
-int main() {
+int main(void) {
     assert( sizeof(sole::uuid      )  * 8 == 128 );
     assert( sizeof(sole::uuid0().ab)  * 8 ==  64 );
     assert( sizeof(sole::uuid0().cd)  * 8 ==  64 );
