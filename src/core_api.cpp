@@ -49,6 +49,7 @@ public:
 };
 
 void init_api(uint32_t cache_num_entries) {
+    std::unique_lock lock(mutex);
     res_cache.capacity(cache_num_entries);
 }
 
@@ -917,12 +918,12 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         StringUtils::split(req->params["exclude_fields"], exclude_fields, ",");
         bool exclude_conversation_history = std::find(exclude_fields.begin(), exclude_fields.end(), "conversation_history") != exclude_fields.end();
 
-        nlohmann::json conversation_history = nlohmann::json::array();
-        conversation_history.push_back(formatted_question_op.get());
-        conversation_history.push_back(formatted_answer_op.get());
+        nlohmann::json new_conversation_history = nlohmann::json::array();
+        new_conversation_history.push_back(formatted_question_op.get());
+        new_conversation_history.push_back(formatted_answer_op.get());
         std::string conversation_id = conversation_history ? orig_req_params["conversation_id"] : "";
 
-        auto add_conversation_op = ConversationManager::get_instance().add_conversation(conversation_history, conversation_model["conversation_collection"], conversation_id);
+        auto add_conversation_op = ConversationManager::get_instance().add_conversation(new_conversation_history, conversation_model["conversation_collection"], conversation_id);
         if(!add_conversation_op.ok()) {
             res->set_400(add_conversation_op.error());
             return false;
@@ -2074,6 +2075,11 @@ bool post_config(const std::shared_ptr<http_req>& req, const std::shared_ptr<htt
     if(!config_update_op.ok()) {
         res->set(config_update_op.code(), config_update_op.error());
     } else {
+        // for cache config, we have to resize the cache
+        if(req_json.count("cache-num-entries") != 0) {
+            std::unique_lock lock(mutex);
+            res_cache.capacity(Config::get_instance().get_cache_num_entries());
+        }
         nlohmann::json response;
         response["success"] = true;
         res->set_201(response.dump());

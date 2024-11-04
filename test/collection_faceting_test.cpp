@@ -1363,6 +1363,31 @@ TEST_F(CollectionFacetingTest, FacetParseTest){
 
     coll1->parse_facet(facet_range, range_facets_with_sort_as_field);
     ASSERT_EQ(1, range_facets_with_sort_as_field.size());
+
+    //range facet label with special chars
+    std::vector<std::string> range_facet_special_chars{
+            "score(%0 - %19:[0, 20], %20 - %59:[20, 60], %60+:[60, ])",
+            "range($$$:[0, 20])"
+    };
+
+    std::vector<facet> facet_speical_chars;
+    for(const std::string& facet_field: range_facet_special_chars) {
+        auto res = coll1->parse_facet(facet_field, facet_speical_chars);
+
+        if(!res.error().empty()) {
+            LOG(ERROR) << res.error();
+            FAIL();
+        }
+    }
+
+    //should not allow to pass only space chars
+    facet_speical_chars.clear();
+   auto only_space_char("review( :[0, 20])");
+
+    auto res = coll1->parse_facet(only_space_char, facet_speical_chars);
+    ASSERT_FALSE(res.error().empty());
+    ASSERT_EQ(400, res.code());
+    ASSERT_EQ("Facet range value is not valid.", res.error());
 }
 
 TEST_F(CollectionFacetingTest, RangeFacetTest) {
@@ -3225,4 +3250,39 @@ TEST_F(CollectionFacetingTest, RangeFacetsWithSortDisabled) {
 
     ASSERT_FALSE(results.ok());
     ASSERT_EQ("Range facets require sort enabled for the field.", results.error());
+}
+
+TEST_F(CollectionFacetingTest, FacetSearchIndexTypeValidation) {
+    std::vector<field> fields = {
+        field("attribute.title", field_types::STRING, true),
+        field("attribute.category", field_types::STRING, true),
+    };
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+    nlohmann::json doc;
+    doc["attribute.title"] = "Foobar";
+    doc["attribute.category"] = "shoes";
+    ASSERT_TRUE(coll1->add(doc.dump()).ok());
+
+    auto res_op = coll1->search("*", {},
+                                 "", {"attribute.*"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 5, "", 30, 4, "", 20, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7,
+                                 fallback,
+                                 4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL,
+                                 "top_values");
+
+    ASSERT_TRUE(res_op.ok());
+
+    res_op = coll1->search("*", {},
+                           "", {"attribute.*"}, {}, {2}, 1, 1, FREQUENCY, {true}, 1,
+                           spp::sparse_hash_set<std::string>(),
+                           spp::sparse_hash_set<std::string>(), 5, "", 30, 4, "", 20, {}, {}, {}, 0,
+                           "<mark>", "</mark>", {}, 1000, true, false, true, "", false, 6000 * 1000, 4, 7,
+                           fallback,
+                           4, {off}, 3, 3, 2, 2, false, "", true, 0, max_score, 100, 0, 4294967295UL,
+                           "");
+
+    ASSERT_TRUE(res_op.ok());
 }

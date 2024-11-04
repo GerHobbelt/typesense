@@ -1061,6 +1061,31 @@ TEST_F(CollectionOptimizedFacetingTest, FacetParseTest){
 
     coll1->parse_facet(facet_range, range_facets_with_sort_as_field);
     ASSERT_EQ(1, range_facets_with_sort_as_field.size());
+
+    //range facet label with special chars
+    std::vector<std::string> range_facet_special_chars{
+            "score(%0 - %19:[0, 20], %20 - %59:[20, 60], %60+:[60, ])",
+            "range($$$:[0, 20])"
+    };
+
+    std::vector<facet> facet_speical_chars;
+    for(const std::string& facet_field: range_facet_special_chars) {
+        auto res = coll1->parse_facet(facet_field, facet_speical_chars);
+
+        if(!res.error().empty()) {
+            LOG(ERROR) << res.error();
+            FAIL();
+        }
+    }
+
+    //should not allow to pass only space chars
+    facet_speical_chars.clear();
+    auto only_space_char("range( :[0, 20])");
+
+    auto res = coll1->parse_facet(only_space_char, facet_speical_chars);
+    ASSERT_FALSE(res.error().empty());
+    ASSERT_EQ(400, res.code());
+    ASSERT_EQ("Facet range value is not valid.", res.error());
 }
 
 TEST_F(CollectionOptimizedFacetingTest, RangeFacetTest) {
@@ -1663,11 +1688,11 @@ TEST_F(CollectionOptimizedFacetingTest, StringLengthTest) {
     ASSERT_TRUE(coll1->add(doc.dump()).ok());
 
     std::string longStr = "";
-    for(auto i = 0; i < 8; ++i) {
+    for(auto i = 0; i < 20; ++i) {
         longStr+="alphabetagamma";
     }
 
-    ASSERT_TRUE(112 == longStr.size());
+    ASSERT_TRUE(280 == longStr.size());
     
     std::vector<std::string> vec;
     vec.emplace_back(longStr);
@@ -1687,8 +1712,8 @@ TEST_F(CollectionOptimizedFacetingTest, StringLengthTest) {
 
     longStr = results["facet_counts"][0]["counts"][3]["value"];
 
-    //string facet length is restricted to 100
-    ASSERT_TRUE(100 == longStr.size());
+    //string facet length is restricted to 255
+    ASSERT_EQ(255, longStr.size());
 }
 
 TEST_F(CollectionOptimizedFacetingTest, FacetingReturnParent) {

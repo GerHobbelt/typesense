@@ -68,7 +68,7 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
         }
 
         if(a_field.num_dim > 0) {
-            auto hnsw_index = new hnsw_index_t(a_field.num_dim, 1024, a_field.vec_dist, a_field.hnsw_params["M"].get<uint32_t>(), a_field.hnsw_params["ef_construction"].get<uint32_t>());
+            auto hnsw_index = new hnsw_index_t(a_field.num_dim, 16, a_field.vec_dist, a_field.hnsw_params["M"].get<uint32_t>(), a_field.hnsw_params["ef_construction"].get<uint32_t>());
             vector_index.emplace(a_field.name, hnsw_index);
             continue;
         }
@@ -746,7 +746,8 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
                             fvalue_to_seq_ids[facet_value_id].push_back(seq_id);
                             seq_id_to_fvalues[seq_id].push_back(facet_value_id);
                         } else if(afield.type == field_types::STRING_ARRAY) {
-                            const std::string& raw_val = field_values[i].get<std::string>().substr(0, 100);
+                            const std::string& raw_val =
+                                    field_values[i].get<std::string>().substr(0, facet_index_t::MAX_FACET_VAL_LEN);
                             facet_value_id_t facet_value_id(raw_val);
                             fvalue_to_seq_ids[facet_value_id].push_back(seq_id);
                             seq_id_to_fvalues[seq_id].push_back(facet_value_id);
@@ -780,7 +781,8 @@ void Index::index_field_in_memory(const field& afield, std::vector<index_record>
                         seq_id_to_fvalues[seq_id].push_back(facet_value_id);
                     }
                     else if(afield.type == field_types::STRING) {
-                        const std::string& raw_val = document[afield.name].get<std::string>().substr(0, 100);
+                        const std::string& raw_val =
+                                document[afield.name].get<std::string>().substr(0, facet_index_t::MAX_FACET_VAL_LEN);
                         facet_value_id_t facet_value_id(raw_val);
                         fvalue_to_seq_ids[facet_value_id].push_back(seq_id);
                         seq_id_to_fvalues[seq_id].push_back(facet_value_id);
@@ -3541,7 +3543,7 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
 
     bool estimate_facets = (facet_sample_percent > 0 && facet_sample_percent < 100 &&
                             all_result_ids_len > facet_sample_threshold);
-    bool is_wildcard_no_filter_query = is_wildcard_non_phrase_query && no_filters_provided;
+    bool is_wildcard_no_filter_query = is_wildcard_non_phrase_query && no_filters_provided && vector_query.field_name.empty();
 
     if(!facets.empty()) {
         const size_t num_threads = std::min(concurrency, all_result_ids_len);
@@ -4044,7 +4046,6 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                         continue;
                     }
 
-                    //LOG(INFO) << "Searching for field: " << the_field.name << ", found token:" << token;
                     const auto& prev_token = last_token ? token_candidates_vec.back().candidates[0] : "";
 
                     std::vector<art_leaf*> field_leaves;
@@ -4061,6 +4062,8 @@ Option<bool> Index::fuzzy_search_fields(const std::vector<search_field_t>& the_f
                     /*auto timeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::high_resolution_clock::now() - begin).count();
                     LOG(INFO) << "Time taken for fuzzy search: " << timeMillis << "ms";*/
+
+                    //LOG(INFO) << "Searching field: " << the_field.name << ", token:" << token << ", sz: " << field_leaves.size();
 
                     if(field_leaves.empty()) {
                         // look at the next field
@@ -4482,7 +4485,7 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
 
             for(size_t fi = 0; fi < field_iters.size(); fi++) {
                 const posting_list_t::iterator_t& field_iter = field_iters[fi];
-                if(field_iter.id() == seq_id) {
+                if(field_iter.id() == seq_id && field_iter.get_field_id() < num_search_fields) {
                     // not all fields might contain a given token
                     field_to_tokens[field_iter.get_field_id()].push_back(field_iter.clone());
                 }
@@ -4499,7 +4502,7 @@ Option<bool> Index::search_across_fields(const std::vector<token_t>& query_token
                 const std::vector<posting_list_t::iterator_t>& field_iters = token_fields_iters.get_its();
                 for(size_t fi = 0; fi < field_iters.size(); fi++) {
                     const posting_list_t::iterator_t& field_iter = field_iters[fi];
-                    if(field_iter.id() == seq_id) {
+                    if(field_iter.id() == seq_id && field_iter.get_field_id() < num_search_fields) {
                         // not all fields might contain a given token
                         field_to_tokens[field_iter.get_field_id()].push_back(field_iter.clone());
                     }
@@ -4736,6 +4739,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
     // avoiding loop
     if (sort_fields.size() > 0) {
+        auto reference_found = true;
+
         // In case of reference sort_by, we need to get the sort score of the reference doc id.
         if (!sort_fields[0].reference_collection_name.empty()) {
             auto& sort_field = sort_fields[0];
@@ -4747,11 +4752,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
-                if (references.at(ref_collection_name).count == 1) {
+                auto const& count = references.at(ref_collection_name).count;
+                if (count == 0) {
+                    reference_found = false;
+                } else if (count == 1) {
                     ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
-                    return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
-                                                multiple_references_error_message : no_references_error_message);
+                    return Option<bool>(400, multiple_references_error_message);
                 }
             } else {
                 auto& cm = CollectionManager::get_instance();
@@ -4768,11 +4775,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
                     auto const& field_name = get_reference_field_op.get();
-                    if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
-                        return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
+                    if (sort_index.count(field_name) == 0) {
+                        return Option<bool>(400, "Could not find `" + field_name + "` in sort_index.");
+                    } else if (sort_index.at(field_name)->count(seq_id) == 0) {
+                        reference_found = false;
+                    } else {
+                        ref_seq_id = sort_index.at(field_name)->at(seq_id);
                     }
-
-                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                 // Joined collection has a reference
                 else {
@@ -4803,7 +4812,9 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& reference = references.at(joined_coll_having_reference);
                     auto const& count = reference.count;
 
-                    if (count == 1) {
+                    if (count == 0) {
+                        reference_found = false;
+                    } else if (count == 1) {
                         auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
                                                                                     reference.docs[0]);
                         if (!op.ok()) {
@@ -4812,8 +4823,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                         ref_seq_id = op.get();
                     } else {
-                        return Option<bool>(400, count > 1 ? multiple_references_error_message :
-                                                                    no_references_error_message);
+                        return Option<bool>(400, multiple_references_error_message);
                     }
                 }
             }
@@ -4829,6 +4839,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
         } else if(field_values[0] == &str_sentinel_value) {
             if (sort_fields[0].reference_collection_name.empty()) {
                 scores[0] = str_sort_index.at(sort_fields[0].name)->rank(seq_id);
+            } else if (!reference_found) {
+                scores[0] = adi_tree_t::NOT_FOUND;
             } else {
                 auto& cm = CollectionManager::get_instance();
                 auto ref_collection = cm.get_collection(sort_fields[0].reference_collection_name);
@@ -4893,8 +4905,12 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                 // do nothing
             }
         } else {
-            auto it = field_values[0]->find(sort_fields[0].reference_collection_name.empty() ? seq_id : ref_seq_id);
-            scores[0] = (it == field_values[0]->end()) ? default_score : it->second;
+            if (sort_fields[0].reference_collection_name.empty() || reference_found) {
+                auto it = field_values[0]->find(sort_fields[0].reference_collection_name.empty() ? seq_id : ref_seq_id);
+                scores[0] = (it == field_values[0]->end()) ? default_score : it->second;
+            } else {
+                scores[0] = default_score;
+            }
 
             if(scores[0] == INT64_MIN && sort_fields[0].missing_values == sort_by::missing_values_t::first) {
                 // By default, missing numerical value are always going to be sorted to be at the end
@@ -4911,6 +4927,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
     }
 
     if(sort_fields.size() > 1) {
+        auto reference_found = true;
+
         // In case of reference sort_by, we need to get the sort score of the reference doc id.
         if (!sort_fields[1].reference_collection_name.empty()) {
             auto& sort_field = sort_fields[1];
@@ -4922,11 +4940,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
-                if (references.at(ref_collection_name).count == 1) {
+                auto const& count = references.at(ref_collection_name).count;
+                if (count == 0) {
+                    reference_found = false;
+                } else if (count == 1) {
                     ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
-                    return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
-                                             multiple_references_error_message : no_references_error_message);
+                    return Option<bool>(400, multiple_references_error_message);
                 }
             } else {
                 auto& cm = CollectionManager::get_instance();
@@ -4943,11 +4963,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
                     auto const& field_name = get_reference_field_op.get();
-                    if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
-                        return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
+                    if (sort_index.count(field_name) == 0) {
+                        return Option<bool>(400, "Could not find `" + field_name + "` in sort_index.");
+                    } else if (sort_index.at(field_name)->count(seq_id) == 0) {
+                        reference_found = false;
+                    } else {
+                        ref_seq_id = sort_index.at(field_name)->at(seq_id);
                     }
-
-                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                     // Joined collection has a reference
                 else {
@@ -4978,7 +5000,9 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& reference = references.at(joined_coll_having_reference);
                     auto const& count = reference.count;
 
-                    if (count == 1) {
+                    if (count == 0) {
+                        reference_found = false;
+                    } else if (count == 1) {
                         auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
                                                                                     reference.docs[0]);
                         if (!op.ok()) {
@@ -4987,8 +5011,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                         ref_seq_id = op.get();
                     } else {
-                        return Option<bool>(400, count > 1 ? multiple_references_error_message :
-                                                 no_references_error_message);
+                        return Option<bool>(400, multiple_references_error_message);
                     }
                 }
             }
@@ -5004,6 +5027,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
         } else if(field_values[1] == &str_sentinel_value) {
             if (sort_fields[1].reference_collection_name.empty()) {
                 scores[1] = str_sort_index.at(sort_fields[1].name)->rank(seq_id);
+            } else if (!reference_found) {
+                scores[1] = adi_tree_t::NOT_FOUND;
             } else {
                 auto& cm = CollectionManager::get_instance();
                 auto ref_collection = cm.get_collection(sort_fields[1].reference_collection_name);
@@ -5069,8 +5094,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
             }
 
         } else {
-            auto it = field_values[1]->find(sort_fields[1].reference_collection_name.empty() ? seq_id : ref_seq_id);
-            scores[1] = (it == field_values[1]->end()) ? default_score : it->second;
+            if (sort_fields[1].reference_collection_name.empty() || reference_found) {
+                auto it = field_values[1]->find(sort_fields[1].reference_collection_name.empty() ? seq_id : ref_seq_id);
+                scores[1] = (it == field_values[1]->end()) ? default_score : it->second;
+            } else {
+                scores[1] = default_score;
+            }
+
             if(scores[1] == INT64_MIN && sort_fields[1].missing_values == sort_by::missing_values_t::first) {
                 bool is_asc = (sort_order[1] == -1);
                 scores[1] = is_asc ? (INT64_MIN + 1) : INT64_MAX;
@@ -5083,6 +5113,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
     }
 
     if(sort_fields.size() > 2) {
+        auto reference_found = true;
+
         // In case of reference sort_by, we need to get the sort score of the reference doc id.
         if (!sort_fields[2].reference_collection_name.empty()) {
             auto& sort_field = sort_fields[2];
@@ -5094,11 +5126,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
             // Joined on ref collection
             if (references.count(ref_collection_name) > 0) {
-                if (references.at(ref_collection_name).count == 1) {
+                auto const& count = references.at(ref_collection_name).count;
+                if (count == 0) {
+                    reference_found = false;
+                } else if (count == 1) {
                     ref_seq_id = references.at(ref_collection_name).docs[0];
                 } else {
-                    return Option<bool>(400, references.at(ref_collection_name).count > 1 ?
-                                             multiple_references_error_message : no_references_error_message);
+                    return Option<bool>(400, multiple_references_error_message);
                 }
             } else {
                 auto& cm = CollectionManager::get_instance();
@@ -5115,11 +5149,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                         return Option<bool>(get_reference_field_op.code(), get_reference_field_op.error());
                     }
                     auto const& field_name = get_reference_field_op.get();
-                    if (sort_index.count(field_name) == 0 || sort_index.at(field_name)->count(seq_id) == 0) {
-                        return Option<bool>(400, "Could not find a reference for doc " + std::to_string(seq_id));
+                    if (sort_index.count(field_name) == 0) {
+                        return Option<bool>(400, "Could not find `" + field_name + "` in sort_index.");
+                    } else if (sort_index.at(field_name)->count(seq_id) == 0) {
+                        reference_found = false;
+                    } else {
+                        ref_seq_id = sort_index.at(field_name)->at(seq_id);
                     }
-
-                    ref_seq_id = sort_index.at(field_name)->at(seq_id);
                 }
                     // Joined collection has a reference
                 else {
@@ -5150,7 +5186,9 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                     auto const& reference = references.at(joined_coll_having_reference);
                     auto const& count = reference.count;
 
-                    if (count == 1) {
+                    if (count == 0) {
+                        reference_found = false;
+                    } else if (count == 1) {
                         auto op = joined_collection->get_sort_index_value_with_lock(reference_field_name,
                                                                                     reference.docs[0]);
                         if (!op.ok()) {
@@ -5159,8 +5197,7 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
 
                         ref_seq_id = op.get();
                     } else {
-                        return Option<bool>(400, count > 1 ? multiple_references_error_message :
-                                                 no_references_error_message);
+                        return Option<bool>(400, multiple_references_error_message);
                     }
                 }
             }
@@ -5176,6 +5213,8 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
         } else if(field_values[2] == &str_sentinel_value) {
             if (sort_fields[2].reference_collection_name.empty()) {
                 scores[2] = str_sort_index.at(sort_fields[2].name)->rank(seq_id);
+            } else if (!reference_found) {
+                scores[2] = adi_tree_t::NOT_FOUND;
             } else {
                 auto& cm = CollectionManager::get_instance();
                 auto ref_collection = cm.get_collection(sort_fields[2].reference_collection_name);
@@ -5240,8 +5279,13 @@ Option<bool> Index::compute_sort_scores(const std::vector<sort_by>& sort_fields,
                 // do nothing
             }
         } else {
-            auto it = field_values[2]->find(sort_fields[2].reference_collection_name.empty() ? seq_id : ref_seq_id);
-            scores[2] = (it == field_values[2]->end()) ? default_score : it->second;
+            if (sort_fields[2].reference_collection_name.empty() || reference_found) {
+                auto it = field_values[2]->find(sort_fields[2].reference_collection_name.empty() ? seq_id : ref_seq_id);
+                scores[2] = (it == field_values[2]->end()) ? default_score : it->second;
+            } else {
+                scores[2] = default_score;
+            }
+
             if(scores[2] == INT64_MIN && sort_fields[2].missing_values == sort_by::missing_values_t::first) {
                 bool is_asc = (sort_order[2] == -1);
                 scores[2] = is_asc ? (INT64_MIN + 1) : INT64_MAX;
@@ -6948,7 +6992,7 @@ void Index::refresh_schemas(const std::vector<field>& new_fields, const std::vec
         search_schema.emplace(new_field.name, new_field);
 
         if(new_field.type == field_types::FLOAT_ARRAY && new_field.num_dim > 0) {
-            auto hnsw_index = new hnsw_index_t(new_field.num_dim, 1024, new_field.vec_dist, new_field.hnsw_params["M"].get<uint32_t>(), new_field.hnsw_params["ef_construction"].get<uint32_t>());
+            auto hnsw_index = new hnsw_index_t(new_field.num_dim, 16, new_field.vec_dist, new_field.hnsw_params["M"].get<uint32_t>(), new_field.hnsw_params["ef_construction"].get<uint32_t>());
             vector_index.emplace(new_field.name, hnsw_index);
             continue;
         }
