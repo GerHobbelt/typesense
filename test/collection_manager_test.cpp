@@ -135,7 +135,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":false,
               "sort":false,
               "store":true,
-              "type":"string"
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -147,7 +149,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":false,
               "sort":false,
               "store":true,
-              "type":"string"
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":true,
@@ -159,7 +163,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":false,
               "store":true,
-              "type":"string[]"
+              "type":"string[]",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":true,
@@ -171,7 +177,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":true,
               "store":true,
-              "type":"int32"
+              "type":"int32",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -183,7 +191,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":true,
               "store":true,
-              "type":"geopoint"
+              "type":"geopoint",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -195,7 +205,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":false,
               "store":true,
-              "type":"string"
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -207,7 +219,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":false,
               "sort":true,
               "store":true,
-              "type":"int32"
+              "type":"int32",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -220,7 +234,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":false,
               "store":true,
-              "type":"object"
+              "type":"object",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -234,7 +250,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "sort":false,
               "store":true,
               "type":"float[]",
-              "vec_dist":"cosine"
+              "vec_dist":"cosine",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -247,7 +265,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "sort":false,
               "store":true,
               "type":"string",
-              "reference":"Products.product_id"
+              "reference":"Products.product_id",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -259,7 +279,9 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "optional":true,
               "sort":true,
               "store":true,
-              "type":"int64"
+              "type":"int64",
+              "range_index":false,
+              "stem":false
             }
           ],
           "id":0,
@@ -1582,17 +1604,17 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     std::string filter_query = "";
     std::vector<std::string> include_fields_vec, exclude_fields_vec;
     std::vector<ref_include_exclude_fields> ref_include_exclude_fields_vec;
-    auto initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                       exclude_fields_vec,
-                                                                                       ref_include_exclude_fields_vec);
+    auto initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                      exclude_fields_vec,
+                                                                                      ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_TRUE(ref_include_exclude_fields_vec.empty());
 
     filter_query = "$foo(bar:baz)";
     exclude_fields_vec = {"$foo(bar)"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("foo", ref_include_exclude_fields_vec[0].collection_name);
@@ -1606,25 +1628,25 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
 
     filter_query = "";
     include_fields_vec = {"$Customers(product_price, strategy: foo) as customers"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_FALSE(initialize_op.ok());
     ASSERT_EQ("Error parsing `$Customers(product_price, strategy: foo) as customers`: Unknown include strategy `foo`. "
               "Valid options are `merge`, `nest`, `nest_array`.", initialize_op.error());
 
     include_fields_vec = {"$Customers(product_price, foo: bar) as customers"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_FALSE(initialize_op.ok());
     ASSERT_EQ("Unknown reference `include_fields` parameter: `foo`.", initialize_op.error());
 
     filter_query = "$Customers(customer_id:=customer_a && (product_price:>100 && product_price:<200))";
     include_fields_vec = {"$Customers(product_price, strategy: merge) as customers"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("Customers", ref_include_exclude_fields_vec[0].collection_name);
@@ -1636,9 +1658,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
 
     filter_query = "$Customers(customer_id:=customer_a && (product_price:>100 && product_price:<200))";
     include_fields_vec = {"$Customers(product_price, strategy: nest_array) as customers"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("Customers", ref_include_exclude_fields_vec[0].collection_name);
@@ -1650,9 +1672,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
 
     filter_query = "$product_variants( $inventory($retailers(location:(33.865,-118.375,100 km))))";
     include_fields_vec = {"$product_variants(id,$inventory(qty,sku,$retailers(id,title)))"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1675,9 +1697,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
 
     filter_query = "$product_variants( $inventory($retailers(location:(33.865,-118.375,100 km))))";
     include_fields_vec = {"$product_variants(title, $inventory(qty, strategy:merge) as inventory, strategy: nest) as variants"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1701,9 +1723,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     filter_query = "$product_variants( $inventory(id:*) && $retailers(location:(33.865,-118.375,100 km)))";
     include_fields_vec = {"$product_variants(title, $inventory(qty, strategy:merge) as inventory,"
                             " $retailers(title), strategy: merge) as variants"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1726,9 +1748,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     filter_query = "$product_variants( $inventory(id:*) && $retailers(location:(33.865,-118.375,100 km)))";
     include_fields_vec = {"$product_variants(title, $inventory(qty, strategy:merge) as inventory, description,"
                             " $retailers(title), foo, strategy: merge) as variants"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1751,9 +1773,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     filter_query = "$Customers(customer_id:=customer_a && (product_price:>100 && product_price:<200))";
     include_fields_vec.clear();
     exclude_fields_vec = {"$Customers(product_price)"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("Customers", ref_include_exclude_fields_vec[0].collection_name);
@@ -1767,9 +1789,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     filter_query = "$product_variants( $inventory(id:*) && $retailers(location:(33.865,-118.375,100 km)))";
     include_fields_vec.clear();
     exclude_fields_vec = {"$product_variants(title, $inventory(qty), description, $retailers(title), foo)"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1795,9 +1817,9 @@ TEST_F(CollectionManagerTest, InitializeRefIncludeExcludeFields) {
     filter_query = "$product_variants( $inventory($retailers(location:(33.865,-118.375,100 km))))";
     include_fields_vec = {"$product_variants(title, $inventory(qty, strategy:merge) as inventory, strategy: nest) as variants"};
     exclude_fields_vec = {"$product_variants(title, $inventory(qty, $retailers(title)))"};
-    initialize_op = CollectionManager::_initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
-                                                                                  exclude_fields_vec,
-                                                                                  ref_include_exclude_fields_vec);
+    initialize_op = CollectionManager::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec,
+                                                                                 exclude_fields_vec,
+                                                                                 ref_include_exclude_fields_vec);
     ASSERT_TRUE(initialize_op.ok());
     ASSERT_EQ(1, ref_include_exclude_fields_vec.size());
     ASSERT_EQ("product_variants", ref_include_exclude_fields_vec[0].collection_name);
@@ -1922,7 +1944,9 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
                     "optional":false,
                     "sort":false,
                     "store":true,
-                    "type":"string"
+                    "type":"string",
+                    "range_index":false,
+                    "stem":false
                 },
                 {
                     "facet":true,
@@ -1935,7 +1959,9 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
                     "optional":false,
                     "sort":true,
                     "store":true,
-                    "type":"int32"
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
                 },{
                     "facet":true,
                     "index":true,
@@ -1947,7 +1973,9 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
                     "optional":false,
                     "sort":true,
                     "store":true,
-                    "type":"int32"
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
                 },{
                     "facet":true,
                     "index":true,
@@ -1959,7 +1987,9 @@ TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
                     "optional":false,
                     "sort":true,
                     "store":true,
-                    "type":"int32"
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
                 }
             ],
             "id":1,

@@ -85,10 +85,6 @@ Option<bool> AnalyticsManager::create_index(nlohmann::json &payload, bool upsert
     suggestion_config.rule_type = payload["type"];
 
     if(payload["type"] == LOG_TYPE) {
-        if(!params.contains("name") || params["name"].empty()) {
-            return Option<bool>(400, "Bad or missing name in params");
-        }
-
         if(!params["source"].contains("collections") || !params["source"]["collections"].is_array()) {
             return Option<bool>(400, "Must contain a valid list of source collections.");
         }
@@ -104,10 +100,6 @@ Option<bool> AnalyticsManager::create_index(nlohmann::json &payload, bool upsert
 
         suggestion_collection = params["source"]["collections"][0].get<std::string>();
         suggestion_config.suggestion_collection = suggestion_collection;
-
-        if(event_collection_map.count(params["name"]) != 0) {
-            return Option<bool>(400, "Event name already exists.");
-        }
     } else {
         if(payload["type"] == COUNTER_TYPE) {
             if(!params["source"].contains("events") || (params["source"].contains("events") &&
@@ -219,17 +211,17 @@ Option<bool> AnalyticsManager::create_index(nlohmann::json &payload, bool upsert
 
             //store event name to their weights
             //which can be used to keep counter events separate from non counter events
-            bool log_to_file = false;
-            if(event.contains("log_to_file")) {
-                log_to_file = event["log_to_file"].get<bool>();
+            bool log_to_store = false;
+            if(event.contains("log_to_store")) {
+                log_to_store = event["log_to_store"].get<bool>();
 
-                if(log_to_file && !analytics_logs.is_open()) {
+                if(log_to_store && !analytics_store) {
                     remove_index(suggestion_config_name);
-                    return Option<bool>(400, "Event can't be logged when analytics-dir is not defined.");
+                    return Option<bool>(400, "Event can't be logged when analytics-db is not defined.");
                 }
             }
             event_weight_map[event["name"]] = event["weight"];
-            event_type_collection ec{event["type"], suggestion_collection, log_to_file, suggestion_config_name};
+            event_type_collection ec{event["type"], suggestion_collection, log_to_store, suggestion_config_name};
             event_collection_map.emplace(event["name"], ec);
         }
         counter_events.emplace(suggestion_collection, counter_event_t{counter_field, {}, event_weight_map});
@@ -470,7 +462,7 @@ Option<bool> AnalyticsManager::add_event(const std::string& client_ip, const std
         }
 
         event_t event(query, event_type, now_ts_useconds, user_id, doc_id,
-                      event_name, event_collection_map[event_name].log_to_file, custom_data);
+                      event_name, event_collection_map[event_name].log_to_store, custom_data);
         events_vec.emplace_back(event);
 
         if (!counter_events.empty()) {
@@ -658,21 +650,7 @@ void AnalyticsManager::persist_events(ReplicationState *raft_server, uint64_t pr
     for (auto &events_collection_it: query_collection_events) {
         const auto& collection = events_collection_it.first;
         for (const auto &event: events_collection_it.second) {
-            if (analytics_logs.is_open() && event.log_to_file) {
-                //store events to log file
-                std::stringstream ssbuf;
-                ssbuf << event.timestamp << "\t" << event.name << "\t"
-                               << collection << "\t" << event.user_id << "\t" << event.doc_id << "\t"
-                               << event.query << "\t";
-
-                for(const auto& kv : event.data) {
-                    ssbuf << kv.second << "\t";
-                }
-
-                analytics_logs << ssbuf.str();
-                analytics_logs << "\n";
-                analytics_logs << std::flush;
-
+            if (event.log_to_store) {
                 nlohmann::json event_data;
                 event.to_json(event_data, collection);
                 payload.push_back(event_data);
@@ -720,7 +698,6 @@ void AnalyticsManager::persist_popular_events(ReplicationState *raft_server, uin
 void AnalyticsManager::stop() {
     quit = true;
     cv.notify_all();
-    analytics_logs.close();
 }
 
 void AnalyticsManager::dispose() {
@@ -751,13 +728,11 @@ void AnalyticsManager::dispose() {
     events_cache.clear();
 }
 
-void AnalyticsManager::init(Store* store, Store* analytics_store, const std::string& analytics_dir) {
+void AnalyticsManager::init(Store* store, Store* analytics_store) {
     this->store = store;
     this->analytics_store = analytics_store;
 
-    if(!analytics_dir.empty()) {
-        const auto analytics_log_path = analytics_dir + "/analytics_events.tsv";
-        analytics_logs.open(analytics_log_path, std::ofstream::out | std::ofstream::app);
+    if(analytics_store) {
         events_cache.capacity(1024);
     }
 }
@@ -799,7 +774,9 @@ void counter_event_t::serialize_as_docs(std::string &docs) {
 bool AnalyticsManager::write_to_db(const nlohmann::json& payload) {
     if(analytics_store) {
         for(const auto& event: payload) {
-            std::string key = event["user_id"].get<std::string>() + "_" + StringUtils::serialize_uint64_t(event["timestamp"].get<uint64_t>());
+            std::string key = event["user_id"].get<std::string>() + "_" + event["type"].get<std::string>()
+                    + "_" + StringUtils::serialize_uint64_t(event["timestamp"].get<uint64_t>());
+
             bool inserted = analytics_store->insert(key, event.dump());
             if(!inserted) {
                 LOG(ERROR) << "Error while dumping events to analytics db.";
@@ -814,8 +791,8 @@ bool AnalyticsManager::write_to_db(const nlohmann::json& payload) {
     return true;
 }
 
-void AnalyticsManager::get_last_N_events(const std::string& userid, uint32_t N, std::vector<std::string>& values) {
-    const std::string userid_prefix = userid + "_";
+void AnalyticsManager::get_last_N_events(const std::string& prefix, uint32_t N, std::vector<std::string>& values) {
+    const std::string userid_prefix = prefix + "_";
     analytics_store->get_last_N_values(userid_prefix, N, values);
 }
 
