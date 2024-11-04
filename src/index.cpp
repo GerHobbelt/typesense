@@ -555,16 +555,17 @@ void Index::validate_and_preprocess(Index *index,
 
 size_t Index::
 batch_memory_index(Index *index,
-                                 std::vector<index_record>& iter_batch,
-                                 const std::string & default_sorting_field,
-                                 const tsl::htrie_map<char, field> & actual_search_schema,
-                                 const tsl::htrie_map<char, field> & embedding_fields,
-                                 const std::string& fallback_field_type,
-                                 const std::vector<char>& token_separators,
-                                 const std::vector<char>& symbols_to_index,
-                                 const bool do_validation, const size_t remote_embedding_batch_size,
-                                 const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries, const bool generate_embeddings, 
-                                 const bool use_addition_fields, const tsl::htrie_map<char, field>& addition_fields) {
+                 std::vector<index_record>& iter_batch,
+                 const std::string & default_sorting_field,
+                 const tsl::htrie_map<char, field> & actual_search_schema,
+                 const tsl::htrie_map<char, field> & embedding_fields,
+                 const std::string& fallback_field_type,
+                 const std::vector<char>& token_separators,
+                 const std::vector<char>& symbols_to_index,
+                 const bool do_validation, const size_t remote_embedding_batch_size,
+                 const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries,
+                 const bool generate_embeddings,
+                 const bool use_addition_fields, const tsl::htrie_map<char, field>& addition_fields) {
     const size_t concurrency = 4;
     const size_t num_threads = std::min(concurrency, iter_batch.size());
     const size_t window_size = (num_threads == 0) ? 0 :
@@ -5966,6 +5967,9 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     filter_result_iterator->compute_iterators();
     auto const& approx_filter_ids_length = filter_result_iterator->approx_filter_ids_length;
 
+    // Timed out during computation of filter_result_iterator. We should still process the partial ids.
+    auto timed_out_before_processing = filter_result_iterator->validity == filter_result_iterator_t::timed_out;
+
     uint32_t token_bits = 0;
     const bool check_for_circuit_break = (approx_filter_ids_length > 1000000);
 
@@ -5992,10 +5996,10 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     Option<bool>* compute_sort_score_statuses[num_threads];
 
     for(size_t thread_id = 0; thread_id < num_threads &&
-                                    filter_result_iterator->validity == filter_result_iterator_t::valid; thread_id++) {
+                                    filter_result_iterator->validity != filter_result_iterator_t::invalid; thread_id++) {
         auto batch_result = new filter_result_t();
         filter_result_iterator->get_n_ids(window_size, excluded_result_index, exclude_token_ids,
-                                          exclude_token_ids_size, batch_result);
+                                          exclude_token_ids_size, batch_result, timed_out_before_processing);
         if (batch_result->count == 0) {
             delete batch_result;
             break;
@@ -6085,7 +6089,8 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
     std::unique_lock<std::mutex> lock_process(m_process);
     cv_process.wait(lock_process, [&](){ return num_processed == num_queued; });
 
-    search_cutoff = parent_search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
+    search_cutoff = parent_search_cutoff || timed_out_before_processing ||
+                        filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
     for(size_t thread_id = 0; thread_id < num_processed; thread_id++) {
         if (compute_sort_score_statuses[thread_id] != nullptr) {
@@ -6113,8 +6118,12 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
             std::chrono::high_resolution_clock::now() - beginF).count();
     LOG(INFO) << "Time for raw scoring: " << timeMillisF;*/
 
-    filter_result_iterator->reset();
-    if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
+    filter_result_iterator->reset(true);
+
+    if (timed_out_before_processing || filter_result_iterator->validity == filter_result_iterator_t::valid) {
+        all_result_ids_len = filter_result_iterator->to_filter_id_array(all_result_ids);
+        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
+    } else if (filter_result_iterator->validity == filter_result_iterator_t::timed_out) {
         auto partial_result = new filter_result_t();
         std::unique_ptr<filter_result_t> partial_result_guard(partial_result);
 
@@ -6123,9 +6132,6 @@ Option<bool> Index::search_wildcard(filter_node_t const* const& filter_tree_root
         all_result_ids_len = partial_result->count;
         all_result_ids = partial_result->docs;
         partial_result->docs = nullptr;
-    } else if (filter_result_iterator->validity == filter_result_iterator_t::valid) {
-        all_result_ids_len = filter_result_iterator->to_filter_id_array(all_result_ids);
-        search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
     }
 
     return Option<bool>(true);
@@ -6733,7 +6739,7 @@ void Index::remove_facet_token(const field& search_field, spp::sparse_hash_map<s
     }
 }
 
-void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name,
+void Index::remove_field(uint32_t seq_id, nlohmann::json& document, const std::string& field_name,
                          const bool is_update) {
     const auto& search_field_it = search_schema.find(field_name);
     if(search_field_it == search_schema.end()) {
@@ -6747,6 +6753,13 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
     }
 
     if(search_field.optional && document[field_name].is_null()) {
+        return ;
+    }
+
+    auto coerce_op = validator_t::coerce_element(search_field, document, document[field_name],
+                                                 "", DIRTY_VALUES::COERCE_OR_REJECT);
+    if(!coerce_op.ok()) {
+        LOG(ERROR) << "Bad type for field " << field_name;
         return ;
     }
 
@@ -6793,9 +6806,27 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
             }
         }
     } else if(search_field.is_int64()) {
-        const std::vector<int64_t>& values = search_field.is_single_integer() ?
-                                             std::vector<int64_t>{document[field_name].get<int64_t>()} :
-                                             document[field_name].get<std::vector<int64_t>>();
+        std::vector<int64_t> values;
+        std::vector<std::pair<uint32_t, uint32_t>> object_array_reference_values;
+
+        if (search_field.is_array() && search_field.nested && search_field.is_reference_helper) {
+            for (const auto &pair: document[field_name]) {
+                if (!pair.is_array() || pair.size() != 2 || !pair[0].is_number_unsigned() ||
+                                                            !pair[1].is_number_unsigned()) {
+                    LOG(ERROR) << "`" + field_name + "` object array reference helper field has wrong value `"
+                                  + pair.dump() + "`.";
+                    continue;
+                }
+
+                object_array_reference_values.emplace_back(seq_id, pair[0]);
+                values.emplace_back(pair[1]);
+            }
+        } else {
+            values = search_field.is_single_integer() ?
+                     std::vector<int64_t>{document[field_name].get<int64_t>()} :
+                     document[field_name].get<std::vector<int64_t>>();
+        }
+
         for(int64_t value: values) {
             if (search_field.range_index) {
                 auto trie = range_index.at(field_name);
@@ -6808,6 +6839,14 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
             if(search_field.facet) {
                 remove_facet_token(search_field, search_index, std::to_string(value), seq_id);
             }
+
+            if (reference_index.count(field_name) != 0) {
+                reference_index[field_name]->remove(value, seq_id);
+            }
+        }
+
+        for (auto const& pair: object_array_reference_values) {
+            object_array_reference_index[field_name]->erase(pair);
         }
     } else if(search_field.num_dim) {
         if(!is_update) {
@@ -6892,7 +6931,7 @@ void Index::remove_field(uint32_t seq_id, const nlohmann::json& document, const 
     }
 }
 
-Option<uint32_t> Index::remove(const uint32_t seq_id, const nlohmann::json & document,
+Option<uint32_t> Index::remove(const uint32_t seq_id, nlohmann::json & document,
                                const std::vector<field>& del_fields, const bool is_update) {
     std::unique_lock lock(mutex);
 
@@ -7623,6 +7662,52 @@ Option<uint32_t> Index::get_sort_index_value_with_lock(const std::string& collec
     }
 
     return Option<uint32_t>(sort_index.at(field_name)->at(seq_id));
+}
+
+float Index::get_distance(const string& geo_field_name, const uint32_t& seq_id,
+                          const S2LatLng& reference_lat_lng, const std::string& unit) const {
+    std::unique_lock lock(mutex);
+
+    int64_t distance = 0;
+    if (sort_index.count(geo_field_name) != 0) {
+        auto& geo_index = sort_index.at(geo_field_name);
+
+        auto it = geo_index->find(seq_id);
+        if (it != geo_index->end()) {
+            int64_t packed_latlng = it->second;
+            S2LatLng s2_lat_lng;
+            GeoPoint::unpack_lat_lng(packed_latlng, s2_lat_lng);
+            distance = GeoPoint::distance(s2_lat_lng, reference_lat_lng);
+        }
+    } else {
+        // indicates geo point array
+        auto field_it = geo_array_index.at(geo_field_name);
+        auto it = field_it->find(seq_id);
+
+        if (it != field_it->end()) {
+            int64_t* latlngs = it->second;
+            for (size_t li = 0; li < latlngs[0]; li++) {
+                S2LatLng s2_lat_lng;
+                int64_t packed_latlng = latlngs[li + 1];
+                GeoPoint::unpack_lat_lng(packed_latlng, s2_lat_lng);
+                int64_t this_dist = GeoPoint::distance(s2_lat_lng, reference_lat_lng);
+                if (this_dist < distance) {
+                    distance = this_dist;
+                }
+            }
+        }
+    }
+
+    double dist = distance;
+    if (unit == "km") {
+        dist = dist * 0.001;
+    } else if (unit == "mi") {
+        dist =  dist * 0.00062137;
+    } else {
+        return 0;
+    }
+
+    return std::round(dist * 1000.0) / 1000.0;
 }
 
 /*

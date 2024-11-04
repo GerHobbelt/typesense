@@ -706,10 +706,10 @@ public:
                 bool enable_typos_for_alpha_numerical_tokens = true
                 ) const;
 
-    void remove_field(uint32_t seq_id, const nlohmann::json& document, const std::string& field_name,
+    void remove_field(uint32_t seq_id, nlohmann::json& document, const std::string& field_name,
                       const bool is_update);
 
-    Option<uint32_t> remove(const uint32_t seq_id, const nlohmann::json & document,
+    Option<uint32_t> remove(const uint32_t seq_id, nlohmann::json & document,
                             const std::vector<field>& del_fields, const bool is_update);
 
     static void validate_and_preprocess(Index *index, std::vector<index_record>& iter_batch,
@@ -1045,6 +1045,9 @@ public:
     void repair_hnsw_index();
 
     void aggregate_facet(const size_t group_limit, facet& this_facet, facet& acc_facet) const;
+
+    float get_distance(const string& geo_field_name, const uint32_t& seq_id,
+                       const S2LatLng& reference_lat_lng, const std::string& unit) const;
 };
 
 template<class T>

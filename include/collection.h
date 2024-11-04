@@ -183,7 +183,7 @@ private:
                           bool& found_highlight,
                           bool& found_full_highlight) const;
 
-    void remove_document(const nlohmann::json & document, const uint32_t seq_id, bool remove_from_store);
+    void remove_document(nlohmann::json & document, const uint32_t seq_id, bool remove_from_store);
 
     void process_remove_field_for_embedding_fields(const field& del_field, std::vector<field>& garbage_embed_fields);
 
@@ -431,6 +431,8 @@ public:
     tsl::htrie_set<char> get_object_reference_helper_fields();
 
     std::string get_default_sorting_field();
+
+    void update_metadata(const nlohmann::json& meta);
 
     static Option<bool> add_reference_helper_fields(nlohmann::json& document, const tsl::htrie_map<char, field>& schema,
                                                     const spp::sparse_hash_map<std::string, reference_pair>& reference_fields,

@@ -227,6 +227,12 @@ struct filter_result_t {
 struct filter_result_iterator_timeout_info {
     filter_result_iterator_timeout_info(uint64_t search_begin_us, uint64_t search_stop_us);
 
+    filter_result_iterator_timeout_info(const filter_result_iterator_timeout_info& obj) {
+        function_call_counter = obj.function_call_counter;
+        search_begin_us = obj.search_begin_us;
+        search_stop_us = obj.search_stop_us;
+    }
+
     uint16_t function_call_counter = 0;
     uint64_t search_begin_us = 0;
     uint64_t search_stop_us = UINT64_MAX;
@@ -280,6 +286,10 @@ private:
     /// Sample filter: [>10, !15].
     std::unordered_set<uint32_t> numerical_not_iterator_index;
 
+    /// String filter can specify prefix value match.
+    /// Sample filter: [Chris P*].
+    std::unordered_set<uint32_t> string_prefix_filter_index;
+
     bool delete_filter_node = false;
 
     std::unique_ptr<filter_result_iterator_timeout_info> timeout_info;
@@ -312,7 +322,7 @@ private:
     void get_n_ids(const uint32_t& n, filter_result_t*& result, const bool& override_timeout = false);
 
     /// Updates `validity` of the iterator to `timed_out` if condition is met. Assumes `timeout_info` is not null.
-    inline bool is_timed_out();
+    inline bool is_timed_out(const bool& override_function_call_counter = false);
 
     /// Advances the iterator until the doc value reaches or just overshoots id. The iterator may become invalid during
     /// this operation.

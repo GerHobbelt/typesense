@@ -1510,6 +1510,7 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
                         if(unit != "km" && unit != "mi") {
                             return Option<bool>(400, "Sort field's parameter unit must be either `km` or `mi`.");
                         }
+                        sort_field_std.unit = unit;
 
                         std::vector<std::string> dist_values;
                         StringUtils::split(param_parts[1], dist_values, unit);
@@ -2790,7 +2791,13 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
 
             for(size_t sort_field_index = 0; sort_field_index < sort_fields_std.size(); sort_field_index++) {
                 const auto& sort_field = sort_fields_std[sort_field_index];
-                if(sort_field.geopoint != 0) {
+                if(sort_field.geopoint != 0 && sort_field.geo_precision != 0) {
+                    S2LatLng reference_lat_lng;
+                    GeoPoint::unpack_lat_lng(sort_field.geopoint, reference_lat_lng);
+
+                    geo_distances[sort_field.name] = index->get_distance(sort_field.name, field_order_kv->key,
+                                                                         reference_lat_lng, sort_field.unit);
+                } else if(sort_field.geopoint != 0) {
                     geo_distances[sort_field.name] = std::abs(field_order_kv->scores[sort_field_index]);
                 }
             }
@@ -2881,13 +2888,9 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
             return Option<nlohmann::json>(add_conversation_op.code(), add_conversation_op.error());
         }
 
-        auto get_conversation_op = ConversationManager::get_instance().get_conversation(add_conversation_op.get());
-        if(!get_conversation_op.ok()) {
-            return Option<nlohmann::json>(get_conversation_op.code(), get_conversation_op.error());
-        }
 
         if(exclude_fields.count("conversation_history") == 0) {
-            result["conversation"]["conversation_history"] = get_conversation_op.get();
+            result["conversation"]["conversation_history"] = conversation_history;
         }
         result["conversation"]["conversation_id"] = add_conversation_op.get();
     }
@@ -4460,7 +4463,7 @@ Option<nlohmann::json> Collection::get(const std::string & id) const {
     return Option<nlohmann::json>(document);
 }
 
-void Collection::remove_document(const nlohmann::json & document, const uint32_t seq_id, bool remove_from_store) {
+void Collection::remove_document(nlohmann::json & document, const uint32_t seq_id, bool remove_from_store) {
     const std::string& id = document["id"];
 
     {
@@ -4746,6 +4749,11 @@ std::string Collection::get_seq_id_collection_prefix() const {
 std::string Collection::get_default_sorting_field() {
     std::shared_lock lock(mutex);
     return default_sorting_field;
+}
+
+void Collection::update_metadata(const nlohmann::json& meta) {
+    std::shared_lock lock(mutex);
+    metadata = meta;
 }
 
 Option<bool> Collection::get_document_from_store(const uint32_t& seq_id,
@@ -5645,13 +5653,14 @@ Option<bool> Collection::validate_alter_payload(nlohmann::json& schema_changes,
     }
 
     if(schema_changes.size() != 1) {
-        return Option<bool>(400, "Only `fields` can be updated at the moment.");
+        return Option<bool>(400, "Only `fields` and `metadata` can be updated at the moment.");
     }
 
     const std::string err_msg = "The `fields` value should be an array of objects containing "
                                 "the field `name` and other properties.";
 
-    if(!schema_changes.contains("fields") || !schema_changes["fields"].is_array() || schema_changes["fields"].empty()) {
+    if((!schema_changes.contains("fields") || !schema_changes["fields"].is_array()
+            || schema_changes["fields"].empty())) {
         return Option<bool>(400, err_msg);
     }
 

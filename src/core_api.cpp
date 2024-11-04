@@ -64,11 +64,11 @@ bool get_alter_in_progress() {
 void log_running_queries() {
     std::unique_lock ifq_lock(ifq_mutex);
     if(in_flight_queries.empty()) {
-        LOG(ERROR) << "No in-flight search queries were found.";
+        LOG(INFO) << "No in-flight search queries were found.";
         return ;
     }
 
-    LOG(ERROR) << "Dump of in-flight search queries:";
+    LOG(INFO) << "Dump of in-flight search queries:";
 
     for(const auto& kv: in_flight_queries) {
         std::string query_string = "?";
@@ -80,7 +80,7 @@ void log_running_queries() {
             }
         }
 
-        LOG(ERROR) << "id=" << kv.first << ", qs=" << query_string << ", body=" << search_payload;
+        LOG(INFO) << "id=" << kv.first << ", qs=" << query_string << ", body=" << search_payload;
     }
 }
 
@@ -305,6 +305,7 @@ bool post_create_collection(const std::shared_ptr<http_req>& req, const std::sha
 
 bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     nlohmann::json req_json;
+    std::set<std::string> allowed_keys = {"metadata", "fields"};
 
     try {
         req_json = nlohmann::json::parse(req->body);
@@ -313,6 +314,20 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
         res->set_400("Bad JSON.");
         alter_in_progress = false;
         return false;
+    }
+
+    if(req_json.empty()) {
+        res->set_400("Alter payload is empty.");
+        alter_in_progress = false;
+        return false;
+    }
+
+    for(auto it : req_json.items()) {
+        if(allowed_keys.count(it.key()) == 0) {
+            res->set_400("Only `fields` and `metadata` can be updated at the moment.");
+            alter_in_progress = false;
+            return false;
+        }
     }
 
     CollectionManager & collectionManager = CollectionManager::get_instance();
@@ -324,11 +339,28 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
         return false;
     }
 
-    auto alter_op = collection->alter(req_json);
-    if(!alter_op.ok()) {
-        res->set(alter_op.code(), alter_op.error());
-        alter_in_progress = false;
-        return false;
+    if(req_json.contains("metadata")) {
+        if(!req_json["metadata"].is_object()) {
+            res->set_400("The `metadata` value should be an object.");
+            alter_in_progress = false;
+            return false;
+        }
+
+        collection->update_metadata(req_json["metadata"]);
+
+        //update in db
+        collectionManager.update_collection_metadata(req->params["collection"], req_json["metadata"]);
+    }
+
+    if(req_json.contains("fields")) {
+        nlohmann::json alter_payload;
+        alter_payload["fields"] = req_json["fields"];
+        auto alter_op = collection->alter(alter_payload);
+        if(!alter_op.ok()) {
+            res->set(alter_op.code(), alter_op.error());
+            alter_in_progress = false;
+            return false;
+        }
     }
 
     alter_in_progress = false;
@@ -356,6 +388,16 @@ bool del_drop_collection(const std::shared_ptr<http_req>& req, const std::shared
 }
 
 bool get_debug(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    bool log_inflight_queries = false;
+
+    if(req->params.count("log_inflight_queries") != 0) {
+        log_inflight_queries = (req->params["log_inflight_queries"] == "true");
+    }
+
+    if(log_inflight_queries) {
+        log_running_queries();
+    }
+
     nlohmann::json result;
     result["version"] = server->get_version();
 
@@ -929,13 +971,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             return false;
         }
 
-        auto get_conversation_op = ConversationManager::get_instance().get_conversation(add_conversation_op.get());
-        if(!get_conversation_op.ok()) {
-            res->set_400(get_conversation_op.error());
-            return false;
-        }
         if(!exclude_conversation_history) {
-            response["conversation"]["conversation_history"] = get_conversation_op.get();
+            response["conversation"]["conversation_history"] = new_conversation_history;
         }
         response["conversation"]["conversation_id"] = add_conversation_op.get();
 
@@ -1466,6 +1503,12 @@ bool patch_update_documents(const std::shared_ptr<http_req>& req, const std::sha
 bool get_fetch_document(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     std::string doc_id = req->params["id"];
 
+    const char* INCLUDE_FIELDS = "include_fields";
+    const char* EXCLUDE_FIELDS = "exclude_fields";
+
+    spp::sparse_hash_set<std::string> exclude_fields;
+    spp::sparse_hash_set<std::string> include_fields;
+
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
     if(collection == nullptr) {
@@ -1480,7 +1523,34 @@ bool get_fetch_document(const std::shared_ptr<http_req>& req, const std::shared_
         return false;
     }
 
-    res->set_200(doc_option.get().dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
+    if(req->params.count(INCLUDE_FIELDS) != 0) {
+        std::vector<std::string> include_fields_vec;
+        StringUtils::split(req->params[INCLUDE_FIELDS], include_fields_vec, ",");
+        include_fields = spp::sparse_hash_set<std::string>(include_fields_vec.begin(), include_fields_vec.end());
+    }
+
+    if(req->params.count(EXCLUDE_FIELDS) != 0) {
+        std::vector<std::string> exclude_fields_vec;
+        StringUtils::split(req->params[EXCLUDE_FIELDS], exclude_fields_vec, ",");
+        exclude_fields = spp::sparse_hash_set<std::string>(exclude_fields_vec.begin(), exclude_fields_vec.end());
+    }
+
+    nlohmann::json doc = doc_option.get();
+
+    for(auto it = doc.begin(); it != doc.end(); ++it) {
+        if(!include_fields.empty() && include_fields.count(it.key()) == 0) {
+            doc.erase(it.key());
+            continue;
+        }
+
+        if(!exclude_fields.empty() && exclude_fields.count(it.key()) != 0) {
+            doc.erase(it.key());
+            continue;
+        }
+    }
+
+
+    res->set_200(doc.dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
     return true;
 }
 
@@ -2919,7 +2989,15 @@ bool post_conversation_model(const std::shared_ptr<http_req>& req, const std::sh
         return false;
     }
 
-    const std::string& model_id = req->metadata;
+    std::string model_id = "";
+    try {
+        nlohmann::json parsed_json = nlohmann::json::parse(req->body);
+        if(parsed_json.count("id") != 0 && parsed_json["id"].is_string()) {
+            model_id = parsed_json["id"].get<std::string>();
+        }
+    } catch(const std::exception& e) {
+
+    }
 
     auto add_model_op = ConversationModelManager::add_model(req_json, model_id);
 

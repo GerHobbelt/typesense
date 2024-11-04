@@ -355,7 +355,7 @@ void filter_result_iterator_t::get_string_filter_next_match(const bool& field_is
     uint32_t lowest_id = UINT32_MAX;
 
     if (filter_node->filter_exp.comparators[0] == EQUALS || filter_node->filter_exp.comparators[0] == NOT_EQUALS) {
-        bool exact_match_found = false;
+        bool match_found = false;
         switch (posting_list_iterators.size()) {
             case 1:
                 while(true) {
@@ -366,28 +366,32 @@ void filter_result_iterator_t::get_string_filter_next_match(const bool& field_is
                         break;
                     }
 
-                    if (posting_list_t::has_exact_match(posting_list_iterators[0], field_is_array)) {
-                        exact_match_found = true;
-                        break;
-                    } else {
-                        // Keep advancing token iterators till exact match is not found.
-                        for (auto& iter: posting_list_iterators[0]) {
-                            if (!iter.valid()) {
-                                break;
-                            }
+                    match_found = string_prefix_filter_index.count(0) == 0 ?
+                                    posting_list_t::has_exact_match(posting_list_iterators[0], field_is_array) :
+                                    posting_list_t::has_prefix_match(posting_list_iterators[0], field_is_array);
 
-                            iter.next();
+                    if (match_found) {
+                        break;
+                    }
+
+                    // Keep advancing token iterators till match is not found.
+                    for (auto& iter: posting_list_iterators[0]) {
+                        if (!iter.valid()) {
+                            break;
                         }
+
+                        iter.next();
                     }
                 }
 
-                if (one_is_valid && exact_match_found) {
+                if (one_is_valid && match_found) {
                     lowest_id = posting_list_iterators[0][0].id();
                 }
             break;
 
             default :
-                for (auto& filter_value_tokens : posting_list_iterators) {
+                for (uint32_t i = 0; i < posting_list_iterators.size(); i++) {
+                    auto& filter_value_tokens = posting_list_iterators[i];
                     bool tokens_iter_is_valid;
                     while(true) {
                         // Perform AND between tokens of a filter value.
@@ -397,24 +401,27 @@ void filter_result_iterator_t::get_string_filter_next_match(const bool& field_is
                             break;
                         }
 
-                        if (posting_list_t::has_exact_match(filter_value_tokens, field_is_array)) {
-                            exact_match_found = true;
-                            break;
-                        } else {
-                            // Keep advancing token iterators till exact match is not found.
-                            for (auto &iter: filter_value_tokens) {
-                                if (!iter.valid()) {
-                                    break;
-                                }
+                        match_found = string_prefix_filter_index.count(i) == 0 ?
+                                      posting_list_t::has_exact_match(filter_value_tokens, field_is_array) :
+                                      posting_list_t::has_prefix_match(filter_value_tokens, field_is_array);
 
-                                iter.next();
+                        if (match_found) {
+                            break;
+                        }
+
+                        // Keep advancing token iterators till exact match is not found.
+                        for (auto &iter: filter_value_tokens) {
+                            if (!iter.valid()) {
+                                break;
                             }
+
+                            iter.next();
                         }
                     }
 
                     one_is_valid = tokens_iter_is_valid || one_is_valid;
 
-                    if (tokens_iter_is_valid && exact_match_found && filter_value_tokens[0].id() < lowest_id) {
+                    if (tokens_iter_is_valid && match_found && filter_value_tokens[0].id() < lowest_id) {
                         lowest_id = filter_value_tokens[0].id();
                     }
                 }
@@ -979,7 +986,10 @@ void filter_result_iterator_t::init() {
                     }
                 }
 
+                id_lists.reserve(id_lists.size() + lists.size());
                 id_lists.emplace_back(std::move(lists));
+
+                id_list_iterators.reserve(id_list_iterators.size() + iters.size());
                 id_list_iterators.emplace_back(std::move(iters));
             }
 
@@ -1101,7 +1111,10 @@ void filter_result_iterator_t::init() {
                     }
                 }
 
+                id_lists.reserve(id_lists.size() + lists.size());
                 id_lists.emplace_back(std::move(lists));
+
+                id_list_iterators.reserve(id_list_iterators.size() + iters.size());
                 id_list_iterators.emplace_back(std::move(iters));
             }
 
@@ -1360,7 +1373,8 @@ void filter_result_iterator_t::init() {
     } else if (f.is_string()) {
         art_tree* t = index->search_index.at(a_filter.field_name);
 
-        for (std::string filter_value : a_filter.values) {
+        for (uint32_t i = 0; i < a_filter.values.size(); i++) {
+            auto filter_value = a_filter.values[i];
             auto is_prefix_match = filter_value.size() > 1 && filter_value[filter_value.size() - 1] == '*';
             if (is_prefix_match) {
                 filter_value.erase(filter_value.size() - 1);
@@ -1469,6 +1483,7 @@ void filter_result_iterator_t::init() {
                         continue;
                     }
 
+                    string_prefix_filter_index.insert(posting_lists.size());
                     posting_lists.push_back(plists);
                     posting_list_iterators.emplace_back(std::vector<posting_list_t::iterator_t>());
                     for (auto const& plist: plists) {
@@ -2209,16 +2224,11 @@ void filter_result_iterator_t::get_n_ids(const uint32_t& n, filter_result_t*& re
         return;
     }
 
-    if (override_timeout) {
-        result_index = 0;
-    } else if (timeout_info != nullptr) {
+    if (!override_timeout && timeout_info != nullptr) {
         // In Index::search_wildcard number of calls to get_n_ids will be min(number of threads, filter match ids).
         // Therefore, `timeout_info->function_call_counter` won't reach `function_call_modulo` if only incremented on
         // function call.
-        if (n > function_call_modulo) {
-            timeout_info->function_call_counter = function_call_modulo - 1;
-        }
-        if (is_timed_out()) {
+        if (n > function_call_modulo && is_timed_out(true)) {
             return;
         }
     }
@@ -2242,9 +2252,7 @@ void filter_result_iterator_t::get_n_ids(const uint32_t& n, filter_result_t*& re
         result_reference = std::move(filter_result.coll_to_references[result_index]);
     }
 
-    if (!override_timeout) {
-        validity = result_index < filter_result.count ? valid : invalid;
-    }
+    validity = result_index < filter_result.count ? valid : invalid;
 }
 
 void filter_result_iterator_t::get_n_ids(const uint32_t& n,
@@ -2261,16 +2269,11 @@ void filter_result_iterator_t::get_n_ids(const uint32_t& n,
         return;
     }
 
-    if (override_timeout) {
-        result_index = 0;
-    } else if (timeout_info != nullptr) {
+    if (!override_timeout && timeout_info != nullptr) {
         // In Index::search_wildcard number of calls to get_n_ids will be min(number of threads, filter match ids).
         // Therefore, `timeout_info->function_call_counter` won't reach `function_call_modulo` if only incremented on
         // function call.
-        if (n > function_call_modulo) {
-            timeout_info->function_call_counter = function_call_modulo - 1;
-        }
-        if (is_timed_out()) {
+        if (n > function_call_modulo && is_timed_out(true)) {
             return;
         }
     }
@@ -2305,9 +2308,7 @@ void filter_result_iterator_t::get_n_ids(const uint32_t& n,
         result_reference = std::move(filter_result.coll_to_references[match_index]);
     }
 
-    if (!override_timeout) {
-        validity = result_index < filter_result.count ? valid : invalid;
-    }
+    validity = result_index < filter_result.count ? valid : invalid;
 }
 
 filter_result_iterator_t::filter_result_iterator_t(uint32_t approx_filter_ids_length) :
@@ -2364,6 +2365,11 @@ void filter_result_iterator_t::compute_iterators() {
     }
 
     if (filter_node->isOperator) {
+        if (timeout_info != nullptr) {
+            // Passing timeout_info into subtree so individual nodes can check for timeout.
+            left_it->timeout_info = std::make_unique<filter_result_iterator_timeout_info>(*timeout_info);
+            right_it->timeout_info = std::make_unique<filter_result_iterator_timeout_info>(*timeout_info);
+        }
         left_it->compute_iterators();
         right_it->compute_iterators();
 
@@ -2373,18 +2379,22 @@ void filter_result_iterator_t::compute_iterators() {
             filter_result_t::or_filter_results(left_it->filter_result, right_it->filter_result, filter_result);
         }
 
-        // In a complex filter query a sub-expression might not match any document while the full expression does match
-        // at least one document. If the full expression doesn't match any document, we return early in the search.
-        if (filter_result.count == 0) {
-            validity = invalid;
-            is_filter_result_initialized = true;
-            return;
+        if (left_it->validity == timed_out || right_it->validity == timed_out ||
+                (timeout_info != nullptr && is_timed_out(true))) {
+            validity = timed_out;
         }
 
-        result_index = 0;;
-        seq_id = filter_result.docs[result_index];
+        // In a complex filter query a sub-expression might not match any document while the full expression does match
+        // at least one document. If the full expression doesn't match any document, we return early in the search.
+        if (filter_result.count == 0 && validity != timed_out) {
+            validity = invalid;
+        } else if (filter_result.count > 0) {
+            result_index = 0;
+            seq_id = filter_result.docs[result_index];
+            approx_filter_ids_length = filter_result.count;
+        }
+
         is_filter_result_initialized = true;
-        approx_filter_ids_length = filter_result.count;
 
         // Deleting subtree since we've already computed the result.
         delete left_it;
@@ -2437,9 +2447,15 @@ void filter_result_iterator_t::compute_iterators() {
                     delete[] filter_ids;
                     filter_ids = out;
                     std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
+
+                    if (timeout_info != nullptr && is_timed_out(true)) {
+                        goto compute_done;
+                    }
                 }
             }
         }
+
+        compute_done:
 
         if (!f_id_buff.empty()) {
             gfx::timsort(f_id_buff.begin(), f_id_buff.end());
@@ -2466,6 +2482,10 @@ void filter_result_iterator_t::compute_iterators() {
         size_t result_size = 0;
         num_tree->search(a_filter.comparators[0], bool_int64, &filter_result.docs, result_size);
         filter_result.count = result_size;
+
+        if (timeout_info != nullptr) {
+            is_timed_out(true);
+        }
     } else if (f.is_string()) {
         // Resetting posting_list_iterators.
         for (uint32_t i = 0; i < posting_lists.size(); i++) {
@@ -2485,7 +2505,33 @@ void filter_result_iterator_t::compute_iterators() {
 
         for (uint32_t i = 0; i < posting_lists.size(); i++) {
             auto& p_list = posting_lists[i];
-            if (a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS) {
+            if (string_prefix_filter_index.count(i) != 0 &&
+                    (a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS)) {
+                // Exact prefix match, needs intersection + prefix matching
+                std::vector<uint32_t> result_id_vec;
+                posting_list_t::intersect(p_list, result_id_vec);
+
+                if (result_id_vec.empty()) {
+                    continue;
+                }
+
+                // need to do prefix match
+                uint32_t* prefix_str_ids = new uint32_t[result_id_vec.size()];
+                size_t prefix_str_ids_size = 0;
+                std::unique_ptr<uint32_t[]> prefix_str_ids_guard(prefix_str_ids);
+
+                posting_list_t::get_prefix_matches(posting_list_iterators[i], f.is_array(),
+                                                  result_id_vec.data(), result_id_vec.size(),
+                                                  prefix_str_ids, prefix_str_ids_size);
+
+                if (prefix_str_ids_size == 0) {
+                    continue;
+                }
+
+                for (size_t pi = 0; pi < prefix_str_ids_size; pi++) {
+                    f_id_buff.push_back(prefix_str_ids[pi]);
+                }
+            } else if (a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS) {
                 // needs intersection + exact matching (unlike CONTAINS)
                 std::vector<uint32_t> result_id_vec;
                 posting_list_t::intersect(p_list, result_id_vec);
@@ -2528,6 +2574,10 @@ void filter_result_iterator_t::compute_iterators() {
                 delete[] or_ids;
                 or_ids = out;
                 std::vector<uint32_t>().swap(f_id_buff);  // clears out memory
+
+                if (timeout_info != nullptr && is_timed_out(true)) {
+                    break;
+                }
             }
         }
 
@@ -2561,13 +2611,19 @@ void filter_result_iterator_t::compute_iterators() {
     approx_filter_ids_length = filter_result.count;
 }
 
-bool filter_result_iterator_t::is_timed_out() {
-    if (validity == timed_out ||
-        (++(timeout_info->function_call_counter) % function_call_modulo == 0 && (std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count() - timeout_info->search_begin_us) > timeout_info->search_stop_us)) {
-        validity = timed_out;
+bool filter_result_iterator_t::is_timed_out(const bool& override_function_call_counter) {
+    if (validity == timed_out) {
         return true;
     }
+
+    if (override_function_call_counter || ++(timeout_info->function_call_counter) % function_call_modulo == 0) {
+        if ((std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count() - timeout_info->search_begin_us) > timeout_info->search_stop_us) {
+            validity = timed_out;
+            return true;
+        }
+    }
+
     return false;
 }
 
