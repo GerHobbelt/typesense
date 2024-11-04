@@ -1399,6 +1399,10 @@ TEST_F(CollectionFilteringTest, FilteringViaDocumentIds) {
     ASSERT_FALSE(res_op.ok());
     ASSERT_EQ("Error with filter field `id`: Filter value cannot be empty.", res_op.error());
 
+    res_op = coll1->search("*", {}, "id: ``", {}, sort_fields, {0}, 10, 1, FREQUENCY, {true});
+    ASSERT_FALSE(res_op.ok());
+    ASSERT_EQ("Error with filter field `id`: Filter value cannot be empty.", res_op.error());
+
     // when no IDs exist
     results = coll1->search("*",
                             {}, "id: [1000] && num_employees: <300",
@@ -2925,6 +2929,36 @@ TEST_F(CollectionFilteringTest, PrefixFilterOnTextFields) {
     ASSERT_EQ("Steve Runner foo", res_obj["hits"][1]["document"]["names"][0]);
     ASSERT_EQ("Steve Rogers", res_obj["hits"][2]["document"]["names"][1]);
     ASSERT_EQ("Steve Reiley", res_obj["hits"][3]["document"]["names"][0]);
+}
+
+TEST_F(CollectionFilteringTest, ExactFilterOnLongField) {
+    nlohmann::json schema = R"({
+         "name": "companies",
+         "fields": [
+           {"name": "keywords", "type": "string[]"}
+         ]
+       })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+
+    auto coll = op.get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+
+    std::string arr_value;
+
+    // when value exceeds 128 tokens, we will fail gracefully
+    for(size_t i = 0; i < 130; i++) {
+        arr_value += "foo" + std::to_string(i) + " ";
+    }
+    doc1["keywords"] = {arr_value};
+
+    ASSERT_TRUE(coll->add(doc1.dump()).ok());
+
+    auto results = coll->search("*", {}, "keywords:=" + arr_value, {}, {}, {0}, 10, 1, FREQUENCY, {false}).get();
+    ASSERT_EQ(0, results["hits"].size());
 }
 
 TEST_F(CollectionFilteringTest, FilterOnStemmedField) {

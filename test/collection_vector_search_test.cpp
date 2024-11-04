@@ -1142,7 +1142,7 @@ TEST_F(CollectionVectorTest, VectorWithNullValue) {
 
     ASSERT_TRUE(nlohmann::json::parse(json_lines[0])["success"].get<bool>());
     ASSERT_FALSE(nlohmann::json::parse(json_lines[1])["success"].get<bool>());
-    ASSERT_EQ("Field `vec` must be an array.",
+    ASSERT_EQ("Field `vec` must have 4 dimensions.",
               nlohmann::json::parse(json_lines[1])["error"].get<std::string>());
 }
 
@@ -1226,6 +1226,50 @@ TEST_F(CollectionVectorTest, EmbeddedVectorUnchangedUpsert) {
     ASSERT_EQ(1, results["found"].get<size_t>());
     embedding = results["hits"][0]["document"]["embedding"].get<std::vector<float>>();
     ASSERT_EQ(384, embedding.size());
+}
+
+TEST_F(CollectionVectorTest, EmbeddOptionalFieldNullValueUpsert) {
+    nlohmann::json schema = R"({
+                "name": "coll1",
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "desc", "type": "string", "optional": true},
+                    {"name": "tags", "type": "string[]", "optional": true},
+                    {"name": "embedding", "type":"float[]", "embed":{"from": ["title", "desc", "tags"],
+                        "model_config": {"model_name": "ts/e5-small"}}}
+                ]
+            })"_json;
+
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+
+    Collection* coll1 = collectionManager.create_collection(schema).get();
+
+    nlohmann::json doc;
+    doc["id"] = "0";
+    doc["title"] = "Title";
+    doc["desc"] = nullptr;
+    doc["tags"] = {"foo", "bar"};
+
+    auto add_op = coll1->add(doc.dump(), UPSERT);
+    ASSERT_TRUE(add_op.ok());
+
+    auto results = coll1->search("title", {"embedding"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {true}, Index::DROP_TOKENS_THRESHOLD,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>()).get();
+
+    ASSERT_EQ(1, results["found"].get<size_t>());
+    auto embedding = results["hits"][0]["document"]["embedding"].get<std::vector<float>>();
+    ASSERT_EQ(384, embedding.size());
+
+    // upsert doc
+    add_op = coll1->add(doc.dump(), index_operation_t::UPSERT);
+    ASSERT_TRUE(add_op.ok());
+
+    // try with null values in array: not allowed
+    doc["tags"] = {"bar", nullptr};
+    add_op = coll1->add(doc.dump(), index_operation_t::UPSERT);
+    ASSERT_FALSE(add_op.ok());
+    ASSERT_EQ("Field `tags` must be an array of string.", add_op.error());
 }
 
 TEST_F(CollectionVectorTest, HybridSearchWithExplicitVector) {
@@ -3086,7 +3130,7 @@ TEST_F(CollectionVectorTest, TestQAConversation) {
     auto conversation_model_config = R"({
         "model_name": "openai/gpt-3.5-turbo",
         "max_bytes: 1000,
-        "conversation_collection": "conversation_store",
+        "history_collection": "conversation_store",
     })"_json;
 
     conversation_model_config["api_key"] = api_key;
@@ -3534,7 +3578,7 @@ TEST_F(CollectionVectorTest, InvalidMultiSearchConversation) {
     auto conversation_model_config = R"({
         "model_name": "openai/gpt-3.5-turbo",
         "max_bytes": 1000,
-        "conversation_collection": "conversation_store"
+        "history_collection": "conversation_store"
     })"_json;
 
     conversation_model_config["api_key"] = api_key;
@@ -3614,7 +3658,7 @@ TEST_F(CollectionVectorTest, TestMigratingConversationModel) {
     auto conversation_model_config = R"({
         "model_name": "openai/gpt-3.5-turbo",
         "max_bytes": 1000,
-        "conversation_collection": "conversation_store"
+        "history_collection": "conversation_store"
     })"_json;
 
     if (std::getenv("api_key") == nullptr) {
@@ -3627,7 +3671,7 @@ TEST_F(CollectionVectorTest, TestMigratingConversationModel) {
     auto migrate_res = ConversationModelManager::migrate_model(conversation_model_config);
     ASSERT_TRUE(migrate_res.ok());
     auto migrated_model = migrate_res.get();
-    ASSERT_TRUE(migrated_model.count("conversation_collection") == 1);
+    ASSERT_TRUE(migrated_model.count("history_collection") == 1);
 
     auto collection = CollectionManager::get_instance().get_collection("conversation_store").get();
     ASSERT_TRUE(collection != nullptr);

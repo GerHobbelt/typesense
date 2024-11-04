@@ -12,6 +12,7 @@ struct event_type_collection {
     std::string event_type;
     std::string collection;
     bool log_to_file = false;
+    std::string analytic_rule;
 };
 
 struct event_t {
@@ -53,20 +54,7 @@ struct event_t {
         }
     }
 
-    void to_json(nlohmann::json& obj) const {
-        obj["query"] = query;
-        obj["type"] = event_type;
-        obj["timestamp"] = timestamp;
-        obj["user_id"] = user_id;
-        obj["doc_id"] = doc_id;
-        obj["name"] = name;
-
-        if(event_type == "custom") {
-            for(const auto& kv : data) {
-                obj[kv.first] = kv.second;
-            }
-        }
-    }
+    void to_json(nlohmann::json& obj, const std::string& coll) const;
 };
 
 struct counter_event_t {
@@ -153,6 +141,7 @@ private:
     LRU::Cache<std::string, event_cache_t> events_cache;
 
     Store* store = nullptr;
+    Store* analytics_store = nullptr;
     std::ofstream  analytics_logs;
 
     bool isRateLimitEnabled = true;
@@ -187,7 +176,7 @@ public:
     AnalyticsManager(AnalyticsManager const&) = delete;
     void operator=(AnalyticsManager const&) = delete;
 
-    void init(Store* store, const std::string& analytics_dir="");
+    void init(Store* store, Store* analytics_store, const std::string& analytics_dir="");
 
     void run(ReplicationState* raft_server);
 
@@ -216,7 +205,7 @@ public:
     Option<bool> add_event(const std::string& client_ip, const std::string& event_type,
                            const std::string& event_name, const nlohmann::json& event_data);
 
-    void persist_events();
+    void persist_events(ReplicationState *raft_server, uint64_t prev_persistence_s);
 
     void persist_popular_events(ReplicationState *raft_server, uint64_t prev_persistence_s);
 
@@ -228,4 +217,14 @@ public:
     std::unordered_map<std::string, QueryAnalytics*> get_nohits_queries();
 
     void resetToggleRateLimit(bool toggle);
+
+    bool write_to_db(const nlohmann::json& payload);
+
+    void get_last_N_events(const std::string& userid, uint32_t N, std::vector<std::string>& values);
+
+#ifdef TEST_BUILD
+    std::unordered_map<std::string, std::vector<event_t>> get_log_events() {
+        return query_collection_events;
+    }
+#endif
 };

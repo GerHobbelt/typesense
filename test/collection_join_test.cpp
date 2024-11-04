@@ -1294,6 +1294,136 @@ TEST_F(CollectionJoinTest, UpdateDocumentHavingReferenceField) {
     ASSERT_EQ("Dan", res_obj["hits"][0]["document"]["Users"][0]["name"]);
 }
 
+TEST_F(CollectionJoinTest, JoinAfterUpdateOfArrayField) {
+    auto exercise_schema =
+            R"({
+                "name": "exercises",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name":"bodyParts","reference":"bodyParts.uid","type":"string[]"},
+                    {"name":"name","type":"string"}]
+            })"_json;
+
+    auto collection_create_op = collectionManager.create_collection(exercise_schema);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto exercise_coll = collection_create_op.get();
+
+    auto body_parts_schema =
+            R"({
+                "name": "bodyParts",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name":"uid","type":"string"},
+                    {"name":"name","type":"string"}]
+            })"_json;
+
+    collection_create_op = collectionManager.create_collection(body_parts_schema);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto part_coll = collection_create_op.get();
+
+    nlohmann::json body_part_doc;
+
+    body_part_doc["name"] = "Part 1";
+    body_part_doc["uid"] = "abcd1";
+    part_coll->add(body_part_doc.dump());
+
+    body_part_doc["name"] = "Part 2";
+    body_part_doc["uid"] = "abcd2";
+    part_coll->add(body_part_doc.dump());
+
+    body_part_doc["name"] = "Part 3";
+    body_part_doc["uid"] = "abcd3";
+    ASSERT_TRUE(part_coll->add(body_part_doc.dump()).ok());
+
+    nlohmann::json exercise_doc;
+    exercise_doc["id"] = "0";
+    exercise_doc["name"] = "Example 1";
+    exercise_doc["bodyParts"] = {"abcd1", "abcd2", "abcd3"};
+    ASSERT_TRUE(exercise_coll->add(exercise_doc.dump()).ok());
+
+    // search for the document
+    std::map<std::string, std::string> req_params = {
+            {"collection", "exercises"},
+            {"q", "*"},
+            {"include_fields", "$bodyParts(uid, name, strategy:nest) as parts"}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    auto res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(3, res["hits"][0]["document"]["bodyParts"].size());
+    ASSERT_EQ(3, res["hits"][0]["document"]["parts"].size());
+
+    // now update document to remove an array element
+    exercise_doc = R"({
+                        "id": "0",
+                        "bodyParts": ["abcd1", "abcd3"]
+                    })"_json;
+    ASSERT_TRUE(exercise_coll->add(exercise_doc.dump(), UPDATE).ok());
+
+    req_params = {
+            {"collection", "exercises"},
+            {"q", "*"},
+            {"include_fields", "$bodyParts(uid, name, strategy:nest) as parts"}
+    };
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+
+    res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(2, res["hits"][0]["document"]["bodyParts"].size());
+    ASSERT_EQ(2, res["hits"][0]["document"]["parts"].size());
+
+    // remove both elements
+    exercise_doc["bodyParts"] = nullptr;
+    ASSERT_TRUE(exercise_coll->add(exercise_doc.dump(), UPDATE).ok());
+
+    req_params = {
+            {"collection", "exercises"},
+            {"q", "*"},
+            {"include_fields", "$bodyParts(uid, name, strategy:nest) as parts"}
+    };
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(0, res["hits"][0]["document"]["bodyParts"].size());
+    ASSERT_EQ(0, res["hits"][0]["document"]["parts"].size());
+
+    exercise_doc["bodyParts"] = {"abcd1"};
+    ASSERT_TRUE(exercise_coll->add(exercise_doc.dump(), UPDATE).ok());
+
+    req_params = {
+            {"collection", "exercises"},
+            {"q", "*"},
+            {"include_fields", "$bodyParts(uid, name, strategy:nest) as parts"}
+    };
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res["hits"][0]["document"]["bodyParts"].size());
+    ASSERT_EQ(1, res["hits"][0]["document"]["parts"].size());
+
+    exercise_doc["bodyParts"] = nlohmann::json::array();
+    ASSERT_TRUE(exercise_coll->add(exercise_doc.dump(), UPDATE).ok());
+
+    req_params = {
+            {"collection", "exercises"},
+            {"q", "*"},
+            {"include_fields", "$bodyParts(uid, name, strategy:nest) as parts"}
+    };
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(0, res["hits"][0]["document"]["bodyParts"].size());
+    ASSERT_EQ(0, res["hits"][0]["document"]["parts"].size());
+}
+
 TEST_F(CollectionJoinTest, FilterByReference_SingleMatch) {
     auto schema_json =
             R"({
@@ -5416,29 +5546,6 @@ TEST_F(CollectionJoinTest, SortByReference) {
 
     schema_json =
             R"({
-                "name": "Ads",
-                "fields": [
-                    {"name": "id", "type": "string"}
-                ]
-            })"_json;
-    documents = {
-            R"({
-                "id": "ad_a"
-            })"_json
-    };
-    collection_create_op = collectionManager.create_collection(schema_json);
-    ASSERT_TRUE(collection_create_op.ok());
-
-    for (auto const &json: documents) {
-        auto add_op = collection_create_op.get()->add(json.dump());
-        if (!add_op.ok()) {
-            LOG(INFO) << add_op.error();
-        }
-        ASSERT_TRUE(add_op.ok());
-    }
-
-    schema_json =
-            R"({
                 "name": "Structures",
                 "fields": [
                     {"name": "id", "type": "string"},
@@ -5468,6 +5575,35 @@ TEST_F(CollectionJoinTest, SortByReference) {
 
     schema_json =
             R"({
+                "name": "Ads",
+                "fields": [
+                    {"name": "id", "type": "string"},
+                    {"name": "structure", "type": "string", "reference": "Structures.id"}
+                ]
+            })"_json;
+    documents = {
+            R"({
+                "id": "ad_a",
+                "structure": "struct_b"
+            })"_json,
+            R"({
+                "id": "ad_b",
+                "structure": "struct_a"
+            })"_json
+    };
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+
+    for (auto const &json: documents) {
+        auto add_op = collection_create_op.get()->add(json.dump());
+        if (!add_op.ok()) {
+            LOG(INFO) << add_op.error();
+        }
+        ASSERT_TRUE(add_op.ok());
+    }
+
+    schema_json =
+            R"({
                 "name": "Candidates",
                 "fields": [
                    {"name": "structure", "type": "string", "reference": "Structures.id", "optional": true},
@@ -5476,13 +5612,16 @@ TEST_F(CollectionJoinTest, SortByReference) {
             })"_json;
     documents = {
             R"({
-                "structure": "struct_a"
+                "structure": "struct_b"
             })"_json,
             R"({
                 "ad": "ad_a"
             })"_json,
             R"({
-                "structure": "struct_b"
+                "structure": "struct_a"
+            })"_json,
+            R"({
+                "ad": "ad_b"
             })"_json
     };
     collection_create_op = collectionManager.create_collection(schema_json);
@@ -5500,25 +5639,67 @@ TEST_F(CollectionJoinTest, SortByReference) {
             {"collection", "Candidates"},
             {"q", "*"},
             {"filter_by", "$Ads(id:*) || $Structures(id:*)"},
-            {"sort_by", "$Structures(name: asc)"}
+            {"sort_by", "$Structures(name: asc)"},
+            {"include_fields", "$Ads($Structures(*))"}
     };
     search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
     ASSERT_TRUE(search_op.ok());
 
     res_obj = nlohmann::json::parse(json_res);
-    ASSERT_EQ(3, res_obj["found"].get<size_t>());
-    ASSERT_EQ(3, res_obj["hits"].size());
-    ASSERT_EQ("2", res_obj["hits"][0]["document"].at("id"));
+    ASSERT_EQ(4, res_obj["found"].get<size_t>());
+    ASSERT_EQ(4, res_obj["hits"].size());
+    ASSERT_EQ("0", res_obj["hits"][0]["document"].at("id"));
     ASSERT_EQ("bar", res_obj["hits"][0]["document"]["Structures"].at("name"));
     ASSERT_EQ(0, res_obj["hits"][0]["document"].count("Ads"));
 
-    ASSERT_EQ("0", res_obj["hits"][1]["document"].at("id"));
+    ASSERT_EQ("2", res_obj["hits"][1]["document"].at("id"));
     ASSERT_EQ("foo", res_obj["hits"][1]["document"]["Structures"].at("name"));
     ASSERT_EQ(0, res_obj["hits"][1]["document"].count("Ads"));
 
-    ASSERT_EQ("1", res_obj["hits"][2]["document"].at("id"));
+    ASSERT_EQ("3", res_obj["hits"][2]["document"].at("id"));
     ASSERT_EQ(0, res_obj["hits"][2]["document"].count("Structures"));
     ASSERT_EQ(1, res_obj["hits"][2]["document"].count("Ads"));
+    ASSERT_EQ(1, res_obj["hits"][2]["document"]["Ads"].count("Structures"));
+    ASSERT_EQ("foo", res_obj["hits"][2]["document"]["Ads"]["Structures"]["name"]);
+
+    ASSERT_EQ("1", res_obj["hits"][3]["document"].at("id"));
+    ASSERT_EQ(0, res_obj["hits"][3]["document"].count("Structures"));
+    ASSERT_EQ(1, res_obj["hits"][3]["document"].count("Ads"));
+    ASSERT_EQ(1, res_obj["hits"][3]["document"]["Ads"].count("Structures"));
+    ASSERT_EQ("bar", res_obj["hits"][3]["document"]["Ads"]["Structures"]["name"]);
+
+    req_params = {
+            {"collection", "Candidates"},
+            {"q", "*"},
+            {"filter_by", "$Ads(id:*) || $Structures(id:*)"},
+            {"sort_by", "$Ads($Structures(name: asc))"},
+            {"include_fields", "$Ads($Structures(*))"}
+    };
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(4, res_obj["found"].get<size_t>());
+    ASSERT_EQ(4, res_obj["hits"].size());
+    ASSERT_EQ("1", res_obj["hits"][0]["document"].at("id"));
+    ASSERT_EQ(0, res_obj["hits"][0]["document"].count("Structures"));
+    ASSERT_EQ(1, res_obj["hits"][0]["document"].count("Ads"));
+    ASSERT_EQ(1, res_obj["hits"][0]["document"]["Ads"].count("Structures"));
+    ASSERT_EQ("bar", res_obj["hits"][0]["document"]["Ads"]["Structures"]["name"]);
+
+    ASSERT_EQ("3", res_obj["hits"][1]["document"].at("id"));
+    ASSERT_EQ(0, res_obj["hits"][1]["document"].count("Structures"));
+    ASSERT_EQ(1, res_obj["hits"][1]["document"].count("Ads"));
+    ASSERT_EQ(1, res_obj["hits"][1]["document"]["Ads"].count("Structures"));
+    ASSERT_EQ("foo", res_obj["hits"][1]["document"]["Ads"]["Structures"]["name"]);
+
+    ASSERT_EQ("2", res_obj["hits"][2]["document"].at("id"));
+    ASSERT_EQ("foo", res_obj["hits"][2]["document"]["Structures"].at("name"));
+    ASSERT_EQ(0, res_obj["hits"][2]["document"].count("Ads"));
+
+    ASSERT_EQ("0", res_obj["hits"][3]["document"].at("id"));
+    ASSERT_EQ("bar", res_obj["hits"][3]["document"]["Structures"].at("name"));
+    ASSERT_EQ(0, res_obj["hits"][3]["document"].count("Ads"));
 }
 
 TEST_F(CollectionJoinTest, FilterByReferenceAlias) {

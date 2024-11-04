@@ -62,6 +62,10 @@ Option<uint32_t> validator_t::coerce_element(const field& a_field, nlohmann::jso
             }
         }
     } else if(a_field.is_array()) {
+        if (doc_ele.is_null()) {
+            doc_ele = nlohmann::json::array();
+        }
+
         if(!doc_ele.is_array()) {
             bool is_auto_embedding = a_field.type == field_types::FLOAT_ARRAY && a_field.embed.count(fields::from) > 0;
             if((a_field.optional && (dirty_values == DIRTY_VALUES::DROP ||
@@ -726,6 +730,11 @@ Option<bool> validator_t::validate_embed_fields(const nlohmann::json& document,
                     continue;
                 }
             }
+
+            if(doc_field_it.value().is_null()) {
+                continue;
+            }
+
             all_optional_and_null = false;
             if((schema_field_it.value().type == field_types::STRING && !doc_field_it.value().is_string()) || 
                 (schema_field_it.value().type == field_types::STRING_ARRAY && !doc_field_it.value().is_array())) {

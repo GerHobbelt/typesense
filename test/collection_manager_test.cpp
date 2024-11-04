@@ -10,6 +10,7 @@
 class CollectionManagerTest : public ::testing::Test {
 protected:
     Store *store;
+    Store* analytic_store;
     CollectionManager & collectionManager = CollectionManager::get_instance();
     std::atomic<bool> quit = false;
     Collection *collection1;
@@ -22,10 +23,12 @@ protected:
         system(("rm -rf "+state_dir_path+" && mkdir -p "+state_dir_path).c_str());
 
         store = new Store(state_dir_path);
+        analytic_store = new Store(state_dir_path + "/analytics");
+
         collectionManager.init(store, 1.0, "auth_key", quit);
         collectionManager.load(8, 1000);
 
-        AnalyticsManager::get_instance().init(store);
+        AnalyticsManager::get_instance().init(store, analytic_store);
 
         schema = R"({
             "name": "collection1",
@@ -62,6 +65,7 @@ protected:
             collectionManager.drop_collection("collection1");
             collectionManager.dispose();
             delete store;
+            delete analytic_store;
         }
     }
 };
@@ -1304,6 +1308,45 @@ TEST_F(CollectionManagerTest, ParseSortByClause) {
                                                           sort_fields);
     ASSERT_TRUE(sort_by_parsed);
     ASSERT_EQ("$foo( _eval(brand:nike && foo:bar):DESC,points:desc)", sort_fields[0].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$Customers(product_price:DESC, $foo(bar:asc))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("$Customers(product_price:DESC, )", sort_fields[0].name);
+    ASSERT_EQ("$foo(bar:asc)", sort_fields[1].name);
+    ASSERT_TRUE(sort_fields[1].is_nested_join_sort_by());
+    ASSERT_EQ(2, sort_fields[1].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[1].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[1].nested_join_collection_names[1]);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$foo($bar($baz(field:asc)))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(1, sort_fields.size());
+    ASSERT_EQ("$baz(field:asc)", sort_fields[0].name);
+    ASSERT_TRUE(sort_fields[0].is_nested_join_sort_by());
+    ASSERT_EQ(3, sort_fields[0].nested_join_collection_names.size());
+    ASSERT_EQ("foo", sort_fields[0].nested_join_collection_names[0]);
+    ASSERT_EQ("bar", sort_fields[0].nested_join_collection_names[1]);
+    ASSERT_EQ("baz", sort_fields[0].nested_join_collection_names[2]);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$Customers(product_price:DESC, $foo($bar( _eval(brand:nike && foo:bar):DESC), baz:asc))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(3, sort_fields.size());
+    ASSERT_EQ("$Customers(product_price:DESC, )", sort_fields[0].name);
+    ASSERT_EQ("$bar( _eval(brand:nike && foo:bar):DESC)", sort_fields[1].name);
+    ASSERT_TRUE(sort_fields[1].is_nested_join_sort_by());
+    ASSERT_EQ(3, sort_fields[1].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[1].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[1].nested_join_collection_names[1]);
+    ASSERT_EQ("bar", sort_fields[1].nested_join_collection_names[2]);
+    ASSERT_EQ("$foo(baz:asc)", sort_fields[2].name);
+    ASSERT_TRUE(sort_fields[2].is_nested_join_sort_by());
+    ASSERT_EQ(2, sort_fields[2].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[2].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[2].nested_join_collection_names[1]);
 
     sort_fields.clear();
     sort_by_parsed = CollectionManager::parse_sort_by_str("", sort_fields);

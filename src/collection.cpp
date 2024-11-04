@@ -85,7 +85,7 @@ Collection::~Collection() {
         }
     }
 
-    ConversationManager::get_instance().remove_conversation_collection(name);
+    ConversationManager::get_instance().remove_history_collection(name);
 }
 
 uint32_t Collection::get_next_seq_id() {
@@ -95,11 +95,11 @@ uint32_t Collection::get_next_seq_id() {
 }
 
 Option<bool> single_value_filter_query(nlohmann::json& document, const std::string& field_name,
-                                       const std::string& ref_field_type, bool is_optional, std::string& filter_query) {
+                                       const std::string& ref_field_type, std::string& filter_query) {
     auto const& value = document[field_name];
 
-    if (is_optional && value.is_null()) {
-        return Option<bool>(422, "Optional field has `null` value.");
+    if (value.is_null()) {
+        return Option<bool>(422, "Field has `null` value.");
     }
 
     if (value.is_string() && ref_field_type == field_types::STRING) {
@@ -130,7 +130,8 @@ Option<bool> Collection::add_reference_helper_fields(nlohmann::json& document, c
     // Add reference helper fields in the document.
     for (auto const& pair: reference_fields) {
         auto field_name = pair.first;
-        auto optional = schema.at(field_name).optional;
+        auto const& field = schema.at(field_name);
+        auto const& optional = field.optional;
         // Strict checking for presence of non-optional reference field during indexing operation.
         auto is_required = !is_update && !optional;
         if (is_required && document.count(field_name) != 1) {
@@ -291,7 +292,7 @@ Option<bool> Collection::add_reference_helper_fields(nlohmann::json& document, c
 
                 temp_doc[field_name] = object_array[i].at(keys[1]);
                 auto single_value_filter_query_op = single_value_filter_query(temp_doc, field_name, ref_field_type,
-                                                                              optional, filter_query);
+                                                                              filter_query);
                 if (!single_value_filter_query_op.ok()) {
                     if (single_value_filter_query_op.code() == 422) {
                         continue;
@@ -348,14 +349,22 @@ Option<bool> Collection::add_reference_helper_fields(nlohmann::json& document, c
                 filter_query += ",";
             }
             if (!filter_values_added) {
+                document[reference_helper_field] = nlohmann::json::array();
+                document[fields::reference_helper_fields] += reference_helper_field;
+
                 continue;
             }
             filter_query[filter_query.size() - 1] = ']';
+        } else if (field.is_array() && document[field_name].is_null()) {
+            document[reference_helper_field] = nlohmann::json::array();
+            document[fields::reference_helper_fields] += reference_helper_field;
+
+            continue;
         } else {
             auto single_value_filter_query_op = single_value_filter_query(document, field_name, ref_field_type,
-                                                                          optional, filter_query);
+                                                                          filter_query);
             if (!single_value_filter_query_op.ok()) {
-                if (single_value_filter_query_op.code() == 422) {
+                if (optional && single_value_filter_query_op.code() == 422) {
                     continue;
                 }
                 return single_value_filter_query_op;
@@ -1228,8 +1237,24 @@ Option<bool> Collection::validate_and_standardize_sort_fields(const std::vector<
                                                                                                      is_group_by_query,
                                                                                                      remote_embedding_timeout_ms,
                                                                                                      remote_embedding_num_tries);
+
+            std::vector<std::string> nested_join_coll_names;
+            for (auto const& coll_name: _sort_field.nested_join_collection_names) {
+                auto coll = cm.get_collection(coll_name);
+                if (coll == nullptr) {
+                    return Option<bool>(400, "Referenced collection `" + coll_name + "` in `sort_by` not found.");
+                }
+                // `CollectionManager::get_collection` accounts for collection alias being used and provides pointer to the
+                // original collection.
+                nested_join_coll_names.emplace_back(coll->name);
+            }
+
             for (auto& ref_sort_field_std: ref_sort_fields_std) {
                 ref_sort_field_std.reference_collection_name = ref_collection_name;
+                ref_sort_field_std.nested_join_collection_names.insert(ref_sort_field_std.nested_join_collection_names.begin(),
+                                                                       nested_join_coll_names.begin(),
+                                                                       nested_join_coll_names.end());
+
                 sort_fields_std.emplace_back(ref_sort_field_std);
             }
 
@@ -2883,7 +2908,7 @@ Option<nlohmann::json> Collection::search(std::string raw_query,
         conversation_history.push_back(formatted_question_op.get());
         conversation_history.push_back(formatted_answer_op.get());
 
-        auto add_conversation_op = ConversationManager::get_instance().add_conversation(conversation_history, conversation_model["conversation_collection"].get<std::string>(), conversation_id);
+        auto add_conversation_op = ConversationManager::get_instance().add_conversation(conversation_history, conversation_model["history_collection"].get<std::string>(), conversation_id);
         if(!add_conversation_op.ok()) {
             return Option<nlohmann::json>(add_conversation_op.code(), add_conversation_op.error());
         }
