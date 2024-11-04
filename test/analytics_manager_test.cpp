@@ -612,6 +612,23 @@ TEST_F(AnalyticsManagerTest, EventsValidation) {
 
     create_op = analyticsManager.create_rule(analytics_rule, true, true);
     ASSERT_TRUE(create_op.ok());
+
+    //try adding removed events
+    ASSERT_TRUE(analyticsManager.remove_rule("product_events").ok());
+
+    analytics_rule = R"({
+        "name": "product_events",
+        "type": "log",
+        "params": {
+            "source": {
+                "collections": ["titles"],
+                 "events":  [{"type": "click", "name": "AP"}, {"type": "visit", "name": "VP"}]
+            }
+        }
+    })"_json;
+
+    create_op = analyticsManager.create_rule(analytics_rule, false, true);
+    ASSERT_TRUE(create_op.ok());
 }
 
 TEST_F(AnalyticsManagerTest, EventsPersist) {
@@ -1911,7 +1928,7 @@ TEST_F(AnalyticsManagerTest, AnalyticsStoreGetLastN) {
 
     //get last 5 visit events for user_id 14
     values.clear();
-    analyticsManager.get_last_N_events("14", "visit", 5, values);
+    analyticsManager.get_last_N_events("14", "AV", 5, values);
     ASSERT_EQ(5, values.size());
     for(int i = 0; i < 5; ++i) {
         parsed_json = nlohmann::json::parse(values[i]);
@@ -1921,7 +1938,7 @@ TEST_F(AnalyticsManagerTest, AnalyticsStoreGetLastN) {
 
     //get last 5 click events for user_id 14
     values.clear();
-    analyticsManager.get_last_N_events("14", "click", 5, values);
+    analyticsManager.get_last_N_events("14", "AB", 5, values);
     ASSERT_EQ(5, values.size());
     for(int i = 0; i < 5; ++i) {
         parsed_json = nlohmann::json::parse(values[i]);
@@ -1954,7 +1971,7 @@ TEST_F(AnalyticsManagerTest, AnalyticsStoreGetLastN) {
     ASSERT_TRUE(analyticsManager.write_to_db(payload));
 
     values.clear();
-    analyticsManager.get_last_N_events("14", "click", 10, values);
+    analyticsManager.get_last_N_events("14", "AB", 10, values);
     ASSERT_EQ(10, values.size());
     for(int i = 0; i < 10; ++i) {
         parsed_json = nlohmann::json::parse(values[i]);
@@ -1989,7 +2006,7 @@ TEST_F(AnalyticsManagerTest, AnalyticsStoreGetLastN) {
     ASSERT_TRUE(analyticsManager.write_to_db(payload));
 
     values.clear();
-    analyticsManager.get_last_N_events("14_U1", "click", 10, values);
+    analyticsManager.get_last_N_events("14_U1", "AB", 10, values);
     ASSERT_EQ(5, values.size());
     for(int i = 0; i < 5; ++i) {
         parsed_json = nlohmann::json::parse(values[i]);

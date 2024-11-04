@@ -342,14 +342,12 @@ Option<bool> AnalyticsManager::remove_index(const std::string &name) {
     suggestion_configs.erase(name);
 
     //remove corresponding events with rule
-    auto it = event_collection_map.begin();
-    for(it; it != event_collection_map.end(); ++it) {
+    for(auto it = event_collection_map.begin(); it != event_collection_map.end();) {
         if(it->second.analytic_rule == name) {
-            break;
+            event_collection_map.erase(it++);
+        } else {
+            ++it;
         }
-    }
-    if(it != event_collection_map.end()) {
-        event_collection_map.erase(it);
     }
 
     auto suggestion_key = std::string(ANALYTICS_RULE_PREFIX) + "_" + name;
@@ -780,10 +778,10 @@ bool AnalyticsManager::write_to_db(const nlohmann::json& payload) {
     if(analytics_store) {
         for(const auto& event: payload) {
             std::string userid = event["user_id"].get<std::string>();
-            std::string event_type = event["type"].get<std::string>();
+            std::string event_name = event["name"].get<std::string>();
             std::string ts = StringUtils::serialize_uint64_t(event["timestamp"].get<uint64_t>());
 
-            std::string key =  userid+ "%" + event_type+ "%" + ts;
+            std::string key =  userid + "%" + event_name + "%" + ts;
 
             bool inserted = analytics_store->insert(key, event.dump());
             if(!inserted) {
@@ -799,7 +797,7 @@ bool AnalyticsManager::write_to_db(const nlohmann::json& payload) {
     return true;
 }
 
-void AnalyticsManager::get_last_N_events(const std::string& userid, const std::string& event_type, uint32_t N,
+void AnalyticsManager::get_last_N_events(const std::string& userid, const std::string& event_name, uint32_t N,
                                             std::vector<std::string>& values) {
     std::string user_id = userid;
 
@@ -807,8 +805,8 @@ void AnalyticsManager::get_last_N_events(const std::string& userid, const std::s
     user_id.erase(std::remove(user_id.begin(), user_id.end(), '%'), user_id.end());
 
     auto userid_prefix = user_id + "%";
-    if(event_type != "*") {
-        userid_prefix += event_type;
+    if(event_name != "*") {
+        userid_prefix += event_name;
     }
 
     analytics_store->get_last_N_values(userid_prefix, N, values);
