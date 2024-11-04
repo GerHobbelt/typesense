@@ -766,7 +766,8 @@ public:
 
     Option<bool> do_filtering_with_lock(filter_node_t* const filter_tree_root,
                                         filter_result_t& filter_result,
-                                        const std::string& collection_name = "") const;
+                                        const std::string& collection_name = "",
+                                        const bool& should_timeout = true) const;
 
     Option<bool> do_reference_filtering_with_lock(filter_node_t* const filter_tree_root,
                                                   filter_result_t& filter_result,
@@ -1024,10 +1025,9 @@ public:
                                      std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3> field_values,
                                      const std::vector<size_t>& geopoint_indices, uint32_t seq_id,
                                      const std::map<basic_string<char>, reference_filter_result_t>& references,
-                                     std::vector<uint32_t>& filter_indexes,
-                                     int64_t max_field_match_score,
-                                     int64_t* scores,
-                                     int64_t& match_score_index, float vector_distance = 0,
+                                     std::vector<uint32_t>& filter_indexes, int64_t max_field_match_score,
+                                     int64_t* scores, int64_t& match_score_index, bool& should_skip,
+                                     float vector_distance = 0,
                                      const std::string& collection_name = "") const;
 
     void process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
@@ -1065,7 +1065,9 @@ public:
     void aggregate_facet(const size_t group_limit, facet& this_facet, facet& acc_facet) const;
 
     float get_distance(const string& geo_field_name, const uint32_t& seq_id,
-                       const S2LatLng& reference_lat_lng, const std::string& unit) const;
+                       const S2LatLng& reference_lat_lng) const;
+
+    void get_top_k_result_ids(const std::vector<std::vector<KV*>>& raw_result_kvs, std::vector<uint32_t>& result_ids) const;
 };
 
 template<class T>
